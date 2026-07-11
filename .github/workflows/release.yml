@@ -1,0 +1,128 @@
+name: Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+env:
+  GO_VERSION: '1.26'
+  CLI_PROXY_API_MODULE: github.com/router-for-me/CLIProxyAPI/v7
+  CLI_PROXY_API_REPO: https://github.com/jianhongyu136/CLIProxyAPI.git
+  CLI_PROXY_API_REF: jhy
+
+jobs:
+  build-linux-amd64:
+    name: Build Linux x64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Clone CLIProxyAPI SDK
+        run: |
+          echo "Using CLIProxyAPI ${CLI_PROXY_API_REPO}@${CLI_PROXY_API_REF}"
+          git clone --depth 1 --branch "${CLI_PROXY_API_REF}" "${CLI_PROXY_API_REPO}" "${RUNNER_TEMP}/CLIProxyAPI"
+
+      - name: Use CI SDK path
+        run: go mod edit -replace="${CLI_PROXY_API_MODULE}=${RUNNER_TEMP}/CLIProxyAPI"
+
+      - name: Test
+        env:
+          CGO_ENABLED: 0
+        run: go test -count=1 ./...
+
+      - name: Build Linux x64 plugin
+        env:
+          CGO_ENABLED: 1
+          GOOS: linux
+          GOARCH: amd64
+        run: |
+          mkdir -p dist
+          go build -trimpath -ldflags="-s -w" -buildmode=c-shared -o dist/privacy-filter-linux-amd64.so .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: privacy-filter-linux-amd64.so
+          path: dist/privacy-filter-linux-amd64.so
+          if-no-files-found: error
+
+  build-windows-amd64:
+    name: Build Windows x64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          path-type: inherit
+          install: mingw-w64-ucrt-x86_64-gcc
+
+      - name: Clone CLIProxyAPI SDK
+        shell: pwsh
+        run: |
+          Write-Host "Using CLIProxyAPI $env:CLI_PROXY_API_REPO@$env:CLI_PROXY_API_REF"
+          git clone --depth 1 --branch $env:CLI_PROXY_API_REF $env:CLI_PROXY_API_REPO (Join-Path $env:RUNNER_TEMP 'CLIProxyAPI')
+
+      - name: Use CI SDK path
+        shell: pwsh
+        run: |
+          $sdkPath = (Join-Path $env:RUNNER_TEMP 'CLIProxyAPI').Replace('\', '/')
+          go mod edit "-replace=$env:CLI_PROXY_API_MODULE=$sdkPath"
+
+      - name: Test
+        shell: pwsh
+        env:
+          CGO_ENABLED: 0
+        run: go test -count=1 ./...
+
+      - name: Build Windows x64 plugin
+        shell: msys2 {0}
+        env:
+          CGO_ENABLED: 1
+          GOOS: windows
+          GOARCH: amd64
+          CC: gcc
+        run: |
+          mkdir -p dist
+          go build -trimpath -ldflags="-s -w" -buildmode=c-shared -o dist/privacy-filter-windows-amd64.dll .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: privacy-filter-windows-amd64.dll
+          path: dist/privacy-filter-windows-amd64.dll
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub release
+    needs:
+      - build-linux-amd64
+      - build-windows-amd64
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            artifacts/privacy-filter-linux-amd64.so
+            artifacts/privacy-filter-windows-amd64.dll

@@ -1,0 +1,31 @@
+{
+  "field_rules": [
+    { "name": "password", "keys": ["password", "passwd", "pwd"], "enabled_by_default": true },
+    { "name": "api_key", "keys": ["api_key", "apikey", "api-key"], "enabled_by_default": true },
+    { "name": "secret", "keys": ["secret", "client_secret"], "enabled_by_default": true },
+    { "name": "token", "keys": ["token", "access_token", "refresh_token", "id_token"], "enabled_by_default": true },
+    { "name": "authorization", "keys": ["authorization", "auth_token"], "enabled_by_default": true },
+    { "name": "private_key", "keys": ["private_key", "privatekey"], "enabled_by_default": true },
+    { "name": "credential", "keys": ["credentials"], "enabled_by_default": true },
+    { "name": "session", "keys": ["session_key", "session_token"], "enabled_by_default": true }
+  ],
+  "value_rules": [
+    { "name": "openai_key", "regex": "sk-[A-Za-z0-9_-]{20,}", "enabled_by_default": true },
+    { "name": "anthropic_key", "regex": "sk-ant-[A-Za-z0-9_-]{20,}", "enabled_by_default": true },
+    { "name": "aws_access_key", "regex": "(?:AKIA|ASIA)[A-Z0-9]{16}", "enabled_by_default": true },
+    { "name": "aws_secret_key", "regex": "[A-Za-z0-9/+]{40}", "enabled_by_default": false },
+    { "name": "google_api_key", "regex": "AIza[A-Za-z0-9_-]{35}", "enabled_by_default": true },
+    { "name": "github_token", "regex": "gh[porsu]_[A-Za-z0-9]{36}", "enabled_by_default": true },
+    { "name": "slack_token", "regex": "xox[baprs]-[A-Za-z0-9-]+", "enabled_by_default": true },
+    { "name": "jwt", "regex": "eyJ[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+", "enabled_by_default": false },
+    { "name": "bearer", "regex": "Bearer\\s+[A-Za-z0-9._-]+", "enabled_by_default": true },
+    { "name": "ssh_private_key", "regex": "-----BEGIN OPENSSH PRIVATE KEY-----[\\s\\S]*?-----END OPENSSH PRIVATE KEY-----", "enabled_by_default": true },
+    { "name": "pem_block", "regex": "-----BEGIN [A-Z ]*PRIVATE KEY-----[\\s\\S]*?-----END [A-Z ]*PRIVATE KEY-----", "enabled_by_default": true },
+    { "name": "email", "regex": "[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}", "enabled_by_default": false },
+    { "name": "phone_cn", "regex": "1[3-9]\\d{9}", "enabled_by_default": false },
+    { "name": "phone_e164", "regex": "\\+[1-9]\\d{7,14}", "enabled_by_default": false },
+    { "name": "id_card_cn", "regex": "[1-9]\\d{16}[0-9Xx]", "validate": "china_id", "enabled_by_default": false },
+    { "name": "credit_card", "regex": "\\d{13,19}", "validate": "luhn", "enabled_by_default": false },
+    { "name": "ipv4", "regex": "\\b(?:\\d{1,3}\\.){3}\\d{1,3}\\b", "enabled_by_default": false }
+  ]
+}

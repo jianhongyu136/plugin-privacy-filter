@@ -1,0 +1,25 @@
+# Tooling metadata
+.vscode/*
+.worktrees/
+.codex/*
+.claude/*
+.claude
+.gemini/*
+.serena/*
+.agent/*
+.agents
+.agents/*
+.opencode/*
+.idea/*
+.beads/*
+.bmad/*
+_bmad/*
+_bmad-output/*
+
+
+dist/
+privacy-filter-*.dll
+privacy-filter-*.h
+privacy-filter-*.so
+plugin-privacy-filter.exe
+docs/superpowers
