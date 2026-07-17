@@ -2341,6 +2341,103 @@ func TestStreamChunkInterceptDropSignaled(t *testing.T) {
 	}
 }
 
+// invokeStreamBodyWithID marshals a stream chunk request with an explicit
+// StreamID and no per-chunk RequestBody, mirroring a stateful host that sends
+// heavy fields only on the header-init call.
+func invokeStreamBodyWithID(t *testing.T, sourceFormat, streamID string, index int, body []byte) pluginapi.StreamChunkInterceptResponse {
+	t.Helper()
+	req, err := json.Marshal(pluginapi.StreamChunkInterceptRequest{
+		StreamID:        streamID,
+		SourceFormat:    sourceFormat,
+		ResponseHeaders: http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:            body,
+		ChunkIndex:      index,
+	})
+	if err != nil {
+		t.Fatalf("marshal stream request: %v", err)
+	}
+	raw, err := handleMethod(pluginabi.MethodResponseInterceptStreamChunk, req)
+	if err != nil {
+		t.Fatalf("stream intercept: %v", err)
+	}
+	var env envelope
+	if err := json.Unmarshal(raw, &env); err != nil {
+		t.Fatalf("unmarshal envelope: %v", err)
+	}
+	var response pluginapi.StreamChunkInterceptResponse
+	if err := json.Unmarshal(env.Result, &response); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	return response
+}
+
+// TestStreamStatefulRestoresByStreamID covers the streaming-performance fix: a
+// stateful stream caches its per-request token allowlist at the header-init call
+// (keyed by StreamID) so payload chunks that carry only StreamID and no
+// RequestBody still restore tokens. This lets the host stop re-sending and the
+// plugin stop re-hashing/re-scanning the full request body on every chunk.
+func TestStreamStatefulRestoresByStreamID(t *testing.T) {
+	callRegister(t, pluginabi.MethodPluginRegister, "")
+	secret := "sk-streamid-secret-value"
+	token := makeToken("REDACTED", secret)
+	activeSnapshot().vault.Put(token, secret)
+	requestBody := []byte(`{"messages":[{"content":"` + token + `"}]}`)
+	streamID := "stream-stateful-1"
+
+	// Header-init carries the heavy RequestBody once; subsequent chunks do not.
+	initReq, _ := json.Marshal(pluginapi.StreamChunkInterceptRequest{
+		StreamID:    streamID,
+		ChunkIndex:  pluginapi.StreamChunkHeaderInitIndex,
+		RequestBody: requestBody,
+	})
+	if _, err := handleMethod(pluginabi.MethodResponseInterceptStreamChunk, initReq); err != nil {
+		t.Fatalf("stream init error: %v", err)
+	}
+	t.Cleanup(func() {
+		invokeStreamBodyWithID(t, formatOpenAI, streamID, pluginapi.StreamChunkEndIndex, nil)
+		if streamCarry.has(streamID) {
+			t.Errorf("stream cleanup did not release state for %q", streamID)
+		}
+	})
+
+	chunk := []byte("data: {\"choices\":[{\"delta\":{\"content\":\"" + token + "\"}}]}\n\n")
+	resp := invokeStreamBodyWithID(t, formatOpenAI, streamID, 0, chunk)
+	delivered := deliveredStreamBody(resp, chunk)
+	if !bytes.Contains(delivered, []byte(secret)) {
+		t.Fatalf("stateful stream chunk must restore the secret from StreamID-cached state; got %q", delivered)
+	}
+	if bytes.Contains(delivered, []byte(token)) {
+		t.Fatalf("delivered chunk still contains the token, restoration did not run: %q", delivered)
+	}
+}
+
+func TestStreamStatefulEndReleasesState(t *testing.T) {
+	callRegister(t, pluginabi.MethodPluginRegister, "")
+	streamID := "stream-stateful-end"
+	initReq, _ := json.Marshal(pluginapi.StreamChunkInterceptRequest{
+		StreamID:    streamID,
+		ChunkIndex:  pluginapi.StreamChunkHeaderInitIndex,
+		RequestBody: []byte(`{"messages":[]}`),
+	})
+	if _, err := handleMethod(pluginabi.MethodResponseInterceptStreamChunk, initReq); err != nil {
+		t.Fatalf("stream init error: %v", err)
+	}
+	if !streamCarry.has(streamID) {
+		t.Fatal("stream init did not retain state")
+	}
+
+	endReq, _ := json.Marshal(pluginapi.StreamChunkInterceptRequest{
+		StreamID:   streamID,
+		ChunkIndex: pluginapi.StreamChunkEndIndex,
+	})
+	if _, err := handleMethod(pluginabi.MethodResponseInterceptStreamChunk, endReq); err != nil {
+		t.Fatalf("stream end error: %v", err)
+	}
+	if streamCarry.has(streamID) {
+		t.Fatal("stream end did not release state")
+	}
+}
+
 // TestVaultExpiryPurgedByLen covers fix #8: expired entries are purged even when
 // never accessed by Get, so plaintext does not linger and Len reflects reality.
 func TestVaultExpiryPurgedByLen(t *testing.T) {

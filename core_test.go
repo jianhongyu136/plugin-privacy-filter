@@ -36,8 +36,8 @@ func callRegister(t *testing.T, method, yamlText string) registration {
 
 func TestRegisterReturnsCapabilitiesAndMetadata(t *testing.T) {
 	reg := callRegister(t, pluginabi.MethodPluginRegister, "")
-	if !reg.Capabilities.RequestInterceptor || !reg.Capabilities.ResponseInterceptor || !reg.Capabilities.StreamChunkInterceptor {
-		t.Fatalf("expected all three capabilities true, got %+v", reg.Capabilities)
+	if !reg.Capabilities.RequestInterceptor || !reg.Capabilities.ResponseInterceptor || !reg.Capabilities.StreamChunkInterceptor || !reg.Capabilities.StreamChunkInterceptorStateful {
+		t.Fatalf("expected all interceptor capabilities true, got %+v", reg.Capabilities)
 	}
 	if len(reg.Metadata.Name) == 0 || len(reg.Metadata.Version) == 0 || len(reg.Metadata.Author) == 0 || len(reg.Metadata.GitHubRepository) == 0 {
 		t.Fatalf("expected all metadata strings non-empty, got %+v", reg.Metadata)

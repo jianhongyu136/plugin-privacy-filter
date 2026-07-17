@@ -272,6 +272,56 @@ func TestStreamStoreCleanupRemovesIdleState(t *testing.T) {
 	t.Fatal("idle stream state was not proactively removed")
 }
 
+func TestStreamStoreActiveStateSurvivesTTLUntilEnd(t *testing.T) {
+	store := newStreamStoreWithLimits(20*time.Millisecond, streamStoreMaxBytes)
+	store.begin("active")
+	store.allowlist("active", func() map[string]struct{} {
+		return map[string]struct{}{"<REDACTED_0123456789abcdef>": {}}
+	})
+	time.Sleep(30 * time.Millisecond)
+
+	if !store.has("active") {
+		t.Fatal("active stream state was removed by idle TTL cleanup")
+	}
+	store.end("active")
+	if store.has("active") {
+		t.Fatal("ended stream state was not released")
+	}
+}
+
+func TestStreamStoreAllowlistBuildPreservesActiveStateAfterHardCapEviction(t *testing.T) {
+	store := newStreamStore()
+	store.begin("active")
+	buildStarted := make(chan struct{})
+	allowBuild := make(chan struct{})
+	buildDone := make(chan struct{})
+	go func() {
+		store.allowlist("active", func() map[string]struct{} {
+			close(buildStarted)
+			<-allowBuild
+			return map[string]struct{}{"<REDACTED_0123456789abcdef>": {}}
+		})
+		close(buildDone)
+	}()
+	<-buildStarted
+
+	// Fill the hard entry cap with newer active streams. With no inactive
+	// candidate available, the original active entry is the LRU eviction.
+	for i := 0; i < streamCarryMaxEntries; i++ {
+		store.begin("replacement-" + itoa(i))
+	}
+	close(allowBuild)
+	<-buildDone
+
+	store.mu.Lock()
+	entry := store.entries["active"]
+	active := entry != nil && entry.active
+	store.mu.Unlock()
+	if !active {
+		t.Fatal("allowlist build recreated live stream state as inactive")
+	}
+}
+
 func TestPluginShutdownClearsStreamState(t *testing.T) {
 	callRegister(t, pluginabi.MethodPluginRegister, "")
 	streamCarry.clear()

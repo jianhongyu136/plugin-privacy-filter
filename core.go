@@ -93,9 +93,10 @@ type registration struct {
 
 // registrationCapability mirrors the host rpcCapabilities JSON names.
 type registrationCapability struct {
-	RequestInterceptor     bool `json:"request_interceptor"`
-	ResponseInterceptor    bool `json:"response_interceptor"`
-	StreamChunkInterceptor bool `json:"response_stream_interceptor"`
+	RequestInterceptor             bool `json:"request_interceptor"`
+	ResponseInterceptor            bool `json:"response_interceptor"`
+	StreamChunkInterceptor         bool `json:"response_stream_interceptor"`
+	StreamChunkInterceptorStateful bool `json:"response_stream_interceptor_stateful"`
 }
 
 func pluginRegistration() registration {
@@ -109,9 +110,10 @@ func pluginRegistration() registration {
 			ConfigFields:     configFields(),
 		},
 		Capabilities: registrationCapability{
-			RequestInterceptor:     true,
-			ResponseInterceptor:    true,
-			StreamChunkInterceptor: true,
+			RequestInterceptor:             true,
+			ResponseInterceptor:            true,
+			StreamChunkInterceptor:         true,
+			StreamChunkInterceptorStateful: true,
 		},
 	}
 }
@@ -273,24 +275,63 @@ func handleStreamChunkIntercept(request []byte) ([]byte, error) {
 	if err := json.Unmarshal(request, &req); err != nil {
 		return errorEnvelope("invalid_request", err.Error()), nil
 	}
+	st := activeSnapshot()
+	if req.ChunkIndex == pluginapi.StreamChunkEndIndex {
+		if req.StreamID != "" {
+			streamCarry.end(req.StreamID)
+		}
+		return okEnvelope(pluginapi.StreamChunkInterceptResponse{})
+	}
 	if req.ChunkIndex == pluginapi.StreamChunkHeaderInitIndex {
+		if req.StreamID != "" {
+			// Stateful path: the host provides a stable StreamID and sends the
+			// heavy RequestBody only on this header-init call. Cache the
+			// request-scoped allowlist now so payload chunks need not carry the
+			// request body, letting the host stop re-sending it and the plugin
+			// stop hashing/scanning it on every chunk.
+			streamCarry.begin(req.StreamID)
+			if st != nil {
+				tokenRe := st.restoreTokenRe
+				streamCarry.allowlist(req.StreamID, func() map[string]struct{} {
+					return collectTokens(req.RequestBody, tokenRe, st.vault)
+				})
+			}
+			return okEnvelope(pluginapi.StreamChunkInterceptResponse{})
+		}
 		resetStreamCarry(req.RequestBody)
 		return okEnvelope(pluginapi.StreamChunkInterceptResponse{})
 	}
-	st := activeSnapshot()
 	if st == nil {
 		return okEnvelope(pluginapi.StreamChunkInterceptResponse{})
 	}
 	tokenRe := st.restoreTokenRe
-	if tokenRe.Find(req.RequestBody) == nil && !bytes.Contains(req.RequestBody, []byte(`\u00`)) {
-		return okEnvelope(pluginapi.StreamChunkInterceptResponse{})
+	var key string
+	var allowed map[string]struct{}
+	if req.StreamID != "" {
+		// Stateful path: reuse the allowlist cached at the header-init call,
+		// keyed by StreamID, without touching RequestBody. If the entry was
+		// removed under a hard memory cap, build from RequestBody when the host
+		// still sends it; otherwise there is nothing to restore.
+		key = req.StreamID
+		allowed = streamCarry.allowlist(key, func() map[string]struct{} {
+			return collectTokens(req.RequestBody, tokenRe, st.vault)
+		})
+		if len(allowed) == 0 {
+			return okEnvelope(pluginapi.StreamChunkInterceptResponse{})
+		}
+	} else {
+		// Legacy path: no StreamID, so derive the per-stream key by hashing the
+		// request body the host re-sends on every chunk.
+		if tokenRe.Find(req.RequestBody) == nil && !bytes.Contains(req.RequestBody, []byte(`\u00`)) {
+			return okEnvelope(pluginapi.StreamChunkInterceptResponse{})
+		}
+		key = streamKey(req.RequestBody)
+		// Build the request-scoped allowlist once per stream and reuse it for
+		// every chunk, rather than re-scanning the full request body each chunk.
+		allowed = streamCarry.allowlist(key, func() map[string]struct{} {
+			return collectTokens(req.RequestBody, tokenRe, st.vault)
+		})
 	}
-	key := streamKey(req.RequestBody)
-	// Build the request-scoped allowlist once per stream and reuse it for every
-	// chunk, rather than re-scanning the full request body on each chunk.
-	allowed := streamCarry.allowlist(key, func() map[string]struct{} {
-		return collectTokens(req.RequestBody, tokenRe, st.vault)
-	})
 	contentType := req.ResponseHeaders.Get("Content-Type")
 	mediaType := strings.TrimSpace(strings.SplitN(contentType, ";", 2)[0])
 	out, drop := detokenizeStreamChunkForMediaType(

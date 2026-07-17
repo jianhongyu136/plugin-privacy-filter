@@ -15,10 +15,9 @@ import (
 )
 
 const (
-	// streamCarryMaxEntries bounds the number of live per-stream states so a
-	// stream that ends while holding state (the host exposes no end-of-stream
-	// flush) cannot leak memory indefinitely. When the cap is exceeded the
-	// oldest-touched entries are evicted.
+	// streamCarryMaxEntries bounds the number of per-stream states. End markers
+	// normally release active state; the hard cap still bounds memory if markers
+	// are missed or concurrency is excessive.
 	streamCarryMaxEntries = 4096
 	// streamCarryMaxBytes bounds withheld bytes per stream. A larger incomplete
 	// SSE line is emitted unchanged rather than retained and repeatedly copied.
@@ -31,9 +30,9 @@ const (
 	// stream. Requests beyond this limit remain safe: excess placeholders are
 	// left unrestored rather than growing persistent state or per-chunk work.
 	streamAllowlistMaxTokens = 1024
-	// streamCarryTTL bounds how long a per-stream state may live before it is
-	// considered abandoned and eligible for eviction. Streaming chunks arrive
-	// far more frequently than this, so it only reaps torn-down streams.
+	// streamCarryTTL bounds how long inactive legacy state may live before it is
+	// considered abandoned and eligible for eviction. Stateful streams remain
+	// active until their end marker unless a hard memory cap is reached.
 	streamCarryTTL = 5 * time.Minute
 )
 
@@ -45,6 +44,7 @@ type streamEntry struct {
 	key       string
 	allowed   map[string]struct{}
 	hasAllow  bool
+	active    bool
 	carry     []byte
 	content   map[string]string
 	touchedAt time.Time
@@ -52,10 +52,9 @@ type streamEntry struct {
 	bytes     int
 }
 
-// streamStore is a bounded, TTL-evicting map of per-stream state. It replaces a
-// bare sync.Map so that streams which end while holding state (the host
-// provides no end-of-stream flush callback) cannot accumulate forever and
-// exhaust memory.
+// streamStore is a bounded map of per-stream state. Active state is retained
+// until an end marker, while inactive legacy state is TTL-evicted. Hard entry
+// and byte caps keep memory bounded if lifecycle markers are missed.
 type streamStore struct {
 	mu             sync.Mutex
 	entries        map[string]*streamEntry
@@ -89,11 +88,15 @@ func (s *streamStore) allowlist(key string, build func() map[string]struct{}) ma
 	s.mu.Lock()
 	now := time.Now()
 	s.purgeLocked(now)
-	if e, ok := s.entries[key]; ok && e.hasAllow {
-		s.touchLocked(e, now)
-		allowed := e.allowed
-		s.mu.Unlock()
-		return allowed
+	active := false
+	if e, ok := s.entries[key]; ok {
+		active = e.active
+		if e.hasAllow {
+			s.touchLocked(e, now)
+			allowed := e.allowed
+			s.mu.Unlock()
+			return allowed
+		}
 	}
 	s.mu.Unlock()
 
@@ -103,6 +106,9 @@ func (s *streamStore) allowlist(key string, build func() map[string]struct{}) ma
 	now = time.Now()
 	s.purgeLocked(now)
 	e := s.getOrCreateLocked(key, now)
+	// Stateful lifecycle calls are serialized per StreamID. Preserve the active
+	// marker if hard-cap pressure evicted the entry during the unlocked scan.
+	e.active = e.active || active
 	if !e.hasAllow {
 		e.allowed = allowed
 		e.hasAllow = true
@@ -162,6 +168,26 @@ func (s *streamStore) reset(key string) {
 	if e, ok := s.entries[key]; ok {
 		s.removeLocked(e)
 	}
+}
+
+// begin replaces any stale state for key and marks the stream active so normal
+// idle cleanup and capacity pressure prefer abandoned or completed entries.
+func (s *streamStore) begin(key string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	if e, ok := s.entries[key]; ok {
+		s.removeLocked(e)
+	}
+	e := s.getOrCreateLocked(key, now)
+	e.active = true
+	s.resizeEntryLocked(e)
+	s.touchLocked(e, now)
+}
+
+// end releases all state retained for a completed stream.
+func (s *streamStore) end(key string) {
+	s.reset(key)
 }
 
 func (s *streamStore) clear() {
@@ -249,12 +275,18 @@ func (s *streamStore) getOrCreateLocked(key string, now time.Time) *streamEntry 
 // purgeLocked removes entries whose last touch is older than the TTL. The
 // caller must hold s.mu.
 func (s *streamStore) purgeLocked(now time.Time) {
-	for s.lru.Len() > 0 {
-		e := s.lru.Back().Value.(*streamEntry)
+	for element := s.lru.Back(); element != nil; {
+		e := element.Value.(*streamEntry)
+		previous := element.Prev()
+		if e.active {
+			element = previous
+			continue
+		}
 		if now.Sub(e.touchedAt) <= s.ttl {
 			return
 		}
 		s.removeLocked(e)
+		element = previous
 	}
 }
 
@@ -262,7 +294,11 @@ func (s *streamStore) purgeLocked(now time.Time) {
 // The caller must hold s.mu.
 func (s *streamStore) evictLocked(max int) {
 	for len(s.entries) > max {
-		s.removeLocked(s.lru.Back().Value.(*streamEntry))
+		candidate := s.evictionCandidateLocked(nil)
+		if candidate == nil {
+			return
+		}
+		s.removeLocked(candidate)
 	}
 }
 
@@ -285,12 +321,28 @@ func (s *streamStore) resizeEntryLocked(e *streamEntry) {
 
 func (s *streamStore) evictBytesLocked(keep *streamEntry) {
 	for s.totalBytes > s.maxBytes && s.lru.Len() > 1 {
-		candidate := s.lru.Back().Value.(*streamEntry)
-		if candidate == keep {
-			candidate = candidate.element.Prev().Value.(*streamEntry)
+		candidate := s.evictionCandidateLocked(keep)
+		if candidate == nil {
+			return
 		}
 		s.removeLocked(candidate)
 	}
+}
+
+func (s *streamStore) evictionCandidateLocked(keep *streamEntry) *streamEntry {
+	for element := s.lru.Back(); element != nil; element = element.Prev() {
+		candidate := element.Value.(*streamEntry)
+		if candidate != keep && !candidate.active {
+			return candidate
+		}
+	}
+	for element := s.lru.Back(); element != nil; element = element.Prev() {
+		candidate := element.Value.(*streamEntry)
+		if candidate != keep {
+			return candidate
+		}
+	}
+	return nil
 }
 
 func (s *streamStore) removeLocked(e *streamEntry) {
@@ -302,15 +354,12 @@ func (s *streamStore) removeLocked(e *streamEntry) {
 	s.totalBytes -= e.bytes
 }
 
-// streamCarry holds the per-stream state keyed by streamKey(requestBody) so
-// concurrent streams do not corrupt each other.
+// streamCarry holds per-stream state. New hosts key it by a unique StreamID;
+// legacy hosts fall back to streamKey(requestBody).
 //
-// Limitation: two concurrent streams that share an identical request body also
-// share a key, so a token split across chunks in one could be reassembled
-// against the other. Full isolation requires a host-provided unique stream ID,
-// which is not currently exposed to interceptors. The request-scoped allowlist
-// (collectTokens) keeps this same-origin: both streams may only restore tokens
-// their shared request actually emitted, so no cross-request secret can leak.
+// Legacy limitation: two concurrent streams with identical request bodies
+// share a key. The request-scoped allowlist keeps this same-origin: both streams
+// may only restore tokens their shared request actually emitted.
 var streamCarry = newStreamStore()
 
 func init() {
@@ -875,8 +924,8 @@ func incompleteTokenTailForLabels(buf []byte, labels []string) int {
 // than deliver the original (still-tokenized) bytes; the withheld bytes are
 // emitted with a later chunk.
 //
-// Limitation: bytes still carried when the stream ends are lost, because the
-// host provides no end-of-stream flush callback to interceptors.
+// Bytes still carried when the stream ends are discarded by the lifecycle end
+// marker rather than emitted without a following chunk.
 func detokenizeStreamChunk(key string, chunk []byte, tokenRe *regexp.Regexp, labels []string, allowed map[string]struct{}, v *vault, isSSE bool) (out []byte, drop bool) {
 	mediaType := ""
 	if isSSE {
