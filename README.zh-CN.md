@@ -223,7 +223,7 @@ plugins:
 规则分为两类：
 
 - **字段规则** 按 JSON 键名匹配。键名命中时，该键下的整个值都会被替换。自定义字段规则上的可选 `regex` 会把匹配约束为符合该模式的值（仅限字符串值）。
-- **值规则** 按正则表达式匹配值或纯文本中的任意位置，只替换命中的片段。较早规则生成的 token 会对后续规则保持受保护状态，因此即使正则重叠也能维持单次响应还原的可逆性。
+- **值规则** 按正则表达式匹配值或纯文本中的任意位置，只替换命中的片段。若正则声明了捕获组，则只替换捕获组 1，匹配到的其余部分原样保留（见 [捕获组](#捕获组部分替换)）。较早规则生成的 token 会对后续规则保持受保护状态，因此即使正则重叠也能维持单次响应还原的可逆性。
 
 规则还可声明校验器（仅内置）：`luhn` 用于信用卡号，`china_id` 用于中国身份证号，会剔除校验和不通过的匹配。
 
@@ -255,9 +255,36 @@ plugins:
 
 默认开启：`openai_key`、`anthropic_key`、`aws_access_key`、`google_api_key`、`github_token`、`slack_token`、`bearer`、`pem_block`、`ssh_private_key`。
 
+默认开启的配置规则（匹配 `key: value` / `key=value` 形式的行，只替换值、保留键名前缀）：`config_password`、`config_secret`、`config_api_key`、`config_token`、`config_private_key`、`config_credential`。它们使用捕获组，因此带厂商前缀的键（如 `alipay_private_key`）也能覆盖，同时键名原样保留。
+
 默认关闭：`aws_secret_key`、`jwt`、`email`、`phone_cn`、`phone_e164`、`id_card_cn`（经 ID 校验）、`credit_card`（经 Luhn 校验）、`ipv4`。
 
 通过 `enabled_builtin_rules` 开启某个默认关闭的规则，或通过 `disabled_builtin_rules` 关闭某个默认开启的规则。
+
+### 捕获组（部分替换）
+
+默认情况下，值规则会把整段命中内容替换成 token。如果只想保留前缀（或后缀）、仅替换其中敏感的部分，就把该部分用**捕获组**（圆括号）包起来。当值规则的正则声明了至少一个捕获组时，只有捕获组 1 会被替换成 token，正则匹配到的其余内容原样保留。
+
+由于 Go 的 RE2 引擎不支持 lookbehind，这就是"带上下文匹配、但只脱敏其中一部分"的实现方式。
+
+```yaml
+      custom_value_rules:
+        - name: kv_secret
+          regex: '(?i)(?:password|secret|token)\s*[:=]\s*(\S+)'
+```
+
+对文本 `password: AbcdAbcd`，只有 `AbcdAbcd` 会变成 token，前缀 `password: ` 保留：
+
+```
+password: <REDACTED_1a2b3c4d5e6f7890>
+```
+
+说明：
+
+- 只使用**捕获组 1**。若只想分组而不捕获（例如 `(?:password|secret|token)` 这样的多选一），请用非捕获组 `(?:...)`，以免被当成捕获组 1。
+- 捕获组 1 前后的前缀和后缀都会被保留。
+- **没有**捕获组的规则维持原行为：整段命中被替换。
+- 捕获组匹配到空串时会被跳过，不会生成空 token。
 
 ## 已知限制
 

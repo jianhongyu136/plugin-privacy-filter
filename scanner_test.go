@@ -136,6 +136,95 @@ func TestRedactedExcerptMaximumIncludesEllipses(t *testing.T) {
 	}
 }
 
+func TestValueRuleCaptureGroupPreservesPrefix(t *testing.T) {
+	rules := compileRules(false, nil, nil, nil, []customValueRule{
+		{Name: "kv_secret", Regex: `(?i)password\s*[:=]\s*(\S+)`},
+	})
+	body := []byte(`{"note":"password: hunter2secret here"}`)
+	res := scanJSONObjectForTest(t, body, rules, testTokenRe, testRedact)
+	var out map[string]any
+	if err := json.Unmarshal(res.Body, &out); err != nil {
+		t.Fatalf("result not valid JSON: %v", err)
+	}
+	note := out["note"].(string)
+	if strings.Contains(note, "hunter2secret") {
+		t.Fatalf("captured secret not redacted: %q", note)
+	}
+	if !strings.HasPrefix(note, "password: ") {
+		t.Fatalf("prefix should be preserved verbatim: %q", note)
+	}
+	if !strings.HasSuffix(note, " here") {
+		t.Fatalf("suffix should be preserved verbatim: %q", note)
+	}
+	if !strings.Contains(note, testRedact("hunter2secret")) {
+		t.Fatalf("only the captured group should be tokenized: %q", note)
+	}
+	if len(res.Matches) != 1 || res.Matches[0].Rule != "kv_secret" || res.Matches[0].RuleType != "value" {
+		t.Fatalf("unexpected matches: %+v", res.Matches)
+	}
+}
+
+func TestValueRuleWithoutCaptureGroupReplacesWholeMatch(t *testing.T) {
+	rules := compileRules(false, nil, nil, nil, []customValueRule{
+		{Name: "whole", Regex: `password\s*[:=]\s*\S+`},
+	})
+	body := []byte(`{"note":"password: hunter2 here"}`)
+	res := scanJSONObjectForTest(t, body, rules, testTokenRe, testRedact)
+	var out map[string]any
+	if err := json.Unmarshal(res.Body, &out); err != nil {
+		t.Fatalf("result not valid JSON: %v", err)
+	}
+	note := out["note"].(string)
+	if strings.Contains(note, "password: hunter2") {
+		t.Fatalf("whole match should be redacted: %q", note)
+	}
+	if !strings.HasPrefix(note, testRedact("password: hunter2")) {
+		t.Fatalf("whole match should become a single token: %q", note)
+	}
+	if !strings.HasSuffix(note, " here") {
+		t.Fatalf("suffix should be preserved: %q", note)
+	}
+}
+
+func TestBuiltinConfigRulesDetectYAMLSecrets(t *testing.T) {
+	yaml := "username: root\n" +
+		"password: AbcdAbcd\n" +
+		"secret: sk-2JuA6Vw5NC5kGVJCr9cALsWcU9DojWSfciYLPBYRklRiJhp4JvieCeTFy675fODv\n" +
+		"app_key: skJua2VwNCr9CAL\n" +
+		"secret_key: abababababab\n" +
+		"alipay_public_key: eaeaeaeaeaeaeaeae\n" +
+		"alipay_private_key: fsfsfsfsfsfsfsfsfsf\n"
+	body, err := json.Marshal(map[string]any{"content": yaml})
+	if err != nil {
+		t.Fatalf("marshal yaml: %v", err)
+	}
+	res := scanJSONObjectForTest(t, body, testRules(), testTokenRe, testRedact)
+	var out map[string]any
+	if err := json.Unmarshal(res.Body, &out); err != nil {
+		t.Fatalf("result not valid JSON: %v", err)
+	}
+	content := out["content"].(string)
+	// Sensitive values must be gone.
+	for _, secret := range []string{"AbcdAbcd", "skJua2VwNCr9CAL", "abababababab", "fsfsfsfsfsfsfsfsfsf"} {
+		if strings.Contains(content, secret) {
+			t.Fatalf("secret %q not redacted: %q", secret, content)
+		}
+	}
+	// Non-secrets must be preserved verbatim, keys included.
+	if !strings.Contains(content, "username: root") {
+		t.Fatalf("non-secret username line should be untouched: %q", content)
+	}
+	if !strings.Contains(content, "alipay_public_key: eaeaeaeaeaeaeaeae") {
+		t.Fatalf("public key line should be untouched: %q", content)
+	}
+	// Keys of redacted lines must be preserved (only the value is a token).
+	for _, prefix := range []string{"password: ", "app_key: ", "secret_key: ", "alipay_private_key: "} {
+		if !strings.Contains(content, prefix) {
+			t.Fatalf("key prefix %q should be preserved: %q", prefix, content)
+		}
+	}
+}
+
 func TestOverlappingValueRulesDoNotRetokenizeEmittedTokens(t *testing.T) {
 	rules := compileRules(false, nil, nil, nil, []customValueRule{
 		{Name: "secret", Regex: `SECRET`},

@@ -224,31 +224,47 @@ func (s *scanner) applyValueRules(text, path string) string {
 				next = append(next, segment)
 				continue
 			}
-			matches := r.re.FindAllStringIndex(segment.value, -1)
+			matches := r.re.FindAllStringSubmatchIndex(segment.value, -1)
 			if len(matches) == 0 {
 				next = append(next, segment)
 				continue
 			}
+			// When a value rule declares capture group 1, only that
+			// submatch is tokenized and the surrounding match text
+			// (e.g. a "password:" prefix) is preserved verbatim. Rules
+			// without a capture group replace the whole match.
+			useGroup := r.re.NumSubexp() >= 1
 			last := 0
 			for _, match := range matches {
 				if match[0] > last {
 					next = append(next, textSegment{value: segment.value[last:match[0]]})
 				}
-				fragment := segment.value[match[0]:match[1]]
-				if r.validate != nil && !r.validate(fragment) {
-					next = append(next, textSegment{value: fragment})
-				} else {
-					fired = true
-					token := s.redact(fragment)
-					if s.stopAfterFirst {
-						s.recordMatch(scanMatch{Rule: r.name, RuleType: "value", Path: path, Context: token})
-					}
-					if firstToken == "" {
-						firstToken = token
-					}
-					next = append(next, textSegment{value: token, protected: true})
-				}
 				last = match[1]
+				rs, re := match[0], match[1]
+				if useGroup && match[2] >= 0 {
+					rs, re = match[2], match[3]
+				}
+				whole := segment.value[match[0]:match[1]]
+				fragment := segment.value[rs:re]
+				if re <= rs || (r.validate != nil && !r.validate(fragment)) {
+					next = append(next, textSegment{value: whole})
+					continue
+				}
+				fired = true
+				if rs > match[0] {
+					next = append(next, textSegment{value: segment.value[match[0]:rs]})
+				}
+				token := s.redact(fragment)
+				if s.stopAfterFirst {
+					s.recordMatch(scanMatch{Rule: r.name, RuleType: "value", Path: path, Context: token})
+				}
+				if firstToken == "" {
+					firstToken = token
+				}
+				next = append(next, textSegment{value: token, protected: true})
+				if re < match[1] {
+					next = append(next, textSegment{value: segment.value[re:match[1]]})
+				}
 			}
 			if last < len(segment.value) {
 				next = append(next, textSegment{value: segment.value[last:]})

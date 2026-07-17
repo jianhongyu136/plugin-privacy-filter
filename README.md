@@ -223,7 +223,7 @@ plugins:
 Rules come in two kinds:
 
 - **Field rules** match by JSON key name. When a key matches, the entire value under that key is replaced. An optional `regex` on a custom field rule constrains the match to values matching that pattern (string values only).
-- **Value rules** match by regular expression anywhere in a value or plain text, replacing only the matched span. Tokens emitted by an earlier rule are protected from later rules, preserving one-pass response restoration even when regexes overlap.
+- **Value rules** match by regular expression anywhere in a value or plain text, replacing only the matched span. If the regex declares a capture group, only capture group 1 is replaced and the rest of the match is kept verbatim (see [Capture groups](#capture-groups-partial-replacement)). Tokens emitted by an earlier rule are protected from later rules, preserving one-pass response restoration even when regexes overlap.
 
 Rules may also declare a validator (builtin only): `luhn` for credit card numbers and `china_id` for Chinese ID numbers, which drops matches that fail the checksum.
 
@@ -255,9 +255,36 @@ Configuration uses the rule names in the first column. Key matching is exact and
 
 Default-on: `openai_key`, `anthropic_key`, `aws_access_key`, `google_api_key`, `github_token`, `slack_token`, `bearer`, `pem_block`, `ssh_private_key`.
 
+Default-on config rules (match `key: value` / `key=value` lines and tokenize only the value, keeping the key prefix): `config_password`, `config_secret`, `config_api_key`, `config_token`, `config_private_key`, `config_credential`. These use a capture group so vendor-prefixed keys (e.g. `alipay_private_key`) are covered while the key name is preserved verbatim.
+
 Default-off: `aws_secret_key`, `jwt`, `email`, `phone_cn`, `phone_e164`, `id_card_cn` (ID-checksum validated), `credit_card` (Luhn validated), `ipv4`.
 
 Turn a default-off rule on via `enabled_builtin_rules`, or turn a default-on rule off via `disabled_builtin_rules`.
+
+### Capture groups (partial replacement)
+
+By default a value rule replaces its entire matched span with a token. To keep a prefix (or suffix) and replace only the sensitive portion, wrap that portion in a **capture group**. When a value rule's regex declares at least one capture group, only capture group 1 is tokenized; everything else the regex matched is preserved verbatim.
+
+This is the way to "match with context but redact only part of it", since Go's RE2 engine has no lookbehind.
+
+```yaml
+      custom_value_rules:
+        - name: kv_secret
+          regex: '(?i)(?:password|secret|token)\s*[:=]\s*(\S+)'
+```
+
+Given the text `password: AbcdAbcd`, only `AbcdAbcd` becomes a token; the `password: ` prefix is kept:
+
+```
+password: <REDACTED_1a2b3c4d5e6f7890>
+```
+
+Notes:
+
+- Only **capture group 1** is used. To group without capturing (e.g. an alternation like `(?:password|secret|token)`), use a non-capturing group `(?:...)` so it is not treated as group 1.
+- Both the prefix and suffix around group 1 are preserved.
+- A rule with **no** capture group keeps the original behavior: the whole match is replaced.
+- An empty capture-group match is skipped (no empty token is emitted).
 
 ## Known limitations
 
