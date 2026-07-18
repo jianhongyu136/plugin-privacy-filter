@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"regexp"
@@ -31,6 +32,7 @@ type semanticFrame struct {
 	lineEnding   []byte
 	dataLead     []byte
 	event        string
+	sentinel     string
 	framing      semanticFraming
 	doc          any
 	opaque       bool
@@ -50,17 +52,48 @@ type semanticPart struct {
 	flush    func(string)
 }
 
+type semanticArgumentPart struct {
+	frame    *semanticFrame
+	channel  string
+	owner    map[string]any
+	field    string
+	original any
+	text     string
+}
+
+type semanticAtomicArgument struct {
+	frame    *semanticFrame
+	owner    map[string]any
+	field    string
+	original any
+	text     string
+}
+
+type semanticArgumentTerminal struct {
+	frame         *semanticFrame
+	channel       string
+	channelPrefix string
+	flush         func(channel, tail string) bool
+}
+
+type semanticArgumentOp struct {
+	part     *semanticArgumentPart
+	terminal *semanticArgumentTerminal
+}
+
 type semanticTerminal struct {
 	channelPrefix string
 	flush         func(string) bool
 }
 
 type semanticBatch struct {
-	frames       []*semanticFrame
-	groups       map[string][]*semanticPart
-	channelOrder []string
-	terminals    []*semanticTerminal
-	excluded     []*semanticPart
+	frames          []*semanticFrame
+	groups          map[string][]*semanticPart
+	channelOrder    []string
+	terminals       []*semanticTerminal
+	excluded        []*semanticPart
+	argumentOps     []semanticArgumentOp
+	atomicArguments []*semanticAtomicArgument
 }
 
 func (b *semanticBatch) addPart(part *semanticPart) {
@@ -147,18 +180,24 @@ func parseSemanticSSEFrames(data []byte) []*semanticFrame {
 			break
 		}
 		if dataLines == 1 {
-			if doc, ok := decodeOneJSON(data[payloadStart:payloadEnd]); ok {
-				frames = append(frames, &semanticFrame{
-					start:        start,
-					next:         cursor,
-					payloadStart: payloadStart,
-					payloadEnd:   payloadEnd,
-					lineEnding:   lineEnding,
-					dataLead:     dataLead,
-					event:        event,
-					framing:      semanticSSE,
-					doc:          doc,
-				})
+			frame := &semanticFrame{
+				start:        start,
+				next:         cursor,
+				payloadStart: payloadStart,
+				payloadEnd:   payloadEnd,
+				lineEnding:   lineEnding,
+				dataLead:     dataLead,
+				event:        event,
+				framing:      semanticSSE,
+			}
+			payload := data[payloadStart:payloadEnd]
+			if bytes.Equal(payload, []byte("[DONE]")) {
+				frame.sentinel = "[DONE]"
+				frame.opaque = true
+				frames = append(frames, frame)
+			} else if doc, ok := decodeOneJSON(payload); ok {
+				frame.doc = doc
+				frames = append(frames, frame)
 			}
 		}
 		start = cursor
@@ -178,11 +217,49 @@ func parseAtomicSemanticSSEFrame(data []byte) (*semanticFrame, bool) {
 	framed = append(framed, '\n', '\n')
 
 	frames := parseSemanticSSEFrames(framed)
-	if len(frames) != 1 || frames[0].start != 0 || frames[0].next != len(framed) || frames[0].payloadEnd > len(data) {
+	if len(frames) != 1 || frames[0].sentinel != "" || frames[0].start != 0 || frames[0].next != len(framed) || frames[0].payloadEnd > len(data) {
 		return nil, false
 	}
 	frames[0].next = len(data)
 	return frames[0], true
+}
+
+func openAIChatArgumentTerminal(frame *semanticFrame, channelPrefix string) *semanticArgumentTerminal {
+	return &semanticArgumentTerminal{
+		frame:         frame,
+		channelPrefix: channelPrefix,
+		flush: func(channel, tail string) bool {
+			const choicePrefix = "argument:openai:choice:"
+			rest, ok := strings.CutPrefix(channel, choicePrefix)
+			if !ok {
+				return false
+			}
+			choiceText, toolText, ok := strings.Cut(rest, ":tool:")
+			if !ok || strings.Contains(toolText, ":") {
+				return false
+			}
+			choiceIndex, err := strconv.ParseInt(choiceText, 10, 64)
+			if err != nil || choiceIndex < 0 {
+				return false
+			}
+			toolIndex, err := strconv.ParseInt(toolText, 10, 64)
+			if err != nil || toolIndex < 0 {
+				return false
+			}
+			frame.before = append(frame.before, semanticSynthetic{doc: map[string]any{
+				"object": "chat.completion.chunk",
+				"choices": []any{map[string]any{
+					"index": choiceIndex,
+					"delta": map[string]any{"tool_calls": []any{map[string]any{
+						"index":    toolIndex,
+						"function": map[string]any{"arguments": tail},
+					}}},
+					"finish_reason": nil,
+				}},
+			}})
+			return true
+		},
+	}
 }
 
 // parseOpenAIChatSemantic adapts strict Chat Completions content deltas with
@@ -190,6 +267,11 @@ func parseAtomicSemanticSSEFrame(data []byte) (*semanticFrame, bool) {
 func parseOpenAIChatSemantic(frames []*semanticFrame) semanticBatch {
 	batch := semanticBatch{groups: make(map[string][]*semanticPart)}
 	for _, frame := range frames {
+		if frame.sentinel == "[DONE]" {
+			batch.frames = append(batch.frames, frame)
+			batch.argumentOps = append(batch.argumentOps, semanticArgumentOp{terminal: openAIChatArgumentTerminal(frame, "argument:openai:")})
+			continue
+		}
 		root, ok := frame.doc.(map[string]any)
 		if !ok {
 			continue
@@ -230,6 +312,40 @@ func parseOpenAIChatSemantic(frames []*semanticFrame) semanticBatch {
 					break
 				}
 			}
+			rawToolCalls, exists := delta["tool_calls"]
+			if !exists || rawToolCalls == nil {
+				continue
+			}
+			toolCalls, ok := rawToolCalls.([]any)
+			if !ok {
+				valid = false
+				break
+			}
+			for _, rawToolCall := range toolCalls {
+				toolCall, ok := rawToolCall.(map[string]any)
+				if !ok {
+					valid = false
+					break
+				}
+				rawFunction, exists := toolCall["function"]
+				if !exists || rawFunction == nil {
+					continue
+				}
+				function, ok := rawFunction.(map[string]any)
+				if !ok {
+					valid = false
+					break
+				}
+				if arguments, exists := function["arguments"]; exists {
+					if _, ok := arguments.(string); !ok {
+						valid = false
+						break
+					}
+				}
+			}
+			if !valid {
+				break
+			}
 		}
 		if !valid {
 			batch.addOpaqueFrame(frame)
@@ -259,6 +375,32 @@ func parseOpenAIChatSemantic(frames []*semanticFrame) semanticBatch {
 				flushFrame.changed = true
 			}
 			batch.addPart(part)
+
+			if rawToolCalls, ok := delta["tool_calls"].([]any); ok {
+				for _, rawToolCall := range rawToolCalls {
+					toolCall := rawToolCall.(map[string]any)
+					function, ok := toolCall["function"].(map[string]any)
+					if !ok {
+						continue
+					}
+					arguments, ok := function["arguments"].(string)
+					if !ok {
+						continue
+					}
+					channel := ""
+					if toolIndex, ok := nonnegativeJSONIndex(toolCall["index"]); ok {
+						channel = "argument:openai:choice:" + strconv.FormatInt(choiceIndex, 10) + ":tool:" + strconv.FormatInt(toolIndex, 10)
+					}
+					batch.argumentOps = append(batch.argumentOps, semanticArgumentOp{part: &semanticArgumentPart{
+						frame: frame, channel: channel, owner: function, field: "arguments",
+						original: function["arguments"], text: arguments,
+					}})
+				}
+			}
+			if choice["finish_reason"] != nil {
+				prefix := "argument:openai:choice:" + strconv.FormatInt(choiceIndex, 10) + ":tool:"
+				batch.argumentOps = append(batch.argumentOps, semanticArgumentOp{terminal: openAIChatArgumentTerminal(frame, prefix)})
+			}
 		}
 	}
 	return batch
@@ -282,8 +424,66 @@ func parseOpenAIChatFrames(data []byte) []*semanticFrame {
 	}}
 }
 
-// parseOpenAIResponsesSemantic adapts visible output-text events to the common
-// channel model while leaving aggregate done text outside the pending stream.
+func openAIResponsesArgumentChannel(outputIndex int64, itemID string) string {
+	return "argument:openai-response:output:" + strconv.FormatInt(outputIndex, 10) + ":item:" + base64.RawURLEncoding.EncodeToString([]byte(itemID))
+}
+
+func parseOpenAIResponsesArgumentChannel(channel string) (int64, string, bool) {
+	const prefix = "argument:openai-response:output:"
+	rest, ok := strings.CutPrefix(channel, prefix)
+	if !ok {
+		return 0, "", false
+	}
+	outputText, encodedItemID, ok := strings.Cut(rest, ":item:")
+	if !ok || outputText == "" || encodedItemID == "" || strings.Contains(encodedItemID, ":") {
+		return 0, "", false
+	}
+	for i := 0; i < len(outputText); i++ {
+		if outputText[i] < '0' || outputText[i] > '9' {
+			return 0, "", false
+		}
+	}
+	outputIndex, err := strconv.ParseInt(outputText, 10, 64)
+	if err != nil || outputIndex < 0 {
+		return 0, "", false
+	}
+	decoded, err := base64.RawURLEncoding.Strict().DecodeString(encodedItemID)
+	if err != nil || len(decoded) == 0 {
+		return 0, "", false
+	}
+	return outputIndex, string(decoded), true
+}
+
+func openAIResponsesArgumentTerminal(frame *semanticFrame, channel, channelPrefix string, sequenceNumber any) *semanticArgumentTerminal {
+	return &semanticArgumentTerminal{
+		frame:         frame,
+		channel:       channel,
+		channelPrefix: channelPrefix,
+		flush: func(flushedChannel, tail string) bool {
+			outputIndex, itemID, ok := parseOpenAIResponsesArgumentChannel(flushedChannel)
+			if !ok {
+				return false
+			}
+			doc := map[string]any{
+				"type":         "response.function_call_arguments.delta",
+				"output_index": outputIndex,
+				"item_id":      itemID,
+				"delta":        tail,
+			}
+			if number, ok := sequenceNumber.(json.Number); ok {
+				doc["sequence_number"] = number
+			}
+			frame.before = append(frame.before, semanticSynthetic{
+				event: "response.function_call_arguments.delta",
+				doc:   doc,
+			})
+			return true
+		},
+	}
+}
+
+// parseOpenAIResponsesSemantic adapts output text and function-call arguments
+// to independent semantic channels while treating aggregate arguments atomically.
 func parseOpenAIResponsesSemantic(data []byte) (*semanticBatch, bool) {
 	batch := &semanticBatch{groups: make(map[string][]*semanticPart)}
 	frames := parseSemanticSSEFrames(data)
@@ -298,88 +498,206 @@ func parseOpenAIResponsesSemantic(data []byte) (*semanticBatch, bool) {
 			continue
 		}
 		eventType, ok := root["type"].(string)
-		if !ok || (eventType != "response.output_text.delta" && eventType != "response.output_text.done") {
-			continue
-		}
-		outputIndex, ok := nonnegativeJSONIndex(root["output_index"])
 		if !ok {
-			batch.addOpaqueFrame(frame)
 			continue
-		}
-		contentIndex, ok := nonnegativeJSONIndex(root["content_index"])
-		if !ok {
-			batch.addOpaqueFrame(frame)
-			continue
-		}
-		itemID := ""
-		if rawItemID, exists := root["item_id"]; exists {
-			var valid bool
-			itemID, valid = rawItemID.(string)
-			if !valid {
-				batch.addOpaqueFrame(frame)
-				continue
-			}
-		}
-		if eventType == "response.output_text.delta" {
-			if _, ok := root["delta"].(string); !ok {
-				batch.addOpaqueFrame(frame)
-				continue
-			}
-		} else if _, ok := root["text"].(string); !ok {
-			batch.addOpaqueFrame(frame)
-			continue
-		}
-		channel := "openai-response:output:" + strconv.FormatInt(outputIndex, 10) + ":content:" + strconv.FormatInt(contentIndex, 10)
-		if itemID != "" {
-			channel += ":item:" + itemID
 		}
 
-		part := &semanticPart{
-			frame:   frame,
-			channel: channel,
-			owner:   root,
-			field:   "delta",
-		}
-		if eventType == "response.output_text.delta" {
-			delta := root["delta"].(string)
-			part.original = root["delta"]
-			part.text = delta
-			part.hasText = true
-		} else {
-			part.terminal = true
-			flushFrame := frame
-			flushOutputIndex := root["output_index"]
-			flushContentIndex := root["content_index"]
-			optionalFields := make(map[string]any, 3)
-			for _, field := range []string{"item_id", "sequence_number", "logprobs"} {
-				if value, exists := root[field]; exists {
-					optionalFields[field] = value
+		switch eventType {
+		case "response.output_text.delta", "response.output_text.done":
+			outputIndex, ok := nonnegativeJSONIndex(root["output_index"])
+			if !ok {
+				batch.addOpaqueFrame(frame)
+				continue
+			}
+			contentIndex, ok := nonnegativeJSONIndex(root["content_index"])
+			if !ok {
+				batch.addOpaqueFrame(frame)
+				continue
+			}
+			itemID := ""
+			if rawItemID, exists := root["item_id"]; exists {
+				var valid bool
+				itemID, valid = rawItemID.(string)
+				if !valid {
+					batch.addOpaqueFrame(frame)
+					continue
 				}
 			}
-			part.flush = func(restored string) {
-				doc := map[string]any{
-					"type":          "response.output_text.delta",
-					"output_index":  flushOutputIndex,
-					"content_index": flushContentIndex,
-					"delta":         restored,
+			if eventType == "response.output_text.delta" {
+				if _, ok := root["delta"].(string); !ok {
+					batch.addOpaqueFrame(frame)
+					continue
 				}
-				for field, value := range optionalFields {
-					doc[field] = value
+			} else if _, ok := root["text"].(string); !ok {
+				batch.addOpaqueFrame(frame)
+				continue
+			}
+			channel := "openai-response:output:" + strconv.FormatInt(outputIndex, 10) + ":content:" + strconv.FormatInt(contentIndex, 10)
+			if itemID != "" {
+				channel += ":item:" + itemID
+			}
+
+			part := &semanticPart{
+				frame:   frame,
+				channel: channel,
+				owner:   root,
+				field:   "delta",
+			}
+			if eventType == "response.output_text.delta" {
+				delta := root["delta"].(string)
+				part.original = root["delta"]
+				part.text = delta
+				part.hasText = true
+			} else {
+				part.terminal = true
+				flushFrame := frame
+				flushOutputIndex := root["output_index"]
+				flushContentIndex := root["content_index"]
+				optionalFields := make(map[string]any, 3)
+				for _, field := range []string{"item_id", "sequence_number", "logprobs"} {
+					if value, exists := root[field]; exists {
+						optionalFields[field] = value
+					}
 				}
-				flushFrame.before = append(flushFrame.before, semanticSynthetic{
-					event: "response.output_text.delta",
-					doc:   doc,
+				part.flush = func(restored string) {
+					doc := map[string]any{
+						"type":          "response.output_text.delta",
+						"output_index":  flushOutputIndex,
+						"content_index": flushContentIndex,
+						"delta":         restored,
+					}
+					for field, value := range optionalFields {
+						doc[field] = value
+					}
+					flushFrame.before = append(flushFrame.before, semanticSynthetic{
+						event: "response.output_text.delta",
+						doc:   doc,
+					})
+				}
+			}
+			batch.frames = append(batch.frames, frame)
+			batch.addPart(part)
+
+		case "response.function_call_arguments.delta":
+			outputIndex, indexOK := nonnegativeJSONIndex(root["output_index"])
+			itemID, itemOK := root["item_id"].(string)
+			delta, deltaOK := root["delta"].(string)
+			if !indexOK || !itemOK || itemID == "" || !deltaOK {
+				batch.addOpaqueFrame(frame)
+				continue
+			}
+			batch.frames = append(batch.frames, frame)
+			batch.argumentOps = append(batch.argumentOps, semanticArgumentOp{part: &semanticArgumentPart{
+				frame: frame, channel: openAIResponsesArgumentChannel(outputIndex, itemID),
+				owner: root, field: "delta", original: root["delta"], text: delta,
+			}})
+
+		case "response.function_call_arguments.done":
+			outputIndex, indexOK := nonnegativeJSONIndex(root["output_index"])
+			itemID, itemOK := root["item_id"].(string)
+			arguments, argumentsOK := root["arguments"].(string)
+			if !indexOK || !itemOK || itemID == "" || !argumentsOK {
+				batch.addOpaqueFrame(frame)
+				continue
+			}
+			batch.frames = append(batch.frames, frame)
+			channel := openAIResponsesArgumentChannel(outputIndex, itemID)
+			batch.argumentOps = append(batch.argumentOps, semanticArgumentOp{terminal: openAIResponsesArgumentTerminal(frame, channel, "", root["sequence_number"])})
+			batch.atomicArguments = append(batch.atomicArguments, &semanticAtomicArgument{
+				frame: frame, owner: root, field: "arguments", original: root["arguments"], text: arguments,
+			})
+
+		case "response.output_item.done":
+			item, itemOK := root["item"].(map[string]any)
+			if !itemOK {
+				batch.addOpaqueFrame(frame)
+				continue
+			}
+			itemType, typeOK := item["type"].(string)
+			if !typeOK {
+				batch.addOpaqueFrame(frame)
+				continue
+			}
+			if itemType != "function_call" {
+				continue
+			}
+			outputIndex, indexOK := nonnegativeJSONIndex(root["output_index"])
+			itemID, idOK := item["id"].(string)
+			arguments, argumentsOK := item["arguments"].(string)
+			if !indexOK || !idOK || itemID == "" || !argumentsOK {
+				batch.addOpaqueFrame(frame)
+				continue
+			}
+			batch.frames = append(batch.frames, frame)
+			channel := openAIResponsesArgumentChannel(outputIndex, itemID)
+			batch.argumentOps = append(batch.argumentOps, semanticArgumentOp{terminal: openAIResponsesArgumentTerminal(frame, channel, "", root["sequence_number"])})
+			batch.atomicArguments = append(batch.atomicArguments, &semanticAtomicArgument{
+				frame: frame, owner: item, field: "arguments", original: item["arguments"], text: arguments,
+			})
+
+		case "response.completed":
+			batch.frames = append(batch.frames, frame)
+			batch.argumentOps = append(batch.argumentOps, semanticArgumentOp{terminal: openAIResponsesArgumentTerminal(frame, "", "argument:openai-response:", root["sequence_number"])})
+			response, ok := root["response"].(map[string]any)
+			if !ok {
+				continue
+			}
+			output, ok := response["output"].([]any)
+			if !ok {
+				continue
+			}
+			for _, rawItem := range output {
+				item, ok := rawItem.(map[string]any)
+				if !ok {
+					continue
+				}
+				itemType, _ := item["type"].(string)
+				arguments, argumentsOK := item["arguments"].(string)
+				if itemType != "function_call" || !argumentsOK {
+					continue
+				}
+				batch.atomicArguments = append(batch.atomicArguments, &semanticAtomicArgument{
+					frame: frame, owner: item, field: "arguments", original: item["arguments"], text: arguments,
 				})
 			}
 		}
-		batch.frames = append(batch.frames, frame)
-		batch.addPart(part)
 	}
 	return batch, len(batch.frames) > 0
 }
 
-// parseClaudeSemantic adapts only visible text deltas and their matching block
-// stops. Thinking and tool-input deltas remain outside semantic pending state.
+func claudeArgumentTerminal(frame *semanticFrame, channel, channelPrefix string) *semanticArgumentTerminal {
+	return &semanticArgumentTerminal{
+		frame:         frame,
+		channel:       channel,
+		channelPrefix: channelPrefix,
+		flush: func(flushedChannel, tail string) bool {
+			const prefix = "argument:claude:block:"
+			indexText, ok := strings.CutPrefix(flushedChannel, prefix)
+			if !ok || indexText == "" || strings.Contains(indexText, ":") {
+				return false
+			}
+			blockIndex, err := strconv.ParseInt(indexText, 10, 64)
+			if err != nil || blockIndex < 0 {
+				return false
+			}
+			frame.before = append(frame.before, semanticSynthetic{
+				event: "content_block_delta",
+				doc: map[string]any{
+					"type":  "content_block_delta",
+					"index": blockIndex,
+					"delta": map[string]any{
+						"type":         "input_json_delta",
+						"partial_json": tail,
+					},
+				},
+			})
+			return true
+		},
+	}
+}
+
+// parseClaudeSemantic adapts visible text and tool-input deltas to independent
+// channels. Thinking deltas remain outside semantic pending state.
 func parseClaudeSemantic(data []byte) (*semanticBatch, bool) {
 	batch := &semanticBatch{groups: make(map[string][]*semanticPart)}
 	for _, frame := range parseSemanticSSEFrames(data) {
@@ -388,7 +706,12 @@ func parseClaudeSemantic(data []byte) (*semanticBatch, bool) {
 			continue
 		}
 		eventType, ok := root["type"].(string)
-		if !ok || (eventType != "content_block_delta" && eventType != "content_block_stop") {
+		if !ok || (eventType != "content_block_delta" && eventType != "content_block_stop" && eventType != "message_stop") {
+			continue
+		}
+		if eventType == "message_stop" {
+			batch.frames = append(batch.frames, frame)
+			batch.argumentOps = append(batch.argumentOps, semanticArgumentOp{terminal: claudeArgumentTerminal(frame, "", "argument:claude:")})
 			continue
 		}
 		index, ok := nonnegativeJSONIndex(root["index"])
@@ -397,10 +720,6 @@ func parseClaudeSemantic(data []byte) (*semanticBatch, bool) {
 			continue
 		}
 		channel := "claude:block:" + strconv.FormatInt(index, 10)
-		part := &semanticPart{
-			frame:   frame,
-			channel: channel,
-		}
 		if eventType == "content_block_delta" {
 			delta, ok := root["delta"].(map[string]any)
 			if !ok {
@@ -412,21 +731,38 @@ func parseClaudeSemantic(data []byte) (*semanticBatch, bool) {
 				batch.addOpaqueFrame(frame)
 				continue
 			}
-			if deltaType != "text_delta" {
+			switch deltaType {
+			case "text_delta":
+				text, ok := delta["text"].(string)
+				if !ok {
+					batch.addOpaqueFrame(frame)
+					continue
+				}
+				part := &semanticPart{
+					frame: frame, channel: channel, owner: delta, field: "text",
+					original: delta["text"], text: text, hasText: true,
+				}
+				batch.frames = append(batch.frames, frame)
+				batch.addPart(part)
+			case "input_json_delta":
+				partialJSON, ok := delta["partial_json"].(string)
+				if !ok {
+					batch.addOpaqueFrame(frame)
+					continue
+				}
+				batch.frames = append(batch.frames, frame)
+				batch.argumentOps = append(batch.argumentOps, semanticArgumentOp{part: &semanticArgumentPart{
+					frame: frame, channel: "argument:" + channel, owner: delta, field: "partial_json",
+					original: delta["partial_json"], text: partialJSON,
+				}})
+			default:
 				continue
 			}
-			text, ok := delta["text"].(string)
-			if !ok {
-				batch.addOpaqueFrame(frame)
-				continue
-			}
-			part.owner = delta
-			part.field = "text"
-			part.original = delta["text"]
-			part.text = text
-			part.hasText = true
-		} else {
-			part.terminal = true
+			continue
+		}
+
+		part := &semanticPart{frame: frame, channel: channel, terminal: true}
+		{
 			flushFrame := frame
 			flushIndex := root["index"]
 			part.flush = func(restored string) {
@@ -445,6 +781,7 @@ func parseClaudeSemantic(data []byte) (*semanticBatch, bool) {
 		}
 		batch.frames = append(batch.frames, frame)
 		batch.addPart(part)
+		batch.argumentOps = append(batch.argumentOps, semanticArgumentOp{terminal: claudeArgumentTerminal(frame, "argument:"+channel, "")})
 	}
 	return batch, len(batch.frames) > 0
 }
@@ -710,7 +1047,7 @@ func (s *streamStore) rewriteSemanticPartsWithTerminals(key string, groups map[s
 			restored := string(restoreRaw([]byte(emit), tokenRe, allowed, v))
 			nextPending := combined[len(combined)-hold:]
 			if nextPending != "" {
-				if _, exists := e.content[channel]; !exists && len(e.content) >= streamAllowlistMaxTokens {
+				if _, exists := e.content[channel]; !exists && streamEntryChannelCount(e) >= streamAllowlistMaxTokens {
 					restored += nextPending
 					nextPending = ""
 				} else if channelBaseBytes+len(channel)+len(nextPending) > s.maxBytes {
@@ -773,6 +1110,140 @@ func (s *streamStore) rewriteSemanticPartsWithTerminals(key string, groups map[s
 			}
 		}
 	}
+	s.resizeEntryLocked(e)
+	s.evictBytesLocked(e)
+	s.touchLocked(e, now)
+}
+
+func (s *streamStore) rewriteJSONArgumentOps(key string, ops []semanticArgumentOp, tokenRe *regexp.Regexp, labels []string, allowed map[string]struct{}, v *vault) {
+	if len(ops) == 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now()
+	s.purgeLocked(now)
+	e := s.getOrCreateLocked(key, now)
+	if e.arguments == nil {
+		e.arguments = make(map[string]jsonArgumentState)
+	}
+	s.resizeEntryLocked(e)
+
+	writePart := func(part *semanticArgumentPart, output string) {
+		if output == part.text {
+			return
+		}
+		part.owner[part.field] = output
+		part.frame.changed = true
+	}
+	rewriteAtomic := func(part *semanticArgumentPart) {
+		restored, changed := restoreAtomicJSONArgument(part.text, tokenRe, labels, allowed, v)
+		if changed {
+			part.owner[part.field] = restored
+			part.frame.changed = true
+		}
+	}
+	setOverflow := func() {
+		if !e.argumentOverflow {
+			if len(e.arguments) == 0 && e.bytes+1 > s.maxBytes {
+				return
+			}
+			e.argumentOverflow = true
+			s.resizeEntryLocked(e)
+		}
+	}
+	partsByFrame := make(map[*semanticFrame]map[string]*semanticArgumentPart)
+
+	for _, op := range ops {
+		if part := op.part; part != nil {
+			if part.channel == "" {
+				rewriteAtomic(part)
+				continue
+			}
+			frameParts := partsByFrame[part.frame]
+			if frameParts == nil {
+				frameParts = make(map[string]*semanticArgumentPart)
+				partsByFrame[part.frame] = frameParts
+			}
+			frameParts[part.channel] = part
+
+			prior, exists := e.arguments[part.channel]
+			if !exists && e.argumentOverflow {
+				rewriteAtomic(part)
+				continue
+			}
+			if !exists && streamEntryChannelCount(e) >= streamAllowlistMaxTokens {
+				setOverflow()
+				continue
+			}
+
+			output, next := rewriteJSONArgumentFragment(part.text, prior, tokenRe, labels, allowed, v, false)
+			candidateBytes := e.bytes + len(part.channel) + jsonArgumentStateBytes(next)
+			if exists {
+				candidateBytes -= len(part.channel) + jsonArgumentStateBytes(prior)
+			} else if len(e.arguments) == 0 && !e.argumentOverflow {
+				candidateBytes++
+			}
+			if candidateBytes > s.maxBytes {
+				if !exists {
+					setOverflow()
+					continue
+				}
+				writePart(part, prior.tail+part.text)
+				e.arguments[part.channel] = jsonArgumentState{disabled: true}
+				s.resizeEntryLocked(e)
+				continue
+			}
+
+			writePart(part, output)
+			e.arguments[part.channel] = next
+			s.resizeEntryLocked(e)
+			continue
+		}
+
+		terminal := op.terminal
+		if terminal == nil {
+			continue
+		}
+		var channels []string
+		if terminal.channel != "" {
+			if _, exists := e.arguments[terminal.channel]; exists {
+				channels = append(channels, terminal.channel)
+			}
+		} else {
+			for channel := range e.arguments {
+				if strings.HasPrefix(channel, terminal.channelPrefix) {
+					channels = append(channels, channel)
+				}
+			}
+			sort.Strings(channels)
+		}
+		for _, channel := range channels {
+			state := e.arguments[channel]
+			output, _ := rewriteJSONArgumentFragment("", state, tokenRe, labels, allowed, v, true)
+			if part := partsByFrame[terminal.frame][channel]; part != nil {
+				current, _ := part.owner[part.field].(string)
+				if output != "" {
+					part.owner[part.field] = current + output
+					part.frame.changed = true
+				}
+				delete(e.arguments, channel)
+				s.resizeEntryLocked(e)
+				continue
+			}
+			if output == "" {
+				delete(e.arguments, channel)
+				s.resizeEntryLocked(e)
+				continue
+			}
+			if terminal.flush != nil && terminal.flush(channel, output) {
+				delete(e.arguments, channel)
+				s.resizeEntryLocked(e)
+			}
+		}
+	}
+
 	s.resizeEntryLocked(e)
 	s.evictBytesLocked(e)
 	s.touchLocked(e, now)
@@ -884,6 +1355,26 @@ func restoreSemanticStream(key string, data []byte, tokenRe *regexp.Regexp, labe
 	for _, part := range batch.excluded {
 		partsByFrame[part.frame] = append(partsByFrame[part.frame], part)
 	}
+	type argumentField struct {
+		frame    *semanticFrame
+		owner    map[string]any
+		field    string
+		original any
+	}
+	argumentFieldsByFrame := make(map[*semanticFrame][]argumentField, len(batch.frames))
+	for _, op := range batch.argumentOps {
+		if op.part != nil {
+			part := op.part
+			argumentFieldsByFrame[part.frame] = append(argumentFieldsByFrame[part.frame], argumentField{
+				frame: part.frame, owner: part.owner, field: part.field, original: part.original,
+			})
+		}
+	}
+	for _, part := range batch.atomicArguments {
+		argumentFieldsByFrame[part.frame] = append(argumentFieldsByFrame[part.frame], argumentField{
+			frame: part.frame, owner: part.owner, field: part.field, original: part.original,
+		})
+	}
 	for _, frame := range batch.frames {
 		if frame.opaque {
 			continue
@@ -899,6 +1390,11 @@ func restoreSemanticStream(key string, data []byte, tokenRe *regexp.Regexp, labe
 				delete(part.owner, part.field)
 			}
 		}
+		for _, field := range argumentFieldsByFrame[frame] {
+			if _, exists := field.owner[field.field]; exists {
+				delete(field.owner, field.field)
+			}
+		}
 		r := &restorer{tokenRe: tokenRe, allowed: allowed, v: v}
 		r.walk(frame.doc)
 		if r.changed {
@@ -907,7 +1403,18 @@ func restoreSemanticStream(key string, data []byte, tokenRe *regexp.Regexp, labe
 		for _, field := range removed {
 			field.part.owner[field.part.field] = field.value
 		}
+		for _, field := range argumentFieldsByFrame[frame] {
+			field.owner[field.field] = field.original
+		}
 	}
+	for _, field := range batch.atomicArguments {
+		restored, changed := restoreAtomicJSONArgument(field.text, tokenRe, labels, allowed, v)
+		field.owner[field.field] = restored
+		if changed {
+			field.frame.changed = true
+		}
+	}
+	streamCarry.rewriteJSONArgumentOps(key, batch.argumentOps, tokenRe, labels, allowed, v)
 	streamCarry.rewriteSemanticPartsWithTerminals(key, batch.groups, batch.channelOrder, batch.terminals, tokenRe, labels, allowed, v)
 	return renderSemanticFrames(data, batch.frames, tokenRe, allowed, v), true
 }

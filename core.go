@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"strconv"
 	"strings"
 
@@ -60,6 +61,10 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 	case pluginabi.MethodPluginRegister, pluginabi.MethodPluginReconfigure:
 		cfg, err := parseLifecycleConfig(request)
 		if err != nil {
+			var schemaErr *unsupportedSchemaVersionError
+			if errors.As(err, &schemaErr) {
+				return errorEnvelope("unsupported_schema_version", schemaErr.Error()), nil
+			}
 			return errorEnvelope("invalid_config", err.Error()), nil
 		}
 		if err := applyConfig(cfg); err != nil {
@@ -101,10 +106,10 @@ type registrationCapability struct {
 
 func pluginRegistration() registration {
 	return registration{
-		SchemaVersion: pluginabi.SchemaVersion,
+		SchemaVersion: pluginabi.SchemaVersionV2,
 		Metadata: pluginapi.Metadata{
 			Name:             "Privacy Filter",
-			Version:          "0.0.1",
+			Version:          "0.0.2",
 			Author:           "jhy",
 			GitHubRepository: "https://github.com/jianhongyu136/plugin-privacy-filter",
 			ConfigFields:     configFields(),
@@ -173,7 +178,7 @@ func handleRequestIntercept(request []byte) (out []byte, err error) {
 	var handled bool
 	var scanErr *contentScanError
 	if st.mode == modeBlock {
-		result, handled, scanErr = scanRequestContentForBlock(req.Body, req.SourceFormat, st.rules, requestTokens, redact)
+		result, handled, scanErr = scanRequestContentForBlock(req.Body, req.SourceFormat, st.rules, requestTokens, redact, st.blockReturnOriginal)
 	} else {
 		result, handled, scanErr = scanRequestContent(req.Body, req.SourceFormat, st.rules, requestTokens, redact)
 	}
@@ -262,7 +267,7 @@ func handleResponseIntercept(request []byte) ([]byte, error) {
 	allowed := collectTokens(req.RequestBody, tokenRe, st.vault)
 	contentType := req.ResponseHeaders.Get("Content-Type")
 	mediaType := strings.TrimSpace(strings.SplitN(contentType, ";", 2)[0])
-	restored := restoreBodyForMediaType(req.Body, tokenRe, allowed, st.vault, mediaType)
+	restored := restoreBodyForMediaType(req.Body, tokenRe, allowed, st.vault, mediaType, req.SourceFormat)
 	var resp pluginapi.ResponseInterceptResponse
 	if len(restored) > 0 && !bytes.Equal(restored, req.Body) {
 		resp.Body = restored

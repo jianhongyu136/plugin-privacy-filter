@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 )
@@ -14,6 +15,343 @@ func detokTestSetup() (string, *regexp.Regexp) {
 	setSharedVault(newVault(100, time.Hour))
 	label := "REDACTED"
 	return label, tokenPattern(label)
+}
+
+func TestRewriteJSONArgumentFragmentAtEveryTokenSplit(t *testing.T) {
+	label := "REDACTED"
+	tokenRe := tokenPattern(label)
+	secret := "quote=\" slash=\\ line=\n tab=\t control=\x01 unicode=世界 html=<>&"
+	token := makeToken(label, secret)
+	allowed := map[string]struct{}{token: {}}
+
+	for _, encodedToken := range []string{
+		token,
+		strings.ReplaceAll(strings.ReplaceAll(token, "<", `\u003c`), ">", `\u003e`),
+		strings.ReplaceAll(strings.ReplaceAll(token, "<", `\u003C`), ">", `\u003E`),
+	} {
+		arguments := `{"value":"` + encodedToken + `"}`
+		for split := 0; split <= len(arguments); split++ {
+			v := newVault(4, time.Hour)
+			v.Put(token, secret)
+			first, state := rewriteJSONArgumentFragment(arguments[:split], jsonArgumentState{}, tokenRe, []string{label}, allowed, v, false)
+			second, state := rewriteJSONArgumentFragment(arguments[split:], state, tokenRe, []string{label}, allowed, v, true)
+			if state.tail != "" {
+				t.Fatalf("representation %q split %d retained tail %q", encodedToken, split, state.tail)
+			}
+			var got map[string]string
+			if err := json.Unmarshal([]byte(first+second), &got); err != nil {
+				t.Fatalf("representation %q split %d produced invalid JSON %q: %v", encodedToken, split, first+second, err)
+			}
+			if got["value"] != secret {
+				t.Fatalf("representation %q split %d value = %q, want %q", encodedToken, split, got["value"], secret)
+			}
+		}
+	}
+}
+
+func TestRewriteJSONArgumentFragmentFocusedCases(t *testing.T) {
+	label := "REDACTED"
+	tokenRe := tokenPattern(label)
+
+	t.Run("escaped delimiter case combinations", func(t *testing.T) {
+		secret := "secret"
+		token := makeToken(label, secret)
+		for _, opening := range []byte{'c', 'C'} {
+			for _, closing := range []byte{'e', 'E'} {
+				encodedToken := `\u003` + string(opening) + token[1:len(token)-1] + `\u003` + string(closing)
+				argument := `{"value":"` + encodedToken + `"}`
+				v := newVault(1, time.Hour)
+				v.Put(token, secret)
+				got, _ := rewriteJSONArgumentFragment(argument, jsonArgumentState{}, tokenRe, []string{label}, map[string]struct{}{token: {}}, v, true)
+				if got != `{"value":"secret"}` {
+					t.Fatalf("delimiters %c/%c restored to %q", opening, closing, got)
+				}
+			}
+		}
+	})
+
+	t.Run("multiple tokens", func(t *testing.T) {
+		firstToken := makeToken(label, "first")
+		secondToken := makeToken(label, "second")
+		argument := `{"values":["` + firstToken + `","` + secondToken + `"]}`
+		v := newVault(2, time.Hour)
+		v.Put(firstToken, "first")
+		v.Put(secondToken, "second")
+		allowed := map[string]struct{}{firstToken: {}, secondToken: {}}
+		got, _ := rewriteJSONArgumentFragment(argument, jsonArgumentState{}, tokenRe, []string{label}, allowed, v, true)
+		if got != `{"values":["first","second"]}` {
+			t.Fatalf("multiple token restoration = %q", got)
+		}
+	})
+
+	t.Run("object key", func(t *testing.T) {
+		token := makeToken(label, "restored-key")
+		argument := `{"` + token + `":"value"}`
+		v := newVault(1, time.Hour)
+		v.Put(token, "restored-key")
+		got, _ := rewriteJSONArgumentFragment(argument, jsonArgumentState{}, tokenRe, []string{label}, map[string]struct{}{token: {}}, v, true)
+		if got != `{"restored-key":"value"}` {
+			t.Fatalf("object key restoration = %q", got)
+		}
+	})
+
+	t.Run("embedded in larger string", func(t *testing.T) {
+		token := makeToken(label, "middle")
+		argument := `{"value":"before ` + token + ` after"}`
+		v := newVault(1, time.Hour)
+		v.Put(token, "middle")
+		got, _ := rewriteJSONArgumentFragment(argument, jsonArgumentState{}, tokenRe, []string{label}, map[string]struct{}{token: {}}, v, true)
+		if got != `{"value":"before middle after"}` {
+			t.Fatalf("embedded token restoration = %q", got)
+		}
+	})
+
+	t.Run("restored secret is not rescanned", func(t *testing.T) {
+		innerToken := makeToken(label, "inner-secret")
+		outerSecret := "contains " + innerToken
+		outerToken := makeToken(label, outerSecret)
+		argument := `{"value":"` + outerToken + `"}`
+		v := newVault(2, time.Hour)
+		v.Put(innerToken, "inner-secret")
+		v.Put(outerToken, outerSecret)
+		allowed := map[string]struct{}{innerToken: {}, outerToken: {}}
+		got, _ := rewriteJSONArgumentFragment(argument, jsonArgumentState{}, tokenRe, []string{label}, allowed, v, true)
+		if got != `{"value":"contains `+innerToken+`"}` {
+			t.Fatalf("restored secret was rescanned: %q", got)
+		}
+	})
+
+	t.Run("outside JSON string", func(t *testing.T) {
+		token := makeToken(label, "secret")
+		argument := `123 ` + token
+		v := newVault(1, time.Hour)
+		v.Put(token, "secret")
+		got, _ := rewriteJSONArgumentFragment(argument, jsonArgumentState{}, tokenRe, []string{label}, map[string]struct{}{token: {}}, v, true)
+		if got != argument {
+			t.Fatalf("token outside string changed: %q", got)
+		}
+	})
+
+	t.Run("invalid escape split disables channel", func(t *testing.T) {
+		token := makeToken(label, "secret")
+		firstFragment := `{"value":"bad\`
+		secondFragment := `q` + token + `"}`
+		v := newVault(1, time.Hour)
+		v.Put(token, "secret")
+		first, state := rewriteJSONArgumentFragment(firstFragment, jsonArgumentState{}, tokenRe, []string{label}, map[string]struct{}{token: {}}, v, false)
+		second, state := rewriteJSONArgumentFragment(secondFragment, state, tokenRe, []string{label}, map[string]struct{}{token: {}}, v, true)
+		if !state.disabled {
+			t.Fatal("invalid escape did not disable channel")
+		}
+		if state.tail != "" {
+			t.Fatalf("disabled channel retained tail %q", state.tail)
+		}
+		if got := first + second; got != firstFragment+secondFragment {
+			t.Fatalf("invalid source changed: got %q want %q", got, firstFragment+secondFragment)
+		}
+	})
+
+	t.Run("disabled channel emits retained bytes", func(t *testing.T) {
+		got, state := rewriteJSONArgumentFragment("fragment", jsonArgumentState{tail: "retained", disabled: true}, tokenRe, []string{label}, nil, nil, false)
+		if got != "retainedfragment" {
+			t.Fatalf("disabled channel output = %q, want %q", got, "retainedfragment")
+		}
+		if !state.disabled || state.tail != "" {
+			t.Fatalf("disabled channel state = %+v", state)
+		}
+	})
+
+	t.Run("escaped gate misses preserve bytes", func(t *testing.T) {
+		token := makeToken(label, "secret")
+		argument := `{"value":"\u003C` + token[1:len(token)-1] + `\u003e"}`
+		tests := []struct {
+			name    string
+			allowed map[string]struct{}
+			vault   *vault
+		}{
+			{name: "vault", allowed: map[string]struct{}{token: {}}, vault: newVault(1, time.Hour)},
+			{name: "allowlist", allowed: nil, vault: func() *vault {
+				v := newVault(1, time.Hour)
+				v.Put(token, "secret")
+				return v
+			}()},
+		}
+		for _, test := range tests {
+			t.Run(test.name, func(t *testing.T) {
+				got, _ := rewriteJSONArgumentFragment(argument, jsonArgumentState{}, tokenRe, []string{label}, test.allowed, test.vault, true)
+				if got != argument {
+					t.Fatalf("gate miss changed escaped token: got %q want %q", got, argument)
+				}
+			})
+		}
+	})
+}
+
+func TestRewriteJSONArgumentFragmentRequiresBothGates(t *testing.T) {
+	label := "REDACTED"
+	tokenRe := tokenPattern(label)
+	token := makeToken(label, "secret")
+	argument := `{"value":"` + token + `"}`
+
+	vaultMiss, _ := rewriteJSONArgumentFragment(argument, jsonArgumentState{}, tokenRe, []string{label}, map[string]struct{}{token: {}}, newVault(1, time.Hour), true)
+	if vaultMiss != argument {
+		t.Fatalf("vault miss changed argument: %q", vaultMiss)
+	}
+
+	v := newVault(1, time.Hour)
+	v.Put(token, "secret")
+	allowlistMiss, _ := rewriteJSONArgumentFragment(argument, jsonArgumentState{}, tokenRe, []string{label}, nil, v, true)
+	if allowlistMiss != argument {
+		t.Fatalf("allowlist miss changed argument: %q", allowlistMiss)
+	}
+}
+
+func TestRewriteJSONArgumentFragmentVaultExpiryBetweenFragments(t *testing.T) {
+	label := "REDACTED"
+	tokenRe := tokenPattern(label)
+	token := makeToken(label, "secret")
+	argument := `{"value":"` + token + `"}`
+	split := strings.Index(argument, token) + len(token)/2
+	v := newVault(1, time.Hour)
+	v.Put(token, "secret")
+
+	first, state := rewriteJSONArgumentFragment(argument[:split], jsonArgumentState{}, tokenRe, []string{label}, map[string]struct{}{token: {}}, v, false)
+	v.mu.Lock()
+	v.items[token].Value.(*vaultEntry).expiresAt = time.Now().Add(-time.Second)
+	v.mu.Unlock()
+	second, state := rewriteJSONArgumentFragment(argument[split:], state, tokenRe, []string{label}, map[string]struct{}{token: {}}, v, true)
+	if state.tail != "" {
+		t.Fatalf("expiry retained tail %q", state.tail)
+	}
+	if got := first + second; got != argument {
+		t.Fatalf("expired token changed: got %q want %q", got, argument)
+	}
+}
+
+func TestRewriteJSONArgumentFragmentIsOnePass(t *testing.T) {
+	label := "REDACTED"
+	tokenRe := tokenPattern(label)
+	innerToken := makeToken(label, "inner")
+	outerSecret := "prefix " + innerToken + " suffix"
+	outerToken := makeToken(label, outerSecret)
+	argument := `{"value":"` + outerToken + `"}`
+	v := newVault(2, time.Hour)
+	v.Put(innerToken, "inner")
+	v.Put(outerToken, outerSecret)
+	allowed := map[string]struct{}{innerToken: {}, outerToken: {}}
+
+	got, _ := rewriteJSONArgumentFragment(argument, jsonArgumentState{}, tokenRe, []string{label}, allowed, v, true)
+	want := `{"value":"prefix ` + innerToken + ` suffix"}`
+	if got != want {
+		t.Fatalf("one-pass restoration = %q, want %q", got, want)
+	}
+}
+
+func TestRewriteJSONArgumentFragmentStateBytes(t *testing.T) {
+	state := jsonArgumentState{tail: "abc"}
+	if got := jsonArgumentStateBytes(state); got != 11 {
+		t.Fatalf("jsonArgumentStateBytes = %d, want 11", got)
+	}
+}
+
+func TestStreamStoreByteAccountingIncludesArgumentState(t *testing.T) {
+	store := newStreamStore()
+	key := "stream"
+	channel := "argument:openai:choice:0:tool:1"
+	state := jsonArgumentState{tail: `\u003cREDACTED_1a2b`, disabled: true}
+
+	store.mu.Lock()
+	entry := store.getOrCreateLocked(key, time.Now())
+	entry.arguments = map[string]jsonArgumentState{channel: state}
+	store.resizeEntryLocked(entry)
+	got := entry.bytes
+	store.mu.Unlock()
+
+	want := len(key) + len(channel) + jsonArgumentStateBytes(state) + 1
+	if got != want {
+		t.Fatalf("argument state bytes = %d, want %d", got, want)
+	}
+}
+
+func TestRewriteJSONArgumentFragmentCopiesRetainedTail(t *testing.T) {
+	label := "REDACTED"
+	tokenRe := tokenPattern(label)
+	token := makeToken(label, "secret")
+	partial := token[:len(token)-1]
+	largeValue := strings.Repeat("x", 1<<20)
+	v := newVault(1, time.Hour)
+	v.Put(token, "secret")
+	allowed := map[string]struct{}{token: {}}
+
+	for _, test := range []struct {
+		name     string
+		fragment string
+	}{
+		{name: "without match", fragment: `{"value":"` + largeValue + partial},
+		{name: "with match", fragment: `{"value":"` + token + largeValue + partial},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, state := rewriteJSONArgumentFragment(test.fragment, jsonArgumentState{}, tokenRe, []string{label}, allowed, v, false)
+			if state.tail != partial {
+				t.Fatalf("retained tail = %q, want %q", state.tail, partial)
+			}
+
+			fragmentStart := uintptr(unsafe.Pointer(unsafe.StringData(test.fragment)))
+			fragmentEnd := fragmentStart + uintptr(len(test.fragment))
+			tailStart := uintptr(unsafe.Pointer(unsafe.StringData(state.tail)))
+			if tailStart >= fragmentStart && tailStart < fragmentEnd {
+				t.Fatalf("retained tail aliases %d-byte fragment backing storage", len(test.fragment))
+			}
+		})
+	}
+}
+
+func TestRewriteJSONArgumentFragmentEscapedScanIsLinear(t *testing.T) {
+	label := "REDACTED"
+	tokenRe := tokenPattern(label)
+	token := makeToken(label, "secret")
+	encodedToken := strings.ReplaceAll(strings.ReplaceAll(token, "<", `\u003C`), ">", `\u003e`)
+	repeatedOpenings := strings.Repeat(`\u003c`, 4096)
+	argument := `{"value":"` + repeatedOpenings + encodedToken + `"}`
+
+	work := 0
+	matches := findJSONArgumentMatchesWithWork(argument, jsonArgumentLexState{}, tokenRe, &work)
+	if len(matches) != 1 || matches[0].canonical != token {
+		t.Fatalf("escaped matches = %+v, want only %q", matches, token)
+	}
+	if work > 4*len(argument) {
+		t.Fatalf("escaped scan work = %d for %d bytes, want at most four operations per byte", work, len(argument))
+	}
+}
+
+func TestRestoreAtomicJSONArgumentRejectsMalformedJSON(t *testing.T) {
+	label, tokenRe := detokTestSetup()
+	token := makeToken(label, "secret")
+	getSharedVault().Put(token, "secret")
+	malformed := `{"value":"` + token
+	got, changed := restoreAtomicJSONArgument(malformed, tokenRe, []string{label}, map[string]struct{}{token: {}}, getSharedVault())
+	if changed || got != malformed {
+		t.Fatalf("malformed argument changed: changed=%v got=%q", changed, got)
+	}
+}
+
+func TestRestoreAtomicJSONArgumentReportsByteChanges(t *testing.T) {
+	label := "REDACTED"
+	tokenRe := tokenPattern(label)
+	token := makeToken(label, "secret")
+	v := newVault(1, time.Hour)
+	v.Put(token, "secret")
+	allowed := map[string]struct{}{token: {}}
+
+	restored, changed := restoreAtomicJSONArgument(`{"value":"`+token+`"}`, tokenRe, []string{label}, allowed, v)
+	if !changed || restored != `{"value":"secret"}` {
+		t.Fatalf("restored argument: changed=%v got=%q", changed, restored)
+	}
+	unchanged := `{"value":"plain"}`
+	got, changed := restoreAtomicJSONArgument(unchanged, tokenRe, []string{label}, allowed, v)
+	if changed || got != unchanged {
+		t.Fatalf("unchanged argument: changed=%v got=%q", changed, got)
+	}
 }
 
 func TestRestoreTokensLeavesUnknown(t *testing.T) {
@@ -44,6 +382,7 @@ func TestIsTokenPrefix(t *testing.T) {
 		{"<REDACTED_", true},
 		{"<REDACTED_1a2b", true},
 		{"<div", false},
+		{"<NOTLABEL_123456", false},
 		{"<REDACTED_z", false},                 // z is not hex
 		{"<REDACTED_00000000000000000", false}, // 17 hex, too long
 	}

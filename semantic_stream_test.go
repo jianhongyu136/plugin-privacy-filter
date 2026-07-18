@@ -206,6 +206,38 @@ func TestSemanticOpenAIChatPendingEmptyDeltaPreservesFrame(t *testing.T) {
 	}
 }
 
+func TestSemanticOpenAIChatBareJSONTerminalSkipsEmptyArgumentFlush(t *testing.T) {
+	const (
+		key   = "semantic-openai-bare-json-terminal"
+		label = "REDACTED"
+	)
+	streamCarry.reset(key)
+	defer streamCarry.reset(key)
+
+	argument := []byte(`{"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"value\":\"plain\"}"}}]},"finish_reason":null}]}`)
+	if out, handled := restoreSemanticStream(key, argument, tokenPattern(label), []string{label}, nil, newVault(1, time.Hour), "text/event-stream", formatOpenAI); !handled || !bytes.Equal(out, argument) {
+		t.Fatalf("bare JSON argument frame changed: handled=%v out=%q want=%q", handled, out, argument)
+	}
+
+	terminal := []byte(`{"object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`)
+	out, handled := restoreSemanticStream(key, terminal, tokenPattern(label), []string{label}, nil, newVault(1, time.Hour), "text/event-stream", formatOpenAI)
+	if !handled {
+		t.Fatal("bare JSON terminal frame was not handled")
+	}
+	if !bytes.Equal(out, terminal) {
+		t.Fatalf("bare JSON terminal emitted an empty argument flush: out=%q want=%q", out, terminal)
+	}
+	if !json.Valid(out) {
+		t.Fatalf("bare JSON terminal became invalid JSON: %q", out)
+	}
+	streamCarry.mu.Lock()
+	entry := streamCarry.entries[key]
+	streamCarry.mu.Unlock()
+	if entry != nil && len(entry.arguments) != 0 {
+		t.Fatalf("bare JSON terminal retained argument state: %#v", entry.arguments)
+	}
+}
+
 func TestSemanticPendingFailsOpenWhenEntryWouldExceedByteBudget(t *testing.T) {
 	const (
 		key      = "stream"
@@ -305,6 +337,222 @@ func TestSemanticPendingFailsOpenWhenEntryWouldExceedByteBudget(t *testing.T) {
 			t.Fatalf("pending and current bytes did not fail open: got=%#v want=%q changed=%v", got, want, frame.changed)
 		}
 	})
+}
+
+func TestRewriteJSONArgumentOpsFlushesTailBeforeTerminal(t *testing.T) {
+	const (
+		key     = "argument-terminal"
+		channel = "argument:openai:choice:0:tool:1"
+		suffix  = `\u003cREDACTED_1a2b`
+	)
+	store := newStreamStore()
+	owner := map[string]any{"arguments": `{"value":"` + suffix}
+	partFrame := &semanticFrame{}
+	terminalFrame := &semanticFrame{}
+	ops := []semanticArgumentOp{
+		{part: &semanticArgumentPart{
+			frame: partFrame, channel: channel, owner: owner, field: "arguments",
+			original: owner["arguments"], text: owner["arguments"].(string),
+		}},
+		{terminal: &semanticArgumentTerminal{
+			frame: terminalFrame, channel: channel,
+			flush: func(flushedChannel, tail string) bool {
+				terminalFrame.before = append(terminalFrame.before, semanticSynthetic{doc: map[string]any{
+					"channel": flushedChannel,
+					"delta":   tail,
+				}})
+				return true
+			},
+		}},
+	}
+
+	store.rewriteJSONArgumentOps(key, ops, tokenPattern("REDACTED"), []string{"REDACTED"}, nil, newVault(1, time.Hour))
+
+	if got, want := owner["arguments"], `{"value":"`; got != want || !partFrame.changed {
+		t.Fatalf("split argument output = %#v, want %q; changed=%v", got, want, partFrame.changed)
+	}
+	if len(terminalFrame.before) != 1 {
+		t.Fatalf("terminal synthetic deltas = %d, want 1", len(terminalFrame.before))
+	}
+	doc := terminalFrame.before[0].doc
+	if got := doc["channel"]; got != channel {
+		t.Fatalf("flushed channel = %#v, want %q", got, channel)
+	}
+	if got := doc["delta"]; got != suffix {
+		t.Fatalf("flushed tail = %#v, want %q", got, suffix)
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if _, exists := store.entries[key].arguments[channel]; exists {
+		t.Fatalf("terminal retained argument channel %q", channel)
+	}
+}
+
+func TestRewriteJSONArgumentOpsRetainsLexicalStateWithoutTail(t *testing.T) {
+	const (
+		key     = "argument-lexical-state"
+		channel = "argument:openai:choice:0:tool:1"
+		label   = "REDACTED"
+	)
+	store := newStreamStore()
+	firstOwner := map[string]any{"arguments": `{"value":"plain`}
+	first := &semanticArgumentPart{
+		frame: &semanticFrame{}, channel: channel, owner: firstOwner, field: "arguments",
+		original: firstOwner["arguments"], text: firstOwner["arguments"].(string),
+	}
+	store.rewriteJSONArgumentOps(key, []semanticArgumentOp{{part: first}}, tokenPattern(label), []string{label}, nil, newVault(1, time.Hour))
+
+	store.mu.Lock()
+	state, exists := store.entries[key].arguments[channel]
+	store.mu.Unlock()
+	if !exists || state.tail != "" || state.next.mode != jsonArgumentInsideString {
+		t.Fatalf("first fragment state = %+v, exists=%v; want empty tail inside string", state, exists)
+	}
+
+	token := makeToken(label, "secret")
+	v := newVault(1, time.Hour)
+	v.Put(token, "secret")
+	secondOwner := map[string]any{"arguments": token + `"}`}
+	second := &semanticArgumentPart{
+		frame: &semanticFrame{}, channel: channel, owner: secondOwner, field: "arguments",
+		original: secondOwner["arguments"], text: secondOwner["arguments"].(string),
+	}
+	store.rewriteJSONArgumentOps(key, []semanticArgumentOp{{part: second}}, tokenPattern(label), []string{label}, map[string]struct{}{token: {}}, v)
+
+	if got, want := secondOwner["arguments"], `secret"}`; got != want || !second.frame.changed {
+		t.Fatalf("second fragment output = %#v, want %q; changed=%v", got, want, second.frame.changed)
+	}
+}
+
+func TestRewriteJSONArgumentOpsSharesVisibleChannelLimit(t *testing.T) {
+	const (
+		key     = "argument-shared-channel-limit"
+		channel = "argument:openai:choice:0:tool:new"
+		label   = "REDACTED"
+	)
+	store := newStreamStore()
+	store.mu.Lock()
+	entry := store.getOrCreateLocked(key, time.Now())
+	entry.content = make(map[string]string, streamAllowlistMaxTokens)
+	for i := 0; i < streamAllowlistMaxTokens; i++ {
+		entry.content[fmt.Sprintf("visible:%d", i)] = "pending"
+	}
+	store.resizeEntryLocked(entry)
+	store.mu.Unlock()
+
+	token := makeToken(label, "secret")
+	v := newVault(1, time.Hour)
+	v.Put(token, "secret")
+	fragment := `{"value":"` + token + `"}`
+	owner := map[string]any{"arguments": fragment}
+	part := &semanticArgumentPart{
+		frame: &semanticFrame{}, channel: channel, owner: owner, field: "arguments",
+		original: fragment, text: fragment,
+	}
+	store.rewriteJSONArgumentOps(key, []semanticArgumentOp{{part: part}}, tokenPattern(label), []string{label}, map[string]struct{}{token: {}}, v)
+
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	entry = store.entries[key]
+	if got := owner["arguments"]; got != fragment || part.frame.changed {
+		t.Fatalf("overflow argument changed: got=%#v want=%q changed=%v", got, fragment, part.frame.changed)
+	}
+	if !entry.argumentOverflow {
+		t.Fatal("shared channel limit did not set argument overflow")
+	}
+	if _, exists := entry.arguments[channel]; exists {
+		t.Fatalf("overflow argument channel %q was retained", channel)
+	}
+}
+
+func TestRewriteJSONArgumentOpsFailsOpenAtByteLimit(t *testing.T) {
+	const (
+		key     = "stream"
+		channel = "argument:openai:choice:0:tool:1"
+		label   = "REDACTED"
+		prior   = `\u003cREDACTED_`
+		current = "1"
+	)
+	store := newStreamStoreWithLimits(time.Minute, len(key)+len(channel)+jsonArgumentStateFixedBytes+1)
+	insideString := advanceJSONArgumentLex(jsonArgumentLexState{}, `{"value":"`)
+	priorState := jsonArgumentState{
+		tail:      prior,
+		tailStart: insideString,
+		next:      advanceJSONArgumentLex(insideString, prior),
+	}
+	store.mu.Lock()
+	entry := store.getOrCreateLocked(key, time.Now())
+	entry.arguments = map[string]jsonArgumentState{channel: priorState}
+	store.resizeEntryLocked(entry)
+	store.mu.Unlock()
+
+	owner := map[string]any{"arguments": current}
+	part := &semanticArgumentPart{
+		frame: &semanticFrame{}, channel: channel, owner: owner, field: "arguments",
+		original: current, text: current,
+	}
+	store.rewriteJSONArgumentOps(key, []semanticArgumentOp{{part: part}}, tokenPattern(label), []string{label}, nil, newVault(1, time.Hour))
+
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	entry = store.entries[key]
+	if got, want := owner["arguments"], prior+current; got != want || !part.frame.changed {
+		t.Fatalf("byte refusal output = %#v, want %q; changed=%v", got, want, part.frame.changed)
+	}
+	state := entry.arguments[channel]
+	if !state.disabled || state.tail != "" {
+		t.Fatalf("byte refusal state = %+v, want bounded disabled marker", state)
+	}
+	if entry.bytes > store.maxBytes || store.totalBytes > store.maxBytes {
+		t.Fatalf("argument state exceeds budget: entry=%d total=%d max=%d", entry.bytes, store.totalBytes, store.maxBytes)
+	}
+}
+
+func TestRewriteJSONArgumentOpsOverflowLatchStaysWithinExactByteLimit(t *testing.T) {
+	const (
+		key             = "exact-argument-limit"
+		existingChannel = "argument:openai:choice:0:tool:0"
+		refusedChannel  = "argument:openai:choice:0:tool:1"
+		label           = "REDACTED"
+	)
+	store := newStreamStoreWithLimits(time.Minute, 1<<20)
+	store.mu.Lock()
+	entry := store.getOrCreateLocked(key, time.Now())
+	entry.arguments = map[string]jsonArgumentState{
+		existingChannel: {next: advanceJSONArgumentLex(jsonArgumentLexState{}, `{"sent":"plain"}`)},
+	}
+	store.resizeEntryLocked(entry)
+	store.maxBytes = entry.bytes
+	wantMax := store.maxBytes
+	store.mu.Unlock()
+
+	token := makeToken(label, "secret")
+	fragment := `{"value":"` + token[:len(token)/2]
+	owner := map[string]any{"arguments": fragment}
+	part := &semanticArgumentPart{
+		frame: &semanticFrame{}, channel: refusedChannel, owner: owner, field: "arguments",
+		original: fragment, text: fragment,
+	}
+	store.rewriteJSONArgumentOps(key, []semanticArgumentOp{{part: part}}, tokenPattern(label), []string{label}, map[string]struct{}{token: {}}, newVault(1, time.Hour))
+
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	entry = store.entries[key]
+	if got := owner["arguments"]; got != fragment || part.frame.changed {
+		t.Fatalf("refused fragment did not fail open in source order: got=%#v want=%q changed=%v", got, fragment, part.frame.changed)
+	}
+	if !entry.argumentOverflow {
+		t.Fatal("exact-limit refusal did not set argument overflow latch")
+	}
+	if _, exists := entry.arguments[existingChannel]; !exists {
+		t.Fatalf("exact-limit refusal removed existing channel: %#v", entry.arguments)
+	}
+	if _, exists := entry.arguments[refusedChannel]; exists {
+		t.Fatalf("exact-limit refusal retained new channel %q", refusedChannel)
+	}
+	if entry.bytes > wantMax || store.totalBytes > wantMax {
+		t.Fatalf("overflow latch exceeded exact budget: entry=%d total=%d max=%d", entry.bytes, store.totalBytes, wantMax)
+	}
 }
 
 func TestSemanticStreamChannelLimitFailsOpen(t *testing.T) {

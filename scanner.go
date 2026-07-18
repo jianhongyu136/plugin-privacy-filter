@@ -10,8 +10,8 @@ import (
 
 const scanContextMaxRunes = 160
 
-// scanMatch records a single redaction. Context is derived only from the final
-// redacted value; it never contains the matched plaintext.
+// scanMatch records a single redaction. Context normally contains only redacted
+// output; block mode may opt in to a bounded copy of the matched plaintext.
 type scanMatch struct {
 	Rule     string
 	RuleType string // "field" or "value"
@@ -43,6 +43,7 @@ type scanner struct {
 	tokenRe        tokenMatcher
 	redact         redactFunc
 	stopAfterFirst bool
+	returnOriginal bool
 	matches        []scanMatch
 }
 
@@ -145,7 +146,7 @@ func (s *scanner) redactWhole(value, ruleName, path string) string {
 		return value
 	}
 	token := s.redact(value)
-	s.recordMatch(scanMatch{Rule: ruleName, RuleType: "field", Path: path, Context: token})
+	s.recordMatch(scanMatch{Rule: ruleName, RuleType: "field", Path: path, Context: s.blockContext(value, token)})
 	return token
 }
 
@@ -167,7 +168,7 @@ func (s *scanner) redactWholeValue(value any, ruleName, path string) any {
 		return value
 	}
 	token := s.redact(string(raw))
-	s.recordMatch(scanMatch{Rule: ruleName, RuleType: "field", Path: path, Context: token})
+	s.recordMatch(scanMatch{Rule: ruleName, RuleType: "field", Path: path, Context: s.blockContext(string(raw), token)})
 	return token
 }
 
@@ -256,7 +257,7 @@ func (s *scanner) applyValueRules(text, path string) string {
 				}
 				token := s.redact(fragment)
 				if s.stopAfterFirst {
-					s.recordMatch(scanMatch{Rule: r.name, RuleType: "value", Path: path, Context: token})
+					s.recordMatch(scanMatch{Rule: r.name, RuleType: "value", Path: path, Context: s.blockContext(fragment, token)})
 				}
 				if firstToken == "" {
 					firstToken = token
@@ -287,6 +288,17 @@ func (s *scanner) applyValueRules(text, path string) string {
 		s.matches[item.matchIndex].Context = redactedExcerpt(text, item.token)
 	}
 	return text
+}
+
+func (s *scanner) blockContext(original, token string) string {
+	if !s.returnOriginal {
+		return token
+	}
+	runes := []rune(original)
+	if len(runes) <= scanContextMaxRunes {
+		return original
+	}
+	return string(runes[:scanContextMaxRunes-3]) + "..."
 }
 
 func redactedExcerpt(text, focus string) string {

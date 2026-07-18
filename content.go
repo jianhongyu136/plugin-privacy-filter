@@ -54,17 +54,17 @@ func classifyFormat(sourceFormat string) formatDisposition {
 // content regions cannot be located) or the format is unrecognized; the caller
 // treats that as a reason to reject the request.
 func scanRequestContent(body []byte, sourceFormat string, rules ruleSet, tokenRe tokenMatcher, redact redactFunc) (scanResult, bool, *contentScanError) {
-	return scanRequestContentWithMode(body, sourceFormat, rules, tokenRe, redact, false)
+	return scanRequestContentWithMode(body, sourceFormat, rules, tokenRe, redact, false, false)
 }
 
 // scanRequestContentForBlock validates the complete request, then stops rule
 // scanning after the first finding. Blocked bodies are never sent upstream, so
 // the mutated document is deliberately not re-encoded.
-func scanRequestContentForBlock(body []byte, sourceFormat string, rules ruleSet, tokenRe tokenMatcher, redact redactFunc) (scanResult, bool, *contentScanError) {
-	return scanRequestContentWithMode(body, sourceFormat, rules, tokenRe, redact, true)
+func scanRequestContentForBlock(body []byte, sourceFormat string, rules ruleSet, tokenRe tokenMatcher, redact redactFunc, returnOriginal bool) (scanResult, bool, *contentScanError) {
+	return scanRequestContentWithMode(body, sourceFormat, rules, tokenRe, redact, true, returnOriginal)
 }
 
-func scanRequestContentWithMode(body []byte, sourceFormat string, rules ruleSet, tokenRe tokenMatcher, redact redactFunc, stopAfterFirst bool) (scanResult, bool, *contentScanError) {
+func scanRequestContentWithMode(body []byte, sourceFormat string, rules ruleSet, tokenRe tokenMatcher, redact redactFunc, stopAfterFirst, returnOriginal bool) (scanResult, bool, *contentScanError) {
 	doc, ok := decodeJSONObject(body)
 	if !ok {
 		return scanResult{}, false, nil
@@ -83,7 +83,7 @@ func scanRequestContentWithMode(body []byte, sourceFormat string, rules ruleSet,
 		return scanResult{}, true, err
 	}
 
-	s := &scanner{rules: rules, tokenRe: tokenRe, redact: redact, stopAfterFirst: stopAfterFirst}
+	s := &scanner{rules: rules, tokenRe: tokenRe, redact: redact, stopAfterFirst: stopAfterFirst, returnOriginal: returnOriginal}
 	var scanErr *contentScanError
 	if stopAfterFirst {
 		scanErr = scanFormatContentUntilBlockMatch(s, doc, sourceFormat)

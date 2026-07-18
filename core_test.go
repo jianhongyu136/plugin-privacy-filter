@@ -36,6 +36,9 @@ func callRegister(t *testing.T, method, yamlText string) registration {
 
 func TestRegisterReturnsCapabilitiesAndMetadata(t *testing.T) {
 	reg := callRegister(t, pluginabi.MethodPluginRegister, "")
+	if reg.SchemaVersion != pluginabi.SchemaVersionV2 {
+		t.Fatalf("schema version = %d, want %d", reg.SchemaVersion, pluginabi.SchemaVersionV2)
+	}
 	if !reg.Capabilities.RequestInterceptor || !reg.Capabilities.ResponseInterceptor || !reg.Capabilities.StreamChunkInterceptor || !reg.Capabilities.StreamChunkInterceptorStateful {
 		t.Fatalf("expected all interceptor capabilities true, got %+v", reg.Capabilities)
 	}
@@ -44,6 +47,72 @@ func TestRegisterReturnsCapabilitiesAndMetadata(t *testing.T) {
 	}
 	if len(reg.Metadata.ConfigFields) == 0 {
 		t.Fatalf("expected config fields declared")
+	}
+	if reg.Metadata.Version != "0.0.2" {
+		t.Fatalf("metadata version = %q, want 0.0.2", reg.Metadata.Version)
+	}
+}
+
+func TestLifecycleRejectsUnsupportedSchemaBeforeConfigParsing(t *testing.T) {
+	callRegister(t, pluginabi.MethodPluginRegister, "token_label: STABLE\nvault_max_entries: 3\n")
+	before := activeSnapshot()
+	token := makeToken("STABLE", "in-flight")
+	before.vault.Put(token, "in-flight")
+
+	for _, schemaVersion := range []uint32{0, pluginabi.SchemaVersionV1} {
+		t.Run(fmt.Sprintf("schema_%d", schemaVersion), func(t *testing.T) {
+			raw, err := handleMethod(
+				pluginabi.MethodPluginReconfigure,
+				lifecycleRequestForSchema(t, "token_label: SHOULD_NOT_APPLY\nunknown_field: true\n", schemaVersion),
+			)
+			if err != nil {
+				t.Fatalf("handleMethod returned Go error: %v", err)
+			}
+			var env envelope
+			if err := json.Unmarshal(raw, &env); err != nil {
+				t.Fatalf("unmarshal envelope: %v", err)
+			}
+			if env.OK || env.Error == nil || env.Error.Code != "unsupported_schema_version" {
+				t.Fatalf("expected unsupported_schema_version envelope, got %+v", env)
+			}
+			if !strings.Contains(env.Error.Message, fmt.Sprint(schemaVersion)) ||
+				!strings.Contains(env.Error.Message, fmt.Sprint(pluginabi.SchemaVersionV2)) {
+				t.Fatalf("schema error lacks received/minimum versions: %q", env.Error.Message)
+			}
+			if activeSnapshot() != before {
+				t.Fatal("unsupported schema replaced the active snapshot")
+			}
+			if got, ok := before.vault.Get(token); !ok || got != "in-flight" {
+				t.Fatalf("unsupported schema disturbed mapping: got=%q ok=%v", got, ok)
+			}
+		})
+	}
+}
+
+func TestLifecycleAcceptsFutureSchemaAndAdvertisesV2(t *testing.T) {
+	raw, err := handleMethod(
+		pluginabi.MethodPluginReconfigure,
+		lifecycleRequestForSchema(t, "token_label: FUTURE\n", pluginabi.SchemaVersionV2+7),
+	)
+	if err != nil {
+		t.Fatalf("handleMethod returned Go error: %v", err)
+	}
+	var env envelope
+	if err := json.Unmarshal(raw, &env); err != nil {
+		t.Fatalf("unmarshal envelope: %v", err)
+	}
+	if !env.OK {
+		t.Fatalf("future host schema was rejected: %+v", env.Error)
+	}
+	var reg registration
+	if err := json.Unmarshal(env.Result, &reg); err != nil {
+		t.Fatalf("unmarshal registration: %v", err)
+	}
+	if reg.SchemaVersion != pluginabi.SchemaVersionV2 {
+		t.Fatalf("schema version = %d, want implemented V2", reg.SchemaVersion)
+	}
+	if _, label := activeRuleSet(); label != "FUTURE" {
+		t.Fatalf("future host config was not applied: label=%q", label)
 	}
 }
 
@@ -188,6 +257,59 @@ func TestBlockModeRejectsWithRedactedContextWithoutVaultWrites(t *testing.T) {
 	}
 	if st.vault.Len() != 1 {
 		t.Fatalf("block mode persisted rejected plaintext: vault size=%d", st.vault.Len())
+	}
+}
+
+func TestBlockModeCanReturnOriginalValueWhenConfigured(t *testing.T) {
+	config := "mode: block\nblock_return_original: true\ntoken_label: BLOCKED\nbuiltin_rules_enabled: false\ncustom_value_rules:\n  - name: marker\n    regex: BLOCKSECRET[0-9]+\n"
+	callRegister(t, pluginabi.MethodPluginRegister, config)
+
+	body := []byte(`{"messages":[{"role":"user","content":"prefix BLOCKSECRET123 suffix"}]}`)
+	response := invokeRequestIntercept(t, pluginabi.MethodRequestInterceptBefore, formatOpenAI, body)
+	if !response.Reject {
+		t.Fatal("block mode did not reject a request containing a privacy match")
+	}
+	if !strings.Contains(response.RejectReason, `"BLOCKSECRET123"`) {
+		t.Fatalf("block reason lacks the original matched value: %q", response.RejectReason)
+	}
+	if strings.Contains(response.RejectReason, "<BLOCKED_") {
+		t.Fatalf("block reason returned a replacement token despite configuration: %q", response.RejectReason)
+	}
+	if !strings.Contains(response.RejectReason, "marker (value) at messages[0].content") {
+		t.Fatalf("block reason lacks the match path: %q", response.RejectReason)
+	}
+}
+
+func TestBlockModeCanReturnOriginalFieldValueWhenConfigured(t *testing.T) {
+	config := "mode: block\nblock_return_original: true\ntoken_label: BLOCKED\nbuiltin_rules_enabled: false\ncustom_field_rules:\n  - name: password\n    keys: [password]\n"
+	callRegister(t, pluginabi.MethodPluginRegister, config)
+
+	body := []byte(`{"messages":[{"role":"assistant","content":null,"function_call":{"name":"login","arguments":"{\"password\":\"field-secret\"}"}}]}`)
+	response := invokeRequestIntercept(t, pluginabi.MethodRequestInterceptBefore, formatOpenAI, body)
+	if !response.Reject {
+		t.Fatal("block mode did not reject a request containing a field-rule match")
+	}
+	if !strings.Contains(response.RejectReason, `"field-secret"`) {
+		t.Fatalf("block reason lacks the original field value: %q", response.RejectReason)
+	}
+}
+
+func TestBlockModeOriginalContextIsBounded(t *testing.T) {
+	config := "mode: block\nblock_return_original: true\ntoken_label: BLOCKED\nbuiltin_rules_enabled: false\ncustom_value_rules:\n  - name: marker\n    regex: LONGSECRET[A-Za-z]+\n"
+	callRegister(t, pluginabi.MethodPluginRegister, config)
+
+	body := []byte(`{"messages":[{"role":"user","content":"LONGSECRET` + strings.Repeat("x", 220) + `"}]}`)
+	response := invokeRequestIntercept(t, pluginabi.MethodRequestInterceptBefore, formatOpenAI, body)
+	if !response.Reject {
+		t.Fatal("block mode did not reject the long privacy match")
+	}
+	quoted := response.RejectReason[strings.LastIndex(response.RejectReason, ": ")+2:]
+	var context string
+	if err := json.Unmarshal([]byte(quoted), &context); err != nil {
+		t.Fatalf("original context is not JSON-quoted: %v (%q)", err, quoted)
+	}
+	if len([]rune(context)) > scanContextMaxRunes || !strings.HasSuffix(context, "...") {
+		t.Fatalf("original context was not bounded with an ellipsis: runes=%d context=%q", len([]rune(context)), context)
 	}
 }
 

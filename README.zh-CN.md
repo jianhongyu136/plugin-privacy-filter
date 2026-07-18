@@ -49,6 +49,8 @@ flowchart LR
 
 宿主加载共享库，并通过一套精简的 C ABI（`cliproxy_plugin_init` / `call` / `free_buffer` / `shutdown`）驱动它。每次调用都携带一个方法名和一段 JSON 请求，返回一个 JSON 信封（`{ok, result, error}`）。插件实现的方法有：
 
+协议兼容性使用两个彼此独立的版本号。原生 C ABI 仍为 `pluginabi.ABIVersion == 1`。生命周期 JSON RPC 请求要求 `schema_version >= 2`；缺失版本或 V1 会在解析配置和修改运行时状态之前被拒绝。即使收到更高的宿主 schema 版本，插件也始终只声明自身实际实现的 `pluginabi.SchemaVersionV2` 契约。接受更高的生命周期版本并不表示插件支持未知的未来 schema 功能。
+
 - `plugin.register` / `plugin.reconfigure` —— 解析并校验配置、编译当前规则集、原地重配置共享 vault，并把工作模式、规则、标签、匹配模式和 vault 作为一个原子的运行时快照一起发布。共享 vault 会保留在途映射及仍持有旧快照的处理器产生的延迟写入。
 - `request.intercept_before` / `request.intercept_after` —— 脱敏出站请求体。
 - `response.intercept_after` —— 还原非流式响应体。
@@ -116,8 +118,9 @@ flowchart TB
 
 1. 宿主同时提供响应体和实际发往上游的请求体（已脱敏）。
 2. `collectTokens` 扫描那份脱敏后的请求体，只接纳在 vault 中有精确且未过期映射的候选。如果其他拦截器对 JSON 字符串中的尖括号进行了转义，它也会在严格解码后的字符串中识别有映射的 token。白名单最多包含 1024 个不同 token；超出的占位符保持不还原。进入白名单只证明当前请求体中存在一个仍有效的 token，并不能证明该 token 最初由这个请求生成。
-3. `restoreBody` 只还原白名单内的 token：
-   - JSON 响应体会被解码，在字符串值内部还原，再以关闭 HTML 转义的方式重新编码，使尖括号得以保留。这样敏感信息中的引号、反斜杠和换行都保持合法。
+3. `restoreBody` 只还原请求级 allowlist 内的 token：
+   - JSON 响应体会被解码，在字符串值内部还原，再以关闭 HTML 转义的方式重新编码。OpenAI Chat 的 `choices[].message.tool_calls[].function.arguments` 与 OpenAI Responses 标准 `function_call` 输出参数按原子 JSON 参数字符串处理；JSON 字符串内容转义保证上游参数原本合法时，其中的引号、反斜杠、换行、制表符和控制字符仍保持合法。畸形参数字符串保持原样。
+   - OpenAI Responses custom tool input 不在这项原子参数字符串支持范围内。Gemini `functionCall.args` 是结构化对象，仍由现有 JSON walker 处理，而不是工具参数增量通道。
    - 服务器推送事件（SSE）响应体会在每个 `data:` 载荷内逐帧还原。
    - 明确的非 JSON、非 SSE 媒体类型使用原始字节替换。缺少可用的 Content-Type 时，插件会先自动识别 JSON/SSE，并让格式错误但形似 JSON 的数据保持不变。
 4. 不在白名单内、或 vault 中无对应条目的 token 会原样保留。反过来，任何被放入后续请求且仍有效的已知 token 都可能进入该请求的白名单，与它最初由哪个请求生成无关。
@@ -140,13 +143,15 @@ flowchart TB
     detok --> emit([还原后的数据块 → 客户端])
 ```
 
-1. 在流初始化调用（`ChunkIndex == -1`）时，插件重置本流残留的重组缓冲区。
-2. 对每个数据块，插件先拼接上一宿主 chunk 留下的原始 carry，并使用同一份经过 vault 校验、最多 1024 个 token 的请求作用域白名单。
+1. 在流初始化调用（`ChunkIndex == -1`）时，插件会重置该流遗留的重组状态。同一 `StreamID` 的重复初始化会替换已放弃尝试中的 allowlist、原始 carry 和语义参数状态。现代 StreamID 主路径以宿主提供的稳定 `StreamID` 作为状态键，后续载荷 chunk 无需重复请求体；没有 `StreamID` 且每个 chunk 重发请求体的宿主使用 legacy 请求体哈希兼容路径。
+2. 对每个数据块，插件先拼接上一宿主 chunk 留下的原始 carry，并复用最多 1024 个 token 的请求级 allowlist。每次还原都必须同时通过请求级 allowlist 与 live vault 两道 gate。
 3. 当响应 Content-Type 为 `text/event-stream` 时，JSON `data:` 行可能在 `data:` 前缀内部，或在 token 之前、内部、之后跨块切断。这个原始 chunk carry 层会从事件的第一个字段开始暂存整个未完成 SSE 事件，直到收到用于派发事件的空行；即使 JSON 行已经完整也同样如此。非 SSE 流不会暂存不含 token 的 `data:` 前缀；所有流类型仍使用有界的 token 尾部缓冲。原始 LF、CRLF 或 CR 分帧保持不变。
-4. 完成原始 chunk carry 后，协议适配器会为 OpenAI Chat Completions、OpenAI Responses、Claude 和 Gemini 跨语义可见文本事件重组可能的 token 前缀。待处理文本按协议以及 choice/item/block/candidate 通道隔离，且只保留可能构成 token 的尾部前缀。Gemini 流既可能包含 SSE 分帧的 JSON 事件，也可能在 Content-Type 仍为 `text/event-stream` 时直接包含完整的裸 JSON 响应。
-5. 如果整个 chunk 都被原始 carry 层暂存，插件返回 `DropChunk`，使宿主不会投递仍处于 token 化状态的片段。
-6. 每个流最多暂存 1 MiB 原始数据。超过上限的未完成事件或超过状态上限的语义前缀会原样发出，而不是继续驻留内存或进行不安全还原。
-7. 如果还原后整个流式 chunk 变成零字节，插件返回 `DropChunk`，避免宿主继续投递原占位符。
+4. 完成原始 chunk carry 后，协议适配器会为 OpenAI Chat Completions、OpenAI Responses、Claude 和 Gemini 跨语义可见文本事件重组可能的 token 前缀。待处理文本按协议以及 choice/item/block/candidate 通道隔离。Gemini 流既可能包含 SSE 分帧的 JSON 事件，也可能在 Content-Type 仍为 `text/event-stream` 时直接包含完整的裸 JSON 响应。
+5. OpenAI Chat 标准函数参数、OpenAI Responses 标准函数调用工具参数增量，以及 Claude `input_json_delta.partial_json` 支持跨事件占位符还原，并使用相互隔离的工具参数增量通道。扫描器只保存常量大小的词法状态与一个可能的编码 token 短尾，从不缓存完整 arguments；JSON 字符串内容转义保证重建后的 JSON 合法。OpenAI Responses custom tool input 不在此范围，Gemini `functionCall.args` 则继续作为结构化对象由普通 JSON walker 处理。
+6. 正常的 Chat finish、Responses done/completed、Claude block/message terminal 会先发出匹配通道的短尾，再释放参数状态。客户端取消、缺少协议 terminal、异常 end cleanup 或硬内存淘汰只清理状态而不尝试投递响应；由于宿主忽略 end callback 的响应体，每个活动参数通道最多丢失一个可能的编码 token 短尾。正常 terminal flushing 与异常 end cleanup 的行为不同，后者不会把短尾发送给客户端；end cleanup 可重复执行，且绝不会输出保留状态。
+7. 如果整个 chunk 都被原始 carry 层暂存，插件返回 `DropChunk`，使宿主不会投递仍处于 token 化状态的片段。
+8. 每个流最多暂存 1 MiB 原始数据。超过上限的未完成事件或超过状态上限的语义前缀会原样发出，而不是继续驻留内存或进行不安全还原。
+9. 如果还原后整个流式 chunk 变成零字节，插件返回 `DropChunk`，避免宿主继续投递原占位符。
 
 ### 设计原理
 
@@ -293,8 +298,8 @@ password: <REDACTED_1a2b3c4d5e6f7890>
 - **基于模式的检测。** 规则可能出现误报和漏报。电子邮件、电话号码、JWT、银行卡号和 IPv4 等宽泛规则因此默认关闭。编码、拆分、混淆或尚不支持的凭据格式可能无法命中。
 - **JSON 重新格式化。** 当请求体被改写时，它会被解码后重新编码，因此 map 的键顺序和空白可能与上游字节不同（语义等价）。这只对字节敏感的消费方（如请求体签名）有影响。没有规则命中的请求体会原样透传。
 - **非字符串敏感值。** 非字符串敏感值（如 `{"password": 123456}`）会以 JSON 字符串（`"123456"`）的形式还原；字符内容保留，但 JSON 类型发生变化。
-- **流式边界情况。** 宿主未提供流结束的 flush 回调，也没有稳定的单流标识。为拼接跨越最后一块的被切断 token 而暂存的字节可能丢失；请求体字节完全相同的并发流会共享同一个重组缓冲区。插件保留 SHA-256 请求体键，不使用易碰撞的快速弱哈希；要消除每个 chunk 的请求体哈希并实现完整流隔离，需要宿主提供流 ID。
-- **流式语义范围。** 跨事件语义重组仅覆盖助手可见文本。推理与工具参数值仍采用单事件还原，只有完整 token 位于同一个事件内时才会还原；跨事件拆分的 token 可能保持未还原。
+- **流式边界情况。** 现代 StreamID 主路径使用稳定 `StreamID` 隔离流；legacy 请求体哈希兼容路径中，请求体字节完全相同的并发流会共享状态。客户端取消、缺少协议 terminal、异常 end cleanup 或硬内存淘汰，可能丢弃每个活动可见文本或受支持参数通道保留的一个编码 token 短尾；end callback 只能清理状态，不能投递 flush 响应体。
+- **流式语义范围。** 跨事件还原覆盖助手可见文本，以及 OpenAI Chat 标准函数参数、OpenAI Responses 标准函数调用参数和 Claude 工具输入 JSON；不覆盖 OpenAI Responses custom tool input 或推理字段。Gemini `functionCall.args` 仍是结构化 JSON，只在单个事件内由通用 walker 处理。
 - **非流式空内容还原。** 宿主 ABI 用空响应 `Body` 表示“不替换”，因此无法表达“整个响应体只有一个映射到空字符串的 token”这一还原结果。流式 ABI 提供明确的 `DropChunk` 信号，可以安全处理对应情况。
 - **内容区域覆盖范围。** 只有已识别的请求格式和明确的运行时内容区域会被扫描。请求头、schema、URL、标识符、媒体/文件数据、加密内容、协议元数据和未访问字段中的匹配明文可能原样发往上游。不支持的源格式会被拒绝，但服务商 schema 漂移既可能触发校验拒绝，也可能引入一个被保留但未扫描的字段。
 - **Token 来源与租户隔离。** 还原白名单根据当前请求体中是否存在 token 构建，而不是根据经过认证的请求或租户来源构建。获知一个仍有效的进程级 token 的调用方，可以在另一请求中重放它并使其具备还原资格。需要隔离调用方时，应使用独立插件进程或独立 vault 信任边界。

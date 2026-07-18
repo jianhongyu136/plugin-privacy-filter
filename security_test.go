@@ -2,7 +2,9 @@ package main
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 	"testing"
@@ -556,6 +558,186 @@ func TestPlainTextResponseWithJSONPrefixRestored(t *testing.T) {
 	}
 }
 
+func TestNonStreamOpenAIChatArgumentRestoration(t *testing.T) {
+	testNonStreamArgumentRestoration(t, formatOpenAI,
+		func(argument, outer string) map[string]any {
+			return map[string]any{
+				"summary": outer,
+				"choices": []any{map[string]any{
+					"message": map[string]any{"tool_calls": []any{map[string]any{
+						"function": map[string]any{"arguments": argument},
+					}}},
+				}},
+			}
+		},
+		func(doc map[string]any) string {
+			choice := doc["choices"].([]any)[0].(map[string]any)
+			message := choice["message"].(map[string]any)
+			toolCall := message["tool_calls"].([]any)[0].(map[string]any)
+			function := toolCall["function"].(map[string]any)
+			return function["arguments"].(string)
+		},
+	)
+}
+
+func TestNonStreamOpenAIResponsesArgumentRestoration(t *testing.T) {
+	testNonStreamArgumentRestoration(t, formatOpenAIResponse,
+		func(argument, outer string) map[string]any {
+			return map[string]any{
+				"summary": outer,
+				"output": []any{map[string]any{
+					"type": "function_call", "arguments": argument,
+				}},
+			}
+		},
+		func(doc map[string]any) string {
+			output := doc["output"].([]any)[0].(map[string]any)
+			return output["arguments"].(string)
+		},
+	)
+}
+
+func TestNonStreamArgumentRestorationKeepsFieldsBeforeMalformedSibling(t *testing.T) {
+	callRegister(t, pluginabi.MethodPluginRegister, "")
+	st := activeSnapshot()
+	secret := "quote=\" slash=\\ line=\n control=\x01"
+	token := makeToken(st.label, secret)
+	st.vault.Put(token, secret)
+	requestBody := []byte(`{"input":"` + token + `"}`)
+	malformed := `{"value":"` + token
+
+	tests := []struct {
+		name         string
+		sourceFormat string
+		body         map[string]any
+		argumentFrom func(map[string]any) string
+	}{
+		{
+			name: "Chat malformed choice sibling", sourceFormat: formatOpenAI,
+			body: map[string]any{
+				"summary": token,
+				"choices": []any{
+					map[string]any{"message": map[string]any{"tool_calls": []any{
+						map[string]any{"function": map[string]any{"arguments": malformed}},
+					}}},
+					"malformed-choice",
+				},
+			},
+			argumentFrom: func(root map[string]any) string {
+				choice := root["choices"].([]any)[0].(map[string]any)
+				message := choice["message"].(map[string]any)
+				toolCall := message["tool_calls"].([]any)[0].(map[string]any)
+				return toolCall["function"].(map[string]any)["arguments"].(string)
+			},
+		},
+		{
+			name: "Responses malformed output sibling", sourceFormat: formatOpenAIResponse,
+			body: map[string]any{
+				"summary": token,
+				"output": []any{
+					map[string]any{"type": "function_call", "arguments": malformed},
+					"malformed-output",
+				},
+			},
+			argumentFrom: func(root map[string]any) string {
+				return root["output"].([]any)[0].(map[string]any)["arguments"].(string)
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			body := mustJSONMarshal(t, test.body)
+			delivered := invokeNonStreamResponseBody(t, test.sourceFormat, requestBody, body)
+			doc, ok := decodeOneJSON(delivered)
+			if !ok {
+				t.Fatalf("mixed malformed response is invalid outer JSON: %q", delivered)
+			}
+			root := doc.(map[string]any)
+			if got := test.argumentFrom(root); got != malformed {
+				t.Fatalf("malformed arguments changed after malformed sibling: got %q want %q", got, malformed)
+			}
+			if got := root["summary"]; got != secret {
+				t.Fatalf("ordinary outer field = %#v, want %q", got, secret)
+			}
+		})
+	}
+}
+
+func testNonStreamArgumentRestoration(t *testing.T, sourceFormat string, makeBody func(argument, outer string) map[string]any, argumentFrom func(map[string]any) string) {
+	t.Helper()
+	callRegister(t, pluginabi.MethodPluginRegister, "")
+	st := activeSnapshot()
+	secret := "quote=\" slash=\\ line=\n tab=\t control=\x01 unicode=世界 html=<>&"
+	token := makeToken(st.label, secret)
+	st.vault.Put(token, secret)
+	requestBody := []byte(`{"input":"` + token + `"}`)
+
+	t.Run("special characters and outer field", func(t *testing.T) {
+		body := mustJSONMarshal(t, makeBody(`{"value":"`+token+`"}`, token))
+		delivered := invokeNonStreamResponseBody(t, sourceFormat, requestBody, body)
+		doc, ok := decodeOneJSON(delivered)
+		if !ok {
+			t.Fatalf("restored non-stream body is invalid JSON: %q", delivered)
+		}
+		root := doc.(map[string]any)
+		if got := root["summary"]; got != secret {
+			t.Fatalf("ordinary outer string restoration = %#v, want %q", got, secret)
+		}
+		argument := argumentFrom(root)
+		var decoded map[string]string
+		if err := json.Unmarshal([]byte(argument), &decoded); err != nil {
+			t.Fatalf("restored non-stream arguments are invalid JSON %q: %v", argument, err)
+		}
+		if got := decoded["value"]; got != secret {
+			t.Fatalf("restored non-stream argument value = %q, want %q", got, secret)
+		}
+	})
+
+	t.Run("malformed arguments remain unchanged", func(t *testing.T) {
+		malformed := `{"value":"` + token
+		body := mustJSONMarshal(t, makeBody(malformed, token))
+		delivered := invokeNonStreamResponseBody(t, sourceFormat, requestBody, body)
+		doc, ok := decodeOneJSON(delivered)
+		if !ok {
+			t.Fatalf("response with malformed inner arguments is invalid outer JSON: %q", delivered)
+		}
+		root := doc.(map[string]any)
+		if got := argumentFrom(root); got != malformed {
+			t.Fatalf("malformed arguments changed: got %q want %q", got, malformed)
+		}
+		if got := root["summary"]; got != secret {
+			t.Fatalf("ordinary outer string was not restored beside malformed arguments: %#v", got)
+		}
+	})
+}
+
+func invokeNonStreamResponseBody(t *testing.T, sourceFormat string, requestBody, body []byte) []byte {
+	t.Helper()
+	req := mustJSONMarshal(t, pluginapi.ResponseInterceptRequest{
+		SourceFormat:    sourceFormat,
+		RequestBody:     requestBody,
+		ResponseHeaders: http.Header{"Content-Type": []string{"application/json"}},
+		Body:            body,
+	})
+	raw, err := handleMethod(pluginabi.MethodResponseInterceptAfter, req)
+	if err != nil {
+		t.Fatalf("non-stream response intercept: %v", err)
+	}
+	var env envelope
+	if err := json.Unmarshal(raw, &env); err != nil {
+		t.Fatalf("unmarshal non-stream envelope: %v", err)
+	}
+	var response pluginapi.ResponseInterceptResponse
+	if err := json.Unmarshal(env.Result, &response); err != nil {
+		t.Fatalf("unmarshal non-stream response: %v", err)
+	}
+	if len(response.Body) == 0 {
+		return body
+	}
+	return response.Body
+}
+
 func mustJSONMarshal(t *testing.T, value any) []byte {
 	t.Helper()
 	raw, err := json.Marshal(value)
@@ -563,6 +745,884 @@ func mustJSONMarshal(t *testing.T, value any) []byte {
 		t.Fatalf("marshal JSON: %v", err)
 	}
 	return raw
+}
+
+func openAIChatToolArgumentBody(t *testing.T, choiceIndex, toolIndex int, fragment string, finishReason any) []byte {
+	t.Helper()
+	return mustJSONMarshal(t, map[string]any{
+		"object": "chat.completion.chunk",
+		"choices": []any{map[string]any{
+			"index": choiceIndex,
+			"delta": map[string]any{"tool_calls": []any{map[string]any{
+				"index":    toolIndex,
+				"function": map[string]any{"arguments": fragment},
+			}}},
+			"finish_reason": finishReason,
+		}},
+	})
+}
+
+func openAIChatToolArgumentSSEBody(t *testing.T, choiceIndex, toolIndex int, fragment string, finishReason any) []byte {
+	t.Helper()
+	body := append([]byte("data: "), openAIChatToolArgumentBody(t, choiceIndex, toolIndex, fragment, finishReason)...)
+	return append(body, '\n', '\n')
+}
+
+func openAIChatToolArguments(t *testing.T, body []byte) map[string]string {
+	t.Helper()
+	arguments := make(map[string]string)
+	for start := 0; start < len(body); {
+		line, _, next := nextSSELine(body, start)
+		start = next
+		if !bytes.HasPrefix(line, []byte("data:")) {
+			continue
+		}
+		payload := bytes.TrimSpace(line[len("data:"):])
+		if bytes.Equal(payload, []byte("[DONE]")) {
+			continue
+		}
+		var chunk struct {
+			Choices []struct {
+				Index int `json:"index"`
+				Delta struct {
+					ToolCalls []struct {
+						Index    int `json:"index"`
+						Function struct {
+							Arguments string `json:"arguments"`
+						} `json:"function"`
+					} `json:"tool_calls"`
+				} `json:"delta"`
+			} `json:"choices"`
+		}
+		if err := json.Unmarshal(payload, &chunk); err != nil {
+			t.Fatalf("invalid OpenAI Chat SSE frame: %v (%q)", err, payload)
+		}
+		for _, choice := range chunk.Choices {
+			for _, tool := range choice.Delta.ToolCalls {
+				channel := fmt.Sprintf("%d:%d", choice.Index, tool.Index)
+				arguments[channel] += tool.Function.Arguments
+			}
+		}
+	}
+	return arguments
+}
+
+func responsesFunctionArgumentDelta(t *testing.T, outputIndex int, itemID, fragment string) []byte {
+	t.Helper()
+	return mustJSONMarshal(t, map[string]any{
+		"type":         "response.function_call_arguments.delta",
+		"output_index": outputIndex,
+		"item_id":      itemID,
+		"delta":        fragment,
+	})
+}
+
+func responsesFunctionArgumentDone(t *testing.T, outputIndex int, itemID, arguments string) []byte {
+	t.Helper()
+	return mustJSONMarshal(t, map[string]any{
+		"type":         "response.function_call_arguments.done",
+		"output_index": outputIndex,
+		"item_id":      itemID,
+		"arguments":    arguments,
+	})
+}
+
+func responsesFunctionArgumentSSEBody(event string, payload []byte) []byte {
+	body := []byte("event: " + event + "\ndata: ")
+	body = append(body, payload...)
+	return append(body, '\n', '\n')
+}
+
+func openAIResponsesFunctionArgumentDeltas(t *testing.T, body []byte) map[string]string {
+	t.Helper()
+	deltas := make(map[string]string)
+	for _, doc := range openAIResponsesEventDocs(t, body) {
+		if doc["type"] != "response.function_call_arguments.delta" {
+			continue
+		}
+		outputIndex, ok := nonnegativeJSONIndex(doc["output_index"])
+		itemID, itemOK := doc["item_id"].(string)
+		delta, deltaOK := doc["delta"].(string)
+		if ok && itemOK && deltaOK {
+			deltas[fmt.Sprintf("%d:%s", outputIndex, itemID)] += delta
+		}
+	}
+	return deltas
+}
+
+func openAIResponsesEventDocs(t *testing.T, body []byte) []map[string]any {
+	t.Helper()
+	var docs []map[string]any
+	for start := 0; start < len(body); {
+		line, _, next := nextSSELine(body, start)
+		start = next
+		if !bytes.HasPrefix(line, []byte("data:")) {
+			continue
+		}
+		payload := bytes.TrimSpace(line[len("data:"):])
+		doc, ok := decodeOneJSON(payload)
+		if !ok {
+			t.Fatalf("invalid OpenAI Responses event payload %q", payload)
+		}
+		root, ok := doc.(map[string]any)
+		if !ok {
+			t.Fatalf("OpenAI Responses event is not an object: %#v", doc)
+		}
+		docs = append(docs, root)
+	}
+	return docs
+}
+
+func findOpenAIResponsesEvent(t *testing.T, body []byte, eventType string) map[string]any {
+	t.Helper()
+	for _, doc := range openAIResponsesEventDocs(t, body) {
+		if doc["type"] == eventType {
+			return doc
+		}
+	}
+	t.Fatalf("OpenAI Responses event %q not found in %q", eventType, body)
+	return nil
+}
+
+func TestOpenAIChatToolArgumentRestoresAtEveryTokenSplit(t *testing.T) {
+	callRegister(t, pluginabi.MethodPluginRegister, "")
+	st := activeSnapshot()
+	secret := "openai-tool-split-secret"
+	token := makeToken(st.label, secret)
+	st.vault.Put(token, secret)
+	requestBody := []byte(`{"messages":[{"content":"` + token + `"}]}`)
+
+	for split := 0; split <= len(token); split++ {
+		resetStreamCarry(requestBody)
+		firstBody := openAIChatToolArgumentSSEBody(t, 0, 1, `{"value":"`+token[:split], nil)
+		first := invokeStreamBody(t, formatOpenAI, requestBody, 0, firstBody)
+		secondBody := openAIChatToolArgumentSSEBody(t, 0, 1, token[split:]+`"}`, nil)
+		second := invokeStreamBody(t, formatOpenAI, requestBody, 1, secondBody)
+		delivered := append(deliveredStreamBody(first, firstBody), deliveredStreamBody(second, secondBody)...)
+		argument := openAIChatToolArguments(t, delivered)["0:1"]
+		var decoded map[string]string
+		if err := json.Unmarshal([]byte(argument), &decoded); err != nil {
+			t.Fatalf("split %d produced invalid arguments %q: %v", split, argument, err)
+		}
+		if got := decoded["value"]; got != secret {
+			t.Fatalf("split %d restored value = %q, want %q", split, got, secret)
+		}
+	}
+}
+
+func TestOpenAIChatToolArgumentChannelsRemainIsolated(t *testing.T) {
+	callRegister(t, pluginabi.MethodPluginRegister, "")
+	st := activeSnapshot()
+	type toolCase struct {
+		choice int
+		tool   int
+		secret string
+		token  string
+	}
+	cases := []toolCase{
+		{choice: 1, tool: 0, secret: "choice-1-tool-0"},
+		{choice: 1, tool: 3, secret: "choice-1-tool-3"},
+		{choice: 7, tool: 0, secret: "choice-7-tool-0"},
+		{choice: 7, tool: 3, secret: "choice-7-tool-3"},
+	}
+	var requestTokens strings.Builder
+	for i := range cases {
+		cases[i].token = makeToken(st.label, cases[i].secret)
+		st.vault.Put(cases[i].token, cases[i].secret)
+		requestTokens.WriteString(cases[i].token)
+	}
+	requestBody := []byte(`{"messages":[{"content":"` + requestTokens.String() + `"}]}`)
+	resetStreamCarry(requestBody)
+
+	var delivered []byte
+	chunkIndex := 0
+	for _, tc := range cases {
+		split := len(tc.token) / 2
+		body := openAIChatToolArgumentSSEBody(t, tc.choice, tc.tool, `{"value":"`+tc.token[:split], nil)
+		response := invokeStreamBody(t, formatOpenAI, requestBody, chunkIndex, body)
+		delivered = append(delivered, deliveredStreamBody(response, body)...)
+		chunkIndex++
+	}
+	for i := len(cases) - 1; i >= 0; i-- {
+		tc := cases[i]
+		split := len(tc.token) / 2
+		body := openAIChatToolArgumentSSEBody(t, tc.choice, tc.tool, tc.token[split:]+`"}`, nil)
+		response := invokeStreamBody(t, formatOpenAI, requestBody, chunkIndex, body)
+		delivered = append(delivered, deliveredStreamBody(response, body)...)
+		chunkIndex++
+	}
+
+	arguments := openAIChatToolArguments(t, delivered)
+	for _, tc := range cases {
+		channel := fmt.Sprintf("%d:%d", tc.choice, tc.tool)
+		var decoded map[string]string
+		if err := json.Unmarshal([]byte(arguments[channel]), &decoded); err != nil {
+			t.Fatalf("channel %s produced invalid arguments %q: %v", channel, arguments[channel], err)
+		}
+		if got := decoded["value"]; got != tc.secret {
+			t.Fatalf("channel %s restored value = %q, want %q", channel, got, tc.secret)
+		}
+	}
+}
+
+func TestOpenAIChatFinishFlushesAllToolArguments(t *testing.T) {
+	callRegister(t, pluginabi.MethodPluginRegister, "")
+	st := activeSnapshot()
+	secret := "openai-finish-secret"
+	token := makeToken(st.label, secret)
+	st.vault.Put(token, secret)
+	requestBody := []byte(`{"messages":[{"content":"` + token + `"}]}`)
+	resetStreamCarry(requestBody)
+	partial := token[:len(token)/2]
+
+	var delivered []byte
+	for tool := 0; tool < 2; tool++ {
+		body := openAIChatToolArgumentSSEBody(t, 4, tool, `{"value":"`+partial, nil)
+		response := invokeStreamBody(t, formatOpenAI, requestBody, tool, body)
+		delivered = append(delivered, deliveredStreamBody(response, body)...)
+	}
+	finishPayload := mustJSONMarshal(t, map[string]any{
+		"object": "chat.completion.chunk",
+		"choices": []any{map[string]any{
+			"index": 4, "delta": map[string]any{}, "finish_reason": "stop",
+		}},
+	})
+	finishBody := append([]byte("data: "), finishPayload...)
+	finishBody = append(finishBody, '\n', '\n')
+	finish := invokeStreamBody(t, formatOpenAI, requestBody, 2, finishBody)
+	finishDelivered := deliveredStreamBody(finish, finishBody)
+	flushed := openAIChatToolArguments(t, finishDelivered)
+	for tool := 0; tool < 2; tool++ {
+		channel := fmt.Sprintf("4:%d", tool)
+		if got := flushed[channel]; got != partial {
+			t.Fatalf("finish event flush for channel %s = %q, want %q", channel, got, partial)
+		}
+	}
+	delivered = append(delivered, finishDelivered...)
+
+	arguments := openAIChatToolArguments(t, delivered)
+	for tool := 0; tool < 2; tool++ {
+		channel := fmt.Sprintf("4:%d", tool)
+		if got, want := arguments[channel], `{"value":"`+partial; got != want {
+			t.Fatalf("finish flush for channel %s = %q, want %q", channel, got, want)
+		}
+	}
+	streamCarry.mu.Lock()
+	defer streamCarry.mu.Unlock()
+	if entry := streamCarry.entries[streamKey(requestBody)]; entry != nil && len(entry.arguments) != 0 {
+		t.Fatalf("finish retained argument state: %#v", entry.arguments)
+	}
+}
+
+func TestOpenAIChatSameFrameArgumentFinishPreservesSourceOrder(t *testing.T) {
+	callRegister(t, pluginabi.MethodPluginRegister, "")
+	st := activeSnapshot()
+	secret := "chat-same-frame-terminal-secret"
+	token := makeToken(st.label, secret)
+	st.vault.Put(token, secret)
+	requestBody := []byte(`{"messages":[{"content":"` + token + `"}]}`)
+	partial := token[:len(token)/2]
+
+	t.Run("single tool", func(t *testing.T) {
+		resetStreamCarry(requestBody)
+		fragment := `{"value":"` + partial
+		body := openAIChatToolArgumentSSEBody(t, 0, 0, fragment, "tool_calls")
+		response := invokeStreamBody(t, formatOpenAI, requestBody, 0, body)
+		delivered := deliveredStreamBody(response, body)
+		if got := openAIChatToolArguments(t, delivered)["0:0"]; got != fragment {
+			t.Fatalf("same-frame terminal argument = %q, want source order %q", got, fragment)
+		}
+		if frames := parseSemanticSSEFrames(delivered); len(frames) != 1 {
+			t.Fatalf("same-frame terminal emitted %d frames, want no synthetic frame", len(frames))
+		}
+	})
+
+	t.Run("multiple tools keep only prior channel synthetic", func(t *testing.T) {
+		resetStreamCarry(requestBody)
+		priorFragment := `{"prior":"` + partial
+		priorBody := openAIChatToolArgumentSSEBody(t, 3, 0, priorFragment, nil)
+		priorResponse := invokeStreamBody(t, formatOpenAI, requestBody, 0, priorBody)
+		priorDelivered := deliveredStreamBody(priorResponse, priorBody)
+
+		firstCurrent := `{"first":"` + partial
+		secondCurrent := `{"second":"` + partial
+		terminalPayload := mustJSONMarshal(t, map[string]any{
+			"object": "chat.completion.chunk",
+			"choices": []any{map[string]any{
+				"index": 3,
+				"delta": map[string]any{"tool_calls": []any{
+					map[string]any{"index": 1, "function": map[string]any{"arguments": firstCurrent}},
+					map[string]any{"index": 2, "function": map[string]any{"arguments": secondCurrent}},
+				}},
+				"finish_reason": "tool_calls",
+			}},
+		})
+		terminalBody := append([]byte("data: "), terminalPayload...)
+		terminalBody = append(terminalBody, '\n', '\n')
+		terminalResponse := invokeStreamBody(t, formatOpenAI, requestBody, 1, terminalBody)
+		terminalDelivered := deliveredStreamBody(terminalResponse, terminalBody)
+
+		frames := parseSemanticSSEFrames(terminalDelivered)
+		if len(frames) != 2 {
+			t.Fatalf("terminal emitted %d frames, want prior-channel synthetic then terminal", len(frames))
+		}
+		terminalArguments := openAIChatToolArguments(t, terminalDelivered)
+		if got := terminalArguments["3:0"]; got != partial {
+			t.Fatalf("prior channel terminal flush = %q, want %q", got, partial)
+		}
+		if got := terminalArguments["3:1"]; got != firstCurrent {
+			t.Fatalf("first same-frame tool argument = %q, want %q", got, firstCurrent)
+		}
+		if got := terminalArguments["3:2"]; got != secondCurrent {
+			t.Fatalf("second same-frame tool argument = %q, want %q", got, secondCurrent)
+		}
+
+		allArguments := openAIChatToolArguments(t, append(priorDelivered, terminalDelivered...))
+		if got := allArguments["3:0"]; got != priorFragment {
+			t.Fatalf("prior channel source order = %q, want %q", got, priorFragment)
+		}
+	})
+}
+
+func TestOpenAIChatDoneFlushesAllToolArguments(t *testing.T) {
+	callRegister(t, pluginabi.MethodPluginRegister, "")
+	st := activeSnapshot()
+	secret := "openai-done-secret"
+	token := makeToken(st.label, secret)
+	st.vault.Put(token, secret)
+	requestBody := []byte(`{"messages":[{"content":"` + token + `"}]}`)
+	resetStreamCarry(requestBody)
+	partial := token[:len(token)/2]
+
+	var delivered []byte
+	for index, channel := range []struct{ choice, tool int }{{choice: 0, tool: 1}, {choice: 2, tool: 4}} {
+		body := openAIChatToolArgumentSSEBody(t, channel.choice, channel.tool, `{"value":"`+partial, nil)
+		response := invokeStreamBody(t, formatOpenAI, requestBody, index, body)
+		delivered = append(delivered, deliveredStreamBody(response, body)...)
+	}
+	doneBody := []byte("data: [DONE]\n\n")
+	done := invokeStreamBody(t, formatOpenAI, requestBody, 2, doneBody)
+	doneDelivered := deliveredStreamBody(done, doneBody)
+	delivered = append(delivered, doneDelivered...)
+	if !bytes.HasSuffix(doneDelivered, doneBody) {
+		t.Fatalf("[DONE] sentinel was not preserved at the end: %q", doneDelivered)
+	}
+	flushed := openAIChatToolArguments(t, doneDelivered)
+	for _, channel := range []string{"0:1", "2:4"} {
+		if got := flushed[channel]; got != partial {
+			t.Fatalf("[DONE] event flush for channel %s = %q, want %q", channel, got, partial)
+		}
+	}
+
+	arguments := openAIChatToolArguments(t, delivered)
+	for _, channel := range []string{"0:1", "2:4"} {
+		if got, want := arguments[channel], `{"value":"`+partial; got != want {
+			t.Fatalf("[DONE] flush for channel %s = %q, want %q", channel, got, want)
+		}
+	}
+	streamCarry.mu.Lock()
+	defer streamCarry.mu.Unlock()
+	if entry := streamCarry.entries[streamKey(requestBody)]; entry != nil && len(entry.arguments) != 0 {
+		t.Fatalf("[DONE] retained argument state: %#v", entry.arguments)
+	}
+}
+
+func TestOpenAIChatToolArgumentRejectsInvalidIndices(t *testing.T) {
+	label := "REDACTED"
+	token := makeToken(label, "invalid-tool-index")
+	partial := `{"value":"` + token[:len(token)/2]
+	for _, tc := range []struct {
+		name  string
+		index any
+		omit  bool
+	}{
+		{name: "missing", omit: true},
+		{name: "negative", index: -1},
+		{name: "non-integer", index: 0.5},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			key := "invalid-openai-tool-index-" + tc.name
+			streamCarry.reset(key)
+			tool := map[string]any{"function": map[string]any{"arguments": partial}}
+			if !tc.omit {
+				tool["index"] = tc.index
+			}
+			payload := mustJSONMarshal(t, map[string]any{
+				"object": "chat.completion.chunk",
+				"choices": []any{map[string]any{
+					"index": 0, "delta": map[string]any{"tool_calls": []any{tool}}, "finish_reason": nil,
+				}},
+			})
+			body := append([]byte("data: "), payload...)
+			body = append(body, '\n', '\n')
+			out, handled := restoreSemanticStream(key, body, tokenPattern(label), []string{label}, map[string]struct{}{token: {}}, newVault(1, time.Hour), "text/event-stream", formatOpenAI)
+			if !handled || !bytes.Equal(out, body) {
+				t.Fatalf("invalid tool index changed fragment: handled=%v out=%q want=%q", handled, out, body)
+			}
+			streamCarry.mu.Lock()
+			entry := streamCarry.entries[key]
+			if entry != nil && len(entry.arguments) != 0 {
+				streamCarry.mu.Unlock()
+				t.Fatalf("invalid tool index retained state: %#v", entry.arguments)
+			}
+			streamCarry.mu.Unlock()
+		})
+	}
+}
+
+func TestOpenAIChatToolArgumentIdentityIgnoresLateID(t *testing.T) {
+	callRegister(t, pluginabi.MethodPluginRegister, "")
+	st := activeSnapshot()
+	secret := "openai-late-tool-id"
+	token := makeToken(st.label, secret)
+	st.vault.Put(token, secret)
+	requestBody := []byte(`{"messages":[{"content":"` + token + `"}]}`)
+	resetStreamCarry(requestBody)
+	split := len(token) / 2
+
+	firstBody := openAIChatToolArgumentSSEBody(t, 0, 2, `{"value":"`+token[:split], nil)
+	first := invokeStreamBody(t, formatOpenAI, requestBody, 0, firstBody)
+	secondPayload := mustJSONMarshal(t, map[string]any{
+		"object": "chat.completion.chunk",
+		"choices": []any{map[string]any{
+			"index": 0,
+			"delta": map[string]any{"tool_calls": []any{map[string]any{
+				"index": 2, "id": "call_late", "function": map[string]any{"arguments": token[split:] + `"}`},
+			}}},
+			"finish_reason": nil,
+		}},
+	})
+	secondBody := append([]byte("data: "), secondPayload...)
+	secondBody = append(secondBody, '\n', '\n')
+	second := invokeStreamBody(t, formatOpenAI, requestBody, 1, secondBody)
+	delivered := append(deliveredStreamBody(first, firstBody), deliveredStreamBody(second, secondBody)...)
+	argument := openAIChatToolArguments(t, delivered)["0:2"]
+	var decoded map[string]string
+	if err := json.Unmarshal([]byte(argument), &decoded); err != nil || decoded["value"] != secret {
+		t.Fatalf("late tool ID changed channel identity: argument=%q decoded=%#v err=%v", argument, decoded, err)
+	}
+}
+
+func TestOpenAIChatToolArgumentSpecialCharactersRemainValid(t *testing.T) {
+	callRegister(t, pluginabi.MethodPluginRegister, "")
+	st := activeSnapshot()
+	secret := "quote=\" slash=\\ line=\n tab=\t control=\x01 unicode=世界 html=<>&"
+	token := makeToken(st.label, secret)
+	st.vault.Put(token, secret)
+	requestBody := []byte(`{"messages":[{"content":"` + token + `"}]}`)
+	resetStreamCarry(requestBody)
+	split := len(token) / 2
+
+	firstBody := openAIChatToolArgumentSSEBody(t, 0, 0, `{"value":"`+token[:split], nil)
+	first := invokeStreamBody(t, formatOpenAI, requestBody, 0, firstBody)
+	secondBody := openAIChatToolArgumentSSEBody(t, 0, 0, token[split:]+`"}`, nil)
+	second := invokeStreamBody(t, formatOpenAI, requestBody, 1, secondBody)
+	delivered := append(deliveredStreamBody(first, firstBody), deliveredStreamBody(second, secondBody)...)
+	argument := openAIChatToolArguments(t, delivered)["0:0"]
+	var decoded map[string]string
+	if err := json.Unmarshal([]byte(argument), &decoded); err != nil {
+		t.Fatalf("special-character arguments are invalid JSON %q: %v", argument, err)
+	}
+	if got := decoded["value"]; got != secret {
+		t.Fatalf("special-character value = %q, want %q", got, secret)
+	}
+}
+
+func TestOpenAIResponsesFunctionArgumentDeltaRestoresSplitWithEncodedItemID(t *testing.T) {
+	callRegister(t, pluginabi.MethodPluginRegister, "")
+	st := activeSnapshot()
+	secret := "responses-function-argument-secret"
+	token := makeToken(st.label, secret)
+	st.vault.Put(token, secret)
+	requestBody := []byte(`{"input":"` + token + `"}`)
+	resetStreamCarry(requestBody)
+	itemID := "call:with/slash/世界"
+	split := len(token) / 2
+
+	firstPayload := responsesFunctionArgumentDelta(t, 3, itemID, `{"value":"`+token[:split])
+	firstBody := responsesFunctionArgumentSSEBody("response.function_call_arguments.delta", firstPayload)
+	first := invokeStreamBody(t, formatOpenAIResponse, requestBody, 0, firstBody)
+	firstDelivered := deliveredStreamBody(first, firstBody)
+	if got, want := openAIResponsesFunctionArgumentDeltas(t, firstDelivered)["3:"+itemID], `{"value":"`; got != want {
+		t.Fatalf("first function-argument delta = %q, want %q", got, want)
+	}
+
+	channel := "argument:openai-response:output:3:item:" + base64.RawURLEncoding.EncodeToString([]byte(itemID))
+	streamCarry.mu.Lock()
+	entry := streamCarry.entries[streamKey(requestBody)]
+	_, retained := entry.arguments[channel]
+	streamCarry.mu.Unlock()
+	if !retained {
+		t.Fatalf("encoded Responses argument channel %q was not retained", channel)
+	}
+
+	secondPayload := responsesFunctionArgumentDelta(t, 3, itemID, token[split:]+`"}`)
+	secondBody := responsesFunctionArgumentSSEBody("response.function_call_arguments.delta", secondPayload)
+	second := invokeStreamBody(t, formatOpenAIResponse, requestBody, 1, secondBody)
+	delivered := append(firstDelivered, deliveredStreamBody(second, secondBody)...)
+	argument := openAIResponsesFunctionArgumentDeltas(t, delivered)["3:"+itemID]
+	var decoded map[string]string
+	if err := json.Unmarshal([]byte(argument), &decoded); err != nil {
+		t.Fatalf("split Responses arguments are invalid JSON %q: %v", argument, err)
+	}
+	if got := decoded["value"]; got != secret {
+		t.Fatalf("split Responses argument value = %q, want %q", got, secret)
+	}
+}
+
+func TestOpenAIResponsesFunctionArgumentDoneFlushesAndRestoresAggregate(t *testing.T) {
+	callRegister(t, pluginabi.MethodPluginRegister, "")
+	st := activeSnapshot()
+	secret := "responses-dedicated-done-secret"
+	token := makeToken(st.label, secret)
+	st.vault.Put(token, secret)
+	requestBody := []byte(`{"input":"` + token + `"}`)
+	resetStreamCarry(requestBody)
+	itemID := "call_done"
+	partial := token[:len(token)/2]
+
+	firstPayload := responsesFunctionArgumentDelta(t, 0, itemID, `{"value":"`+partial)
+	firstBody := responsesFunctionArgumentSSEBody("response.function_call_arguments.delta", firstPayload)
+	first := invokeStreamBody(t, formatOpenAIResponse, requestBody, 0, firstBody)
+	if got := openAIResponsesFunctionArgumentDeltas(t, deliveredStreamBody(first, firstBody))["0:"+itemID]; got != `{"value":"` {
+		t.Fatalf("pending suffix reached client before done: %q", got)
+	}
+
+	doneArguments := `{"aggregate":"` + token + `"}`
+	donePayload := responsesFunctionArgumentDone(t, 0, itemID, doneArguments)
+	doneBody := responsesFunctionArgumentSSEBody("response.function_call_arguments.done", donePayload)
+	done := invokeStreamBody(t, formatOpenAIResponse, requestBody, 1, doneBody)
+	doneDelivered := deliveredStreamBody(done, doneBody)
+	if got := openAIResponsesFunctionArgumentDeltas(t, doneDelivered)["0:"+itemID]; got != partial {
+		t.Fatalf("dedicated done flush = %q, want %q", got, partial)
+	}
+	doc := findOpenAIResponsesEvent(t, doneDelivered, "response.function_call_arguments.done")
+	if got, want := doc["arguments"], `{"aggregate":"`+secret+`"}`; got != want {
+		t.Fatalf("dedicated done aggregate = %#v, want %q", got, want)
+	}
+	if deltaAt, doneAt := bytes.Index(doneDelivered, []byte(`"response.function_call_arguments.delta"`)), bytes.Index(doneDelivered, []byte(`"response.function_call_arguments.done"`)); deltaAt < 0 || doneAt < 0 || deltaAt >= doneAt {
+		t.Fatalf("dedicated done output order is not delta-before-done: %q", doneDelivered)
+	}
+}
+
+func TestOpenAIResponsesFunctionArgumentAggregateDoesNotDuplicateClosedDelta(t *testing.T) {
+	callRegister(t, pluginabi.MethodPluginRegister, "")
+	st := activeSnapshot()
+	secret := "responses-later-aggregate-secret"
+	token := makeToken(st.label, secret)
+	st.vault.Put(token, secret)
+	requestBody := []byte(`{"input":"` + token + `"}`)
+	resetStreamCarry(requestBody)
+	itemID := "call_later_aggregate"
+	partial := token[:len(token)/2]
+
+	deltaBody := responsesFunctionArgumentSSEBody("response.function_call_arguments.delta", responsesFunctionArgumentDelta(t, 2, itemID, `{"value":"`+partial))
+	delta := invokeStreamBody(t, formatOpenAIResponse, requestBody, 0, deltaBody)
+	_ = deliveredStreamBody(delta, deltaBody)
+	doneBody := responsesFunctionArgumentSSEBody("response.function_call_arguments.done", responsesFunctionArgumentDone(t, 2, itemID, `{"value":"`+token+`"}`))
+	done := invokeStreamBody(t, formatOpenAIResponse, requestBody, 1, doneBody)
+	if got := openAIResponsesFunctionArgumentDeltas(t, deliveredStreamBody(done, doneBody))["2:"+itemID]; got != partial {
+		t.Fatalf("dedicated done flush = %q, want %q", got, partial)
+	}
+
+	aggregatePayload := mustJSONMarshal(t, map[string]any{
+		"type":         "response.output_item.done",
+		"output_index": 2,
+		"item": map[string]any{
+			"type": "function_call", "id": itemID, "arguments": `{"value":"` + token + `"}`,
+		},
+	})
+	aggregateBody := responsesFunctionArgumentSSEBody("response.output_item.done", aggregatePayload)
+	aggregate := invokeStreamBody(t, formatOpenAIResponse, requestBody, 2, aggregateBody)
+	aggregateDelivered := deliveredStreamBody(aggregate, aggregateBody)
+	if got := openAIResponsesFunctionArgumentDeltas(t, aggregateDelivered)["2:"+itemID]; got != "" {
+		t.Fatalf("later aggregate emitted duplicate delta %q", got)
+	}
+	doc := findOpenAIResponsesEvent(t, aggregateDelivered, "response.output_item.done")
+	item := doc["item"].(map[string]any)
+	if got, want := item["arguments"], `{"value":"`+secret+`"}`; got != want {
+		t.Fatalf("later output-item aggregate = %#v, want %q", got, want)
+	}
+}
+
+func TestOpenAIResponsesFunctionArgumentAggregateFlushesWithoutDedicatedDone(t *testing.T) {
+	callRegister(t, pluginabi.MethodPluginRegister, "")
+	st := activeSnapshot()
+	secret := "responses-aggregate-flush-secret"
+	token := makeToken(st.label, secret)
+	st.vault.Put(token, secret)
+	requestBody := []byte(`{"input":"` + token + `"}`)
+	resetStreamCarry(requestBody)
+	itemID := "call_aggregate_flush"
+	partial := token[:len(token)/2]
+
+	deltaBody := responsesFunctionArgumentSSEBody("response.function_call_arguments.delta", responsesFunctionArgumentDelta(t, 5, itemID, `{"value":"`+partial))
+	delta := invokeStreamBody(t, formatOpenAIResponse, requestBody, 0, deltaBody)
+	_ = deliveredStreamBody(delta, deltaBody)
+	aggregatePayload := mustJSONMarshal(t, map[string]any{
+		"type":            "response.output_item.done",
+		"output_index":    5,
+		"sequence_number": 42,
+		"item": map[string]any{
+			"type": "function_call", "id": itemID, "arguments": `{"value":"` + token + `"}`,
+		},
+	})
+	aggregateBody := responsesFunctionArgumentSSEBody("response.output_item.done", aggregatePayload)
+	aggregate := invokeStreamBody(t, formatOpenAIResponse, requestBody, 1, aggregateBody)
+	aggregateDelivered := deliveredStreamBody(aggregate, aggregateBody)
+	deltas := openAIResponsesFunctionArgumentDeltas(t, aggregateDelivered)
+	if got := deltas["5:"+itemID]; got != partial {
+		t.Fatalf("output-item done flush = %q, want %q", got, partial)
+	}
+	for _, doc := range openAIResponsesEventDocs(t, aggregateDelivered) {
+		if doc["type"] == "response.function_call_arguments.delta" && doc["sequence_number"] != json.Number("42") {
+			t.Fatalf("synthetic sequence number = %#v, want 42", doc["sequence_number"])
+		}
+	}
+}
+
+func TestOpenAIResponsesCompletedFlushesFunctionArguments(t *testing.T) {
+	callRegister(t, pluginabi.MethodPluginRegister, "")
+	st := activeSnapshot()
+	secret := "responses-completed-secret"
+	token := makeToken(st.label, secret)
+	st.vault.Put(token, secret)
+	requestBody := []byte(`{"input":"` + token + `"}`)
+	resetStreamCarry(requestBody)
+	partial := token[:len(token)/2]
+	channels := []struct {
+		output int
+		item   string
+	}{{output: 0, item: "call_a"}, {output: 9, item: "call:b/世界"}}
+
+	for i, channel := range channels {
+		body := responsesFunctionArgumentSSEBody("response.function_call_arguments.delta", responsesFunctionArgumentDelta(t, channel.output, channel.item, `{"value":"`+partial))
+		response := invokeStreamBody(t, formatOpenAIResponse, requestBody, i, body)
+		_ = deliveredStreamBody(response, body)
+	}
+	completedPayload := mustJSONMarshal(t, map[string]any{"type": "response.completed", "sequence_number": 77})
+	completedBody := responsesFunctionArgumentSSEBody("response.completed", completedPayload)
+	completed := invokeStreamBody(t, formatOpenAIResponse, requestBody, len(channels), completedBody)
+	completedDelivered := deliveredStreamBody(completed, completedBody)
+	deltas := openAIResponsesFunctionArgumentDeltas(t, completedDelivered)
+	for _, channel := range channels {
+		key := fmt.Sprintf("%d:%s", channel.output, channel.item)
+		if got := deltas[key]; got != partial {
+			t.Fatalf("response.completed flush for %s = %q, want %q", key, got, partial)
+		}
+	}
+}
+
+func TestOpenAIResponsesCompletedFunctionCallArgumentsUseAtomicRestoration(t *testing.T) {
+	callRegister(t, pluginabi.MethodPluginRegister, "")
+	st := activeSnapshot()
+	secret := "quote=\" slash=\\ line=\n tab=\t control=\x01 unicode=世界 html=<>&"
+	token := makeToken(st.label, secret)
+	st.vault.Put(token, secret)
+	requestBody := []byte(`{"input":"` + token + `"}`)
+
+	completedBody := func(arguments string) []byte {
+		payload := mustJSONMarshal(t, map[string]any{
+			"type":            "response.completed",
+			"sequence_number": 77,
+			"response": map[string]any{
+				"id": "resp_cli_proxy", "object": "response", "created_at": 1,
+				"status": "completed", "background": false, "error": nil,
+				"instructions": token,
+				"output": []any{
+					map[string]any{
+						"id": "fc_call_completed", "type": "function_call", "status": "completed",
+						"arguments": arguments, "call_id": "call_completed", "name": "read",
+					},
+					map[string]any{
+						"id": "ctc_custom", "type": "custom_tool_call", "status": "completed",
+						"input": token, "call_id": "call_custom", "name": "shell",
+					},
+				},
+			},
+		})
+		return responsesFunctionArgumentSSEBody("response.completed", payload)
+	}
+
+	t.Run("CLIProxyAPI payload restores aggregate after synthetic flush", func(t *testing.T) {
+		resetStreamCarry(requestBody)
+		partial := token[:len(token)/2]
+		deltaBody := responsesFunctionArgumentSSEBody("response.function_call_arguments.delta", responsesFunctionArgumentDelta(t, 0, "call_completed", `{"value":"`+partial))
+		delta := invokeStreamBody(t, formatOpenAIResponse, requestBody, 0, deltaBody)
+		_ = deliveredStreamBody(delta, deltaBody)
+
+		body := completedBody(`{"value":"` + token + `"}`)
+		response := invokeStreamBody(t, formatOpenAIResponse, requestBody, 1, body)
+		delivered := deliveredStreamBody(response, body)
+		docs := openAIResponsesEventDocs(t, delivered)
+		if len(docs) != 2 || docs[0]["type"] != "response.function_call_arguments.delta" || docs[1]["type"] != "response.completed" {
+			t.Fatalf("completed output order = %#v, want synthetic delta then completed", docs)
+		}
+		if got := docs[0]["delta"]; got != partial {
+			t.Fatalf("completed synthetic tail = %#v, want %q", got, partial)
+		}
+
+		completed := docs[1]["response"].(map[string]any)
+		output := completed["output"].([]any)
+		functionCall := output[0].(map[string]any)
+		arguments := functionCall["arguments"].(string)
+		var decoded map[string]string
+		if err := json.Unmarshal([]byte(arguments), &decoded); err != nil {
+			t.Fatalf("completed function-call arguments are invalid JSON %q: %v", arguments, err)
+		}
+		if got := decoded["value"]; got != secret {
+			t.Fatalf("completed function-call argument = %q, want %q", got, secret)
+		}
+		if got := output[1].(map[string]any)["input"]; got != secret {
+			t.Fatalf("completed custom-tool input = %#v, want generic restoration %q", got, secret)
+		}
+		if got := completed["instructions"]; got != secret {
+			t.Fatalf("completed ordinary field = %#v, want %q", got, secret)
+		}
+	})
+
+	t.Run("malformed aggregate remains unchanged", func(t *testing.T) {
+		resetStreamCarry(requestBody)
+		malformed := `{"value":"` + token
+		body := completedBody(malformed)
+		response := invokeStreamBody(t, formatOpenAIResponse, requestBody, 0, body)
+		delivered := deliveredStreamBody(response, body)
+		doc := findOpenAIResponsesEvent(t, delivered, "response.completed")
+		completed := doc["response"].(map[string]any)
+		functionCall := completed["output"].([]any)[0].(map[string]any)
+		if got := functionCall["arguments"]; got != malformed {
+			t.Fatalf("malformed completed aggregate = %#v, want %q", got, malformed)
+		}
+		if got := completed["instructions"]; got != secret {
+			t.Fatalf("ordinary completed field beside malformed aggregate = %#v, want %q", got, secret)
+		}
+	})
+}
+
+func TestOpenAIResponsesFunctionArgumentRejectsInvalidIdentity(t *testing.T) {
+	label := "REDACTED"
+	token := makeToken(label, "invalid-responses-identity")
+	fragment := `{"value":"` + token[:len(token)/2]
+	for _, tc := range []struct {
+		name        string
+		outputIndex any
+		omitOutput  bool
+		itemID      any
+		omitItem    bool
+	}{
+		{name: "missing output", omitOutput: true, itemID: "call"},
+		{name: "negative output", outputIndex: -1, itemID: "call"},
+		{name: "fractional output", outputIndex: 0.5, itemID: "call"},
+		{name: "missing item", outputIndex: 0, omitItem: true},
+		{name: "empty item", outputIndex: 0, itemID: ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			key := "invalid-responses-identity-" + tc.name
+			streamCarry.reset(key)
+			doc := map[string]any{
+				"type":  "response.function_call_arguments.delta",
+				"delta": fragment,
+			}
+			if !tc.omitOutput {
+				doc["output_index"] = tc.outputIndex
+			}
+			if !tc.omitItem {
+				doc["item_id"] = tc.itemID
+			}
+			body := responsesFunctionArgumentSSEBody("response.function_call_arguments.delta", mustJSONMarshal(t, doc))
+			out, handled := restoreSemanticStream(key, body, tokenPattern(label), []string{label}, map[string]struct{}{token: {}}, newVault(1, time.Hour), "text/event-stream", formatOpenAIResponse)
+			if handled && !bytes.Equal(out, body) {
+				t.Fatalf("invalid Responses identity changed: handled=%v out=%q want=%q", handled, out, body)
+			}
+			streamCarry.mu.Lock()
+			entry := streamCarry.entries[key]
+			if entry != nil && len(entry.arguments) != 0 {
+				streamCarry.mu.Unlock()
+				t.Fatalf("invalid Responses identity retained state: %#v", entry.arguments)
+			}
+			streamCarry.mu.Unlock()
+		})
+	}
+}
+
+func TestOpenAIResponsesFunctionArgumentIndependentFromOutputText(t *testing.T) {
+	callRegister(t, pluginabi.MethodPluginRegister, "")
+	st := activeSnapshot()
+	secret := "responses-independent-channels"
+	token := makeToken(st.label, secret)
+	st.vault.Put(token, secret)
+	requestBody := []byte(`{"input":"` + token + `"}`)
+	resetStreamCarry(requestBody)
+	split := len(token) / 2
+
+	textFirstBody := responsesOutputTextDeltaBody(t, token[:split])
+	textFirst := invokeStreamBody(t, formatOpenAIResponse, requestBody, 0, textFirstBody)
+	if got := openAIResponsesStreamText(t, deliveredStreamBody(textFirst, textFirstBody)); got != "" {
+		t.Fatalf("output-text prefix reached client: %q", got)
+	}
+	argumentFirstBody := responsesFunctionArgumentSSEBody("response.function_call_arguments.delta", responsesFunctionArgumentDelta(t, 0, "msg_privacy", `{"value":"`+token[:split]))
+	argumentFirst := invokeStreamBody(t, formatOpenAIResponse, requestBody, 1, argumentFirstBody)
+	if got := openAIResponsesFunctionArgumentDeltas(t, deliveredStreamBody(argumentFirst, argumentFirstBody))["0:msg_privacy"]; got != `{"value":"` {
+		t.Fatalf("function-argument prefix output = %q", got)
+	}
+	argumentSecondBody := responsesFunctionArgumentSSEBody("response.function_call_arguments.delta", responsesFunctionArgumentDelta(t, 0, "msg_privacy", token[split:]+`"}`))
+	argumentSecond := invokeStreamBody(t, formatOpenAIResponse, requestBody, 2, argumentSecondBody)
+	argument := openAIResponsesFunctionArgumentDeltas(t, append(deliveredStreamBody(argumentFirst, argumentFirstBody), deliveredStreamBody(argumentSecond, argumentSecondBody)...))["0:msg_privacy"]
+	var decoded map[string]string
+	if err := json.Unmarshal([]byte(argument), &decoded); err != nil || decoded["value"] != secret {
+		t.Fatalf("independent function arguments = %q decoded=%#v err=%v", argument, decoded, err)
+	}
+	textSecondBody := responsesOutputTextDeltaBody(t, token[split:])
+	textSecond := invokeStreamBody(t, formatOpenAIResponse, requestBody, 3, textSecondBody)
+	if got := openAIResponsesStreamText(t, deliveredStreamBody(textSecond, textSecondBody)); got != secret {
+		t.Fatalf("function argument consumed output-text pending state: %q", got)
+	}
+}
+
+func TestOpenAIResponsesCustomToolArgumentsKeepGenericBehavior(t *testing.T) {
+	callRegister(t, pluginabi.MethodPluginRegister, "")
+	st := activeSnapshot()
+	secret := "responses-custom-tool-secret"
+	token := makeToken(st.label, secret)
+	st.vault.Put(token, secret)
+	requestBody := []byte(`{"input":"` + token + `"}`)
+	resetStreamCarry(requestBody)
+
+	for index, tc := range []struct {
+		name      string
+		eventType string
+		doc       map[string]any
+		value     func(map[string]any) string
+	}{
+		{
+			name: "custom input done", eventType: "response.custom_tool_call_input.done",
+			doc:   map[string]any{"type": "response.custom_tool_call_input.done", "output_index": 0, "item_id": "custom", "input": token},
+			value: func(doc map[string]any) string { return doc["input"].(string) },
+		},
+		{
+			name: "custom output item", eventType: "response.output_item.done",
+			doc: map[string]any{
+				"type": "response.output_item.done", "output_index": 0,
+				"item": map[string]any{"type": "custom_tool_call", "id": "custom", "input": token},
+			},
+			value: func(doc map[string]any) string { return doc["item"].(map[string]any)["input"].(string) },
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := responsesFunctionArgumentSSEBody(tc.eventType, mustJSONMarshal(t, tc.doc))
+			response := invokeStreamBody(t, formatOpenAIResponse, requestBody, index, body)
+			delivered := deliveredStreamBody(response, body)
+			doc := findOpenAIResponsesEvent(t, delivered, tc.eventType)
+			if got := tc.value(doc); got != secret {
+				t.Fatalf("custom tool generic restoration = %q, want %q", got, secret)
+			}
+		})
+	}
+	streamCarry.mu.Lock()
+	defer streamCarry.mu.Unlock()
+	if entry := streamCarry.entries[streamKey(requestBody)]; entry != nil && len(entry.arguments) != 0 {
+		t.Fatalf("custom tool events retained argument state: %#v", entry.arguments)
+	}
 }
 
 func TestSplitSSETokenRestoresWithJSONEscaping(t *testing.T) {
@@ -933,6 +1993,44 @@ func TestGeminiSingleEventRestoresGenericFieldsButNotThoughtText(t *testing.T) {
 	}
 	if got := parts[2]["text"]; got != thoughtToken {
 		t.Fatalf("thought text was restored unexpectedly: got %#v want %q", got, thoughtToken)
+	}
+}
+
+func TestGeminiFunctionArgumentUsesGenericWalkerWithoutArgumentState(t *testing.T) {
+	callRegister(t, pluginabi.MethodPluginRegister, "")
+	st := activeSnapshot()
+	secret := "gemini-structured-function-argument"
+	token := makeToken(st.label, secret)
+	st.vault.Put(token, secret)
+	requestBody := []byte(`{"contents":[{"parts":[{"text":"` + token + `"}]}]}`)
+	resetStreamCarry(requestBody)
+	body := geminiCandidatesBody(t, []any{map[string]any{
+		"index": 0,
+		"content": map[string]any{"parts": []any{map[string]any{
+			"functionCall": map[string]any{"name": "lookup", "args": map[string]any{"value": token}},
+		}}},
+	}})
+
+	response := invokeStreamBody(t, formatGemini, requestBody, 0, body)
+	delivered := deliveredStreamBody(response, body)
+	doc, ok := decodeOneJSON(delivered)
+	if !ok {
+		t.Fatalf("invalid Gemini response: %q", delivered)
+	}
+	root := doc.(map[string]any)
+	candidate := root["candidates"].([]any)[0].(map[string]any)
+	content := candidate["content"].(map[string]any)
+	part := content["parts"].([]any)[0].(map[string]any)
+	functionCall := part["functionCall"].(map[string]any)
+	args := functionCall["args"].(map[string]any)
+	if got := args["value"]; got != secret {
+		t.Fatalf("Gemini functionCall.args generic restoration = %#v, want %q", got, secret)
+	}
+
+	streamCarry.mu.Lock()
+	defer streamCarry.mu.Unlock()
+	if entry := streamCarry.entries[streamKey(requestBody)]; entry != nil && entry.arguments != nil {
+		t.Fatalf("Gemini structured arguments created argument state: %#v", entry.arguments)
 	}
 }
 
@@ -1448,6 +2546,180 @@ func TestClaudeStreamKeepsBlockIndicesIndependent(t *testing.T) {
 	}
 }
 
+func TestClaudeInputJSONDeltaChannelsRemainIsolated(t *testing.T) {
+	callRegister(t, pluginabi.MethodPluginRegister, "")
+	st := activeSnapshot()
+	secrets := []string{"claude-tool-block-two", "claude-tool-block-seven"}
+	tokens := []string{makeToken(st.label, secrets[0]), makeToken(st.label, secrets[1])}
+	for i := range tokens {
+		st.vault.Put(tokens[i], secrets[i])
+	}
+	requestBody := []byte(`{"messages":[{"content":"` + tokens[0] + ` ` + tokens[1] + `"}]}`)
+	resetStreamCarry(requestBody)
+	splits := []int{len(tokens[0]) / 2, len(tokens[1]) / 2}
+
+	var delivered []byte
+	fragments := []struct {
+		index    int
+		fragment string
+	}{
+		{index: 2, fragment: `{"value":"` + tokens[0][:splits[0]]},
+		{index: 7, fragment: `{"value":"` + tokens[1][:splits[1]]},
+		{index: 7, fragment: tokens[1][splits[1]:] + `"}`},
+		{index: 2, fragment: tokens[0][splits[0]:] + `"}`},
+	}
+	for chunkIndex, fragment := range fragments {
+		body := claudeInputJSONDeltaBody(t, fragment.index, fragment.fragment)
+		response := invokeStreamBody(t, formatClaude, requestBody, chunkIndex, body)
+		delivered = append(delivered, deliveredStreamBody(response, body)...)
+	}
+
+	arguments := claudeInputJSONByBlock(t, delivered)
+	for i, index := range []int64{2, 7} {
+		var decoded map[string]string
+		if err := json.Unmarshal([]byte(arguments[index]), &decoded); err != nil {
+			t.Fatalf("Claude block %d produced invalid input JSON %q: %v", index, arguments[index], err)
+		}
+		if got := decoded["value"]; got != secrets[i] {
+			t.Fatalf("Claude block %d restored value = %q, want %q", index, got, secrets[i])
+		}
+	}
+}
+
+func TestClaudeInputJSONContentBlockStopFlushesOnlyMatchingBlock(t *testing.T) {
+	callRegister(t, pluginabi.MethodPluginRegister, "")
+	st := activeSnapshot()
+	token := makeToken(st.label, "claude-input-json-block-stop")
+	st.vault.Put(token, "claude-input-json-block-stop")
+	requestBody := []byte(`{"messages":[{"content":"` + token + `"}]}`)
+	resetStreamCarry(requestBody)
+	partial := token[:len(token)/2]
+
+	for chunkIndex, index := range []int{3, 8} {
+		body := claudeInputJSONDeltaBody(t, index, `{"value":"`+partial)
+		response := invokeStreamBody(t, formatClaude, requestBody, chunkIndex, body)
+		_ = deliveredStreamBody(response, body)
+	}
+	stopBody := claudeSSEBody(t, "content_block_stop", map[string]any{
+		"type": "content_block_stop", "index": 3,
+	}, "\n")
+	stopped := invokeStreamBody(t, formatClaude, requestBody, 2, stopBody)
+	flushed := claudeInputJSONByBlock(t, deliveredStreamBody(stopped, stopBody))
+	if got := flushed[3]; got != partial {
+		t.Fatalf("matching Claude block flush = %q, want %q", got, partial)
+	}
+	if got := flushed[8]; got != "" {
+		t.Fatalf("unmatched Claude block was flushed: %q", got)
+	}
+
+	streamCarry.mu.Lock()
+	defer streamCarry.mu.Unlock()
+	entry := streamCarry.entries[streamKey(requestBody)]
+	if entry == nil || len(entry.arguments) != 1 {
+		t.Fatalf("Claude block stop retained states = %#v, want only unmatched block", entry)
+	}
+	if _, exists := entry.arguments["argument:claude:block:8"]; !exists {
+		t.Fatalf("unmatched Claude argument state missing: %#v", entry.arguments)
+	}
+}
+
+func TestClaudeInputJSONMessageStopFlushesAllBlocks(t *testing.T) {
+	callRegister(t, pluginabi.MethodPluginRegister, "")
+	st := activeSnapshot()
+	token := makeToken(st.label, "claude-input-json-message-stop")
+	st.vault.Put(token, "claude-input-json-message-stop")
+	requestBody := []byte(`{"messages":[{"content":"` + token + `"}]}`)
+	resetStreamCarry(requestBody)
+	partial := token[:len(token)/2]
+
+	for chunkIndex, index := range []int{1, 6} {
+		body := claudeInputJSONDeltaBody(t, index, `{"value":"`+partial)
+		response := invokeStreamBody(t, formatClaude, requestBody, chunkIndex, body)
+		_ = deliveredStreamBody(response, body)
+	}
+	stopBody := claudeSSEBody(t, "message_stop", map[string]any{"type": "message_stop"}, "\n")
+	stopped := invokeStreamBody(t, formatClaude, requestBody, 2, stopBody)
+	delivered := deliveredStreamBody(stopped, stopBody)
+	flushed := claudeInputJSONByBlock(t, delivered)
+	for _, index := range []int64{1, 6} {
+		if got := flushed[index]; got != partial {
+			t.Fatalf("message_stop flush for block %d = %q, want %q", index, got, partial)
+		}
+	}
+	if !bytes.HasSuffix(delivered, stopBody) {
+		t.Fatalf("message_stop event was not preserved at the end: %q", delivered)
+	}
+	streamCarry.mu.Lock()
+	defer streamCarry.mu.Unlock()
+	if entry := streamCarry.entries[streamKey(requestBody)]; entry != nil && len(entry.arguments) != 0 {
+		t.Fatalf("message_stop retained Claude argument state: %#v", entry.arguments)
+	}
+}
+
+func TestClaudeInputJSONDeltaRejectsInvalidBlockIndex(t *testing.T) {
+	label := "REDACTED"
+	token := makeToken(label, "invalid-claude-input-index")
+	fragment := `{"value":"` + token[:len(token)/2]
+	for _, tc := range []struct {
+		name  string
+		index any
+		omit  bool
+	}{
+		{name: "missing", omit: true},
+		{name: "negative", index: -1},
+		{name: "non-integer", index: 0.5},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			key := "invalid-claude-input-index-" + tc.name
+			streamCarry.reset(key)
+			doc := map[string]any{
+				"type":  "content_block_delta",
+				"delta": map[string]any{"type": "input_json_delta", "partial_json": fragment},
+			}
+			if !tc.omit {
+				doc["index"] = tc.index
+			}
+			body := claudeSSEBody(t, "content_block_delta", doc, "\n")
+			out, handled := restoreSemanticStream(key, body, tokenPattern(label), []string{label}, map[string]struct{}{token: {}}, newVault(1, time.Hour), "text/event-stream", formatClaude)
+			if !handled || !bytes.Equal(out, body) {
+				t.Fatalf("invalid Claude block index changed fragment: handled=%v out=%q want=%q", handled, out, body)
+			}
+			streamCarry.mu.Lock()
+			entry := streamCarry.entries[key]
+			if entry != nil && entry.arguments != nil {
+				streamCarry.mu.Unlock()
+				t.Fatalf("invalid Claude block index created argument state: %#v", entry.arguments)
+			}
+			streamCarry.mu.Unlock()
+		})
+	}
+}
+
+func TestClaudeInputJSONDeltaSpecialCharactersRemainValid(t *testing.T) {
+	callRegister(t, pluginabi.MethodPluginRegister, "")
+	st := activeSnapshot()
+	secret := "quote=\" slash=\\ line=\n tab=\t control=\x01 unicode=世界 html=<>&"
+	token := makeToken(st.label, secret)
+	st.vault.Put(token, secret)
+	requestBody := []byte(`{"messages":[{"content":"` + token + `"}]}`)
+	resetStreamCarry(requestBody)
+	split := len(token) / 2
+
+	firstBody := claudeInputJSONDeltaBody(t, 4, `{"value":"`+token[:split])
+	first := invokeStreamBody(t, formatClaude, requestBody, 0, firstBody)
+	secondBody := claudeInputJSONDeltaBody(t, 4, token[split:]+`"}`)
+	second := invokeStreamBody(t, formatClaude, requestBody, 1, secondBody)
+	delivered := append(deliveredStreamBody(first, firstBody), deliveredStreamBody(second, secondBody)...)
+	argument := claudeInputJSONByBlock(t, delivered)[4]
+	var decoded map[string]string
+	if err := json.Unmarshal([]byte(argument), &decoded); err != nil {
+		t.Fatalf("special-character Claude input JSON is invalid %q: %v", argument, err)
+	}
+	if got := decoded["value"]; got != secret {
+		t.Fatalf("special-character Claude value = %q, want %q", got, secret)
+	}
+}
+
 func TestClaudeStreamPreservesMetadataEventNameAndCRLF(t *testing.T) {
 	callRegister(t, pluginabi.MethodPluginRegister, "")
 	st := activeSnapshot()
@@ -1492,36 +2764,43 @@ func TestClaudeStreamPreservesMetadataEventNameAndCRLF(t *testing.T) {
 func TestClaudeStreamThinkingAndToolDeltasDoNotShareTextPending(t *testing.T) {
 	callRegister(t, pluginabi.MethodPluginRegister, "")
 	st := activeSnapshot()
-	secret := "claude-visible-only-secret"
-	token := makeToken(st.label, secret)
-	st.vault.Put(token, secret)
-	requestBody := []byte(`{"messages":[{"content":"` + token + `"}]}`)
+	textSecret := "claude-visible-only-secret"
+	argumentSecret := "claude-input-json-only-secret"
+	textToken := makeToken(st.label, textSecret)
+	argumentToken := makeToken(st.label, argumentSecret)
+	st.vault.Put(textToken, textSecret)
+	st.vault.Put(argumentToken, argumentSecret)
+	requestBody := []byte(`{"messages":[{"content":"` + textToken + ` ` + argumentToken + `"}]}`)
 	resetStreamCarry(requestBody)
-	split := len(token) / 2
+	textSplit := len(textToken) / 2
+	argumentSplit := len(argumentToken) / 2
 
-	firstBody := claudeTextDeltaBody(t, 0, token[:split])
+	firstBody := claudeTextDeltaBody(t, 0, textToken[:textSplit])
 	invokeStreamBody(t, formatClaude, requestBody, 0, firstBody)
-	negativeBodies := [][]byte{
-		claudeSSEBody(t, "content_block_delta", map[string]any{
-			"type":  "content_block_delta",
-			"index": 0,
-			"delta": map[string]any{"type": "thinking_delta", "thinking": token[split:]},
-		}, "\n"),
-		claudeSSEBody(t, "content_block_delta", map[string]any{
-			"type":  "content_block_delta",
-			"index": 0,
-			"delta": map[string]any{"type": "input_json_delta", "partial_json": token[split:]},
-		}, "\n"),
+	thinkingBody := claudeSSEBody(t, "content_block_delta", map[string]any{
+		"type":  "content_block_delta",
+		"index": 0,
+		"delta": map[string]any{"type": "thinking_delta", "thinking": textToken[textSplit:]},
+	}, "\n")
+	thinking := invokeStreamBody(t, formatClaude, requestBody, 1, thinkingBody)
+	if delivered := deliveredStreamBody(thinking, thinkingBody); !bytes.Equal(delivered, thinkingBody) || bytes.Contains(delivered, []byte(textSecret)) {
+		t.Fatalf("Claude thinking delta entered text pending state: %q", delivered)
 	}
-	for i, body := range negativeBodies {
-		response := invokeStreamBody(t, formatClaude, requestBody, i+1, body)
-		if delivered := deliveredStreamBody(response, body); !bytes.Equal(delivered, body) || bytes.Contains(delivered, []byte(secret)) {
-			t.Fatalf("non-visible Claude delta %d entered text pending state: %q", i, delivered)
-		}
+	argumentFirstBody := claudeInputJSONDeltaBody(t, 0, `{"value":"`+argumentToken[:argumentSplit])
+	argumentFirst := invokeStreamBody(t, formatClaude, requestBody, 2, argumentFirstBody)
+	if got := claudeInputJSONByBlock(t, deliveredStreamBody(argumentFirst, argumentFirstBody))[0]; got != `{"value":"` {
+		t.Fatalf("Claude input JSON prefix output = %q", got)
 	}
-	completionBody := claudeTextDeltaBody(t, 0, token[split:])
-	completion := invokeStreamBody(t, formatClaude, requestBody, 3, completionBody)
-	if got := claudeStreamText(t, deliveredStreamBody(completion, completionBody)); got != secret {
+	argumentSecondBody := claudeInputJSONDeltaBody(t, 0, argumentToken[argumentSplit:]+`"}`)
+	argumentSecond := invokeStreamBody(t, formatClaude, requestBody, 3, argumentSecondBody)
+	argument := claudeInputJSONByBlock(t, append(deliveredStreamBody(argumentFirst, argumentFirstBody), deliveredStreamBody(argumentSecond, argumentSecondBody)...))[0]
+	var decoded map[string]string
+	if err := json.Unmarshal([]byte(argument), &decoded); err != nil || decoded["value"] != argumentSecret {
+		t.Fatalf("Claude input JSON state was changed by text/thinking: argument=%q decoded=%#v err=%v", argument, decoded, err)
+	}
+	completionBody := claudeTextDeltaBody(t, 0, textToken[textSplit:])
+	completion := invokeStreamBody(t, formatClaude, requestBody, 4, completionBody)
+	if got := claudeStreamText(t, deliveredStreamBody(completion, completionBody)); got != textSecret {
 		t.Fatalf("Claude text pending state was changed by thinking/tool deltas: %q", got)
 	}
 }
@@ -2007,6 +3286,18 @@ func claudeTextDeltaBody(t *testing.T, index int, delta string) []byte {
 	}, "\n")
 }
 
+func claudeInputJSONDeltaBody(t *testing.T, index int, fragment string) []byte {
+	t.Helper()
+	return claudeSSEBody(t, "content_block_delta", map[string]any{
+		"type":  "content_block_delta",
+		"index": index,
+		"delta": map[string]any{
+			"type":         "input_json_delta",
+			"partial_json": fragment,
+		},
+	}, "\n")
+}
+
 func geminiBody(t *testing.T, text string) []byte {
 	t.Helper()
 	return geminiCandidatesBody(t, []any{map[string]any{
@@ -2110,6 +3401,30 @@ func claudeStreamText(t *testing.T, body []byte) string {
 		}
 	}
 	return text.String()
+}
+
+func claudeInputJSONByBlock(t *testing.T, body []byte) map[int64]string {
+	t.Helper()
+	arguments := make(map[int64]string)
+	for _, frame := range parseSemanticSSEFrames(body) {
+		root, ok := frame.doc.(map[string]any)
+		if !ok || root["type"] != "content_block_delta" {
+			continue
+		}
+		index, ok := nonnegativeJSONIndex(root["index"])
+		if !ok {
+			continue
+		}
+		delta, ok := root["delta"].(map[string]any)
+		if !ok || delta["type"] != "input_json_delta" {
+			continue
+		}
+		fragment, ok := delta["partial_json"].(string)
+		if ok {
+			arguments[index] += fragment
+		}
+	}
+	return arguments
 }
 
 func responsesSSEBody(t *testing.T, event string, doc map[string]any, lineEnding string) []byte {
@@ -2371,6 +3686,317 @@ func invokeStreamBodyWithID(t *testing.T, sourceFormat, streamID string, index i
 	return response
 }
 
+func initStreamWithID(t *testing.T, sourceFormat, streamID string, requestBody []byte) {
+	t.Helper()
+	req := mustJSONMarshal(t, pluginapi.StreamChunkInterceptRequest{
+		StreamID:     streamID,
+		SourceFormat: sourceFormat,
+		RequestBody:  requestBody,
+		ChunkIndex:   pluginapi.StreamChunkHeaderInitIndex,
+	})
+	if _, err := handleMethod(pluginabi.MethodResponseInterceptStreamChunk, req); err != nil {
+		t.Fatalf("stream init: %v", err)
+	}
+}
+
+func assertNoArgumentState(t *testing.T, key, channelPrefix string) {
+	t.Helper()
+	streamCarry.mu.Lock()
+	defer streamCarry.mu.Unlock()
+	entry := streamCarry.entries[key]
+	if entry == nil {
+		return
+	}
+	for channel := range entry.arguments {
+		if strings.HasPrefix(channel, channelPrefix) {
+			t.Fatalf("argument state %q remained after terminal: %#v", channel, entry.arguments)
+		}
+	}
+}
+
+func TestStreamStatefulChatArgumentRestoration(t *testing.T) {
+	callRegister(t, pluginabi.MethodPluginRegister, "mode: filter\n")
+	st := activeSnapshot()
+	secret := "stateful-chat-tool-argument"
+	token := makeToken(st.label, secret)
+	st.vault.Put(token, secret)
+	requestBody := []byte(`{"messages":[{"content":"` + token + `"}]}`)
+	streamID := "stateful-chat-argument"
+	initStreamWithID(t, formatOpenAI, streamID, requestBody)
+	t.Cleanup(func() { invokeStreamBodyWithID(t, formatOpenAI, streamID, pluginapi.StreamChunkEndIndex, nil) })
+	split := len(token) / 2
+
+	firstBody := openAIChatToolArgumentSSEBody(t, 0, 1, `{"value":"`+token[:split], nil)
+	first := invokeStreamBodyWithID(t, formatOpenAI, streamID, 0, firstBody)
+	secondBody := openAIChatToolArgumentSSEBody(t, 0, 1, token[split:]+`"}`, nil)
+	second := invokeStreamBodyWithID(t, formatOpenAI, streamID, 1, secondBody)
+	delivered := append(deliveredStreamBody(first, firstBody), deliveredStreamBody(second, secondBody)...)
+	argument := openAIChatToolArguments(t, delivered)["0:1"]
+	var decoded map[string]string
+	if err := json.Unmarshal([]byte(argument), &decoded); err != nil || decoded["value"] != secret {
+		t.Fatalf("stateful arguments = %q decoded=%#v err=%v", argument, decoded, err)
+	}
+
+	finishBody := openAIChatToolArgumentSSEBody(t, 0, 1, "", "stop")
+	_ = invokeStreamBodyWithID(t, formatOpenAI, streamID, 2, finishBody)
+	assertNoArgumentState(t, streamID, "argument:openai:")
+	end := invokeStreamBodyWithID(t, formatOpenAI, streamID, pluginapi.StreamChunkEndIndex, nil)
+	if end.DropChunk || len(end.Body) != 0 || streamCarry.has(streamID) {
+		t.Fatalf("stateful end did not cleanly release state: response=%+v retained=%v", end, streamCarry.has(streamID))
+	}
+}
+
+func TestStreamLegacyChatArgumentRestoration(t *testing.T) {
+	callRegister(t, pluginabi.MethodPluginRegister, "mode: filter\n")
+	st := activeSnapshot()
+	secret := "legacy-chat-tool-argument"
+	token := makeToken(st.label, secret)
+	st.vault.Put(token, secret)
+	requestBody := []byte(`{"messages":[{"content":"` + token + `"}]}`)
+	resetStreamCarry(requestBody)
+	split := len(token) / 2
+
+	firstBody := openAIChatToolArgumentSSEBody(t, 2, 3, `{"value":"`+token[:split], nil)
+	first := invokeStreamBody(t, formatOpenAI, requestBody, 0, firstBody)
+	secondBody := openAIChatToolArgumentSSEBody(t, 2, 3, token[split:]+`"}`, nil)
+	second := invokeStreamBody(t, formatOpenAI, requestBody, 1, secondBody)
+	delivered := append(deliveredStreamBody(first, firstBody), deliveredStreamBody(second, secondBody)...)
+	argument := openAIChatToolArguments(t, delivered)["2:3"]
+	var decoded map[string]string
+	if err := json.Unmarshal([]byte(argument), &decoded); err != nil || decoded["value"] != secret {
+		t.Fatalf("legacy arguments = %q decoded=%#v err=%v", argument, decoded, err)
+	}
+	finishBody := openAIChatToolArgumentSSEBody(t, 2, 3, "", "stop")
+	_ = invokeStreamBody(t, formatOpenAI, requestBody, 2, finishBody)
+	assertNoArgumentState(t, streamKey(requestBody), "argument:openai:")
+}
+
+func TestToolArgumentRestoresAcrossReconfig(t *testing.T) {
+	callRegister(t, pluginabi.MethodPluginRegister, "mode: filter\n")
+	before := activeSnapshot()
+	secret := "tool-argument-filter-to-block"
+	token := makeToken(before.label, secret)
+	before.vault.Put(token, secret)
+	requestBody := []byte(`{"messages":[{"content":"` + token + `"}]}`)
+	streamID := "tool-argument-hot-switch"
+	initStreamWithID(t, formatOpenAI, streamID, requestBody)
+	t.Cleanup(func() { invokeStreamBodyWithID(t, formatOpenAI, streamID, pluginapi.StreamChunkEndIndex, nil) })
+	split := len(token) / 2
+
+	firstBody := openAIChatToolArgumentSSEBody(t, 0, 0, `{"value":"`+token[:split], nil)
+	first := invokeStreamBodyWithID(t, formatOpenAI, streamID, 0, firstBody)
+	callRegister(t, pluginabi.MethodPluginReconfigure, "mode: block\n")
+	if activeSnapshot().vault != before.vault {
+		t.Fatal("hot reconfiguration replaced the live vault")
+	}
+	secondBody := openAIChatToolArgumentSSEBody(t, 0, 0, token[split:]+`"}`, nil)
+	second := invokeStreamBodyWithID(t, formatOpenAI, streamID, 1, secondBody)
+	delivered := append(deliveredStreamBody(first, firstBody), deliveredStreamBody(second, secondBody)...)
+	argument := openAIChatToolArguments(t, delivered)["0:0"]
+	var decoded map[string]string
+	if err := json.Unmarshal([]byte(argument), &decoded); err != nil || decoded["value"] != secret {
+		t.Fatalf("hot-switch arguments = %q decoded=%#v err=%v", argument, decoded, err)
+	}
+	finishBody := openAIChatToolArgumentSSEBody(t, 0, 0, "", "stop")
+	_ = invokeStreamBodyWithID(t, formatOpenAI, streamID, 2, finishBody)
+	assertNoArgumentState(t, streamID, "argument:openai:")
+}
+
+func TestArgumentNormalTerminalEndReleasesState(t *testing.T) {
+	callRegister(t, pluginabi.MethodPluginRegister, "")
+	st := activeSnapshot()
+	token := makeToken(st.label, "normal-terminal-argument")
+	st.vault.Put(token, "normal-terminal-argument")
+	requestBody := []byte(`{"input":"` + token + `"}`)
+	partial := token[:len(token)/2]
+
+	t.Run("Chat finish", func(t *testing.T) {
+		resetStreamCarry(requestBody)
+		seed := openAIChatToolArgumentSSEBody(t, 0, 0, `{"value":"`+partial, nil)
+		_ = invokeStreamBody(t, formatOpenAI, requestBody, 0, seed)
+		finish := openAIChatToolArgumentSSEBody(t, 0, 0, "", "stop")
+		_ = invokeStreamBody(t, formatOpenAI, requestBody, 1, finish)
+		assertNoArgumentState(t, streamKey(requestBody), "argument:openai:")
+	})
+	t.Run("Responses done and completed", func(t *testing.T) {
+		resetStreamCarry(requestBody)
+		seedBody := responsesFunctionArgumentSSEBody("response.function_call_arguments.delta", responsesFunctionArgumentDelta(t, 0, "call_done", `{"value":"`+partial))
+		_ = invokeStreamBody(t, formatOpenAIResponse, requestBody, 0, seedBody)
+		doneBody := responsesFunctionArgumentSSEBody("response.function_call_arguments.done", responsesFunctionArgumentDone(t, 0, "call_done", `{"value":"`+token+`"}`))
+		_ = invokeStreamBody(t, formatOpenAIResponse, requestBody, 1, doneBody)
+		assertNoArgumentState(t, streamKey(requestBody), "argument:openai-response:")
+
+		seedBody = responsesFunctionArgumentSSEBody("response.function_call_arguments.delta", responsesFunctionArgumentDelta(t, 1, "call_completed", `{"value":"`+partial))
+		_ = invokeStreamBody(t, formatOpenAIResponse, requestBody, 2, seedBody)
+		completedBody := responsesFunctionArgumentSSEBody("response.completed", mustJSONMarshal(t, map[string]any{"type": "response.completed"}))
+		_ = invokeStreamBody(t, formatOpenAIResponse, requestBody, 3, completedBody)
+		assertNoArgumentState(t, streamKey(requestBody), "argument:openai-response:")
+	})
+	t.Run("Claude block and message", func(t *testing.T) {
+		resetStreamCarry(requestBody)
+		seed := claudeInputJSONDeltaBody(t, 2, `{"value":"`+partial)
+		_ = invokeStreamBody(t, formatClaude, requestBody, 0, seed)
+		blockStop := claudeSSEBody(t, "content_block_stop", map[string]any{"type": "content_block_stop", "index": 2}, "\n")
+		_ = invokeStreamBody(t, formatClaude, requestBody, 1, blockStop)
+		assertNoArgumentState(t, streamKey(requestBody), "argument:claude:block:2")
+
+		for i, index := range []int{3, 4} {
+			seed = claudeInputJSONDeltaBody(t, index, `{"value":"`+partial)
+			_ = invokeStreamBody(t, formatClaude, requestBody, i+2, seed)
+		}
+		messageStop := claudeSSEBody(t, "message_stop", map[string]any{"type": "message_stop"}, "\n")
+		_ = invokeStreamBody(t, formatClaude, requestBody, 4, messageStop)
+		assertNoArgumentState(t, streamKey(requestBody), "argument:claude:")
+	})
+}
+
+func TestArgumentEndWithoutProtocolTerminalCleansState(t *testing.T) {
+	callRegister(t, pluginabi.MethodPluginRegister, "")
+	st := activeSnapshot()
+	token := makeToken(st.label, "abnormal-end-argument")
+	st.vault.Put(token, "abnormal-end-argument")
+	requestBody := []byte(`{"messages":[{"content":"` + token + `"}]}`)
+	streamID := "argument-abnormal-end"
+	initStreamWithID(t, formatOpenAI, streamID, requestBody)
+	partial := token[:len(token)/2]
+	seedBody := openAIChatToolArgumentSSEBody(t, 0, 0, `{"value":"`+partial, nil)
+	seed := invokeStreamBodyWithID(t, formatOpenAI, streamID, 0, seedBody)
+	if got := openAIChatToolArguments(t, deliveredStreamBody(seed, seedBody))["0:0"]; got != `{"value":"` {
+		t.Fatalf("abnormal-end seed emitted retained suffix: %q", got)
+	}
+	if !streamCarry.has(streamID) {
+		t.Fatal("argument state was not retained before abnormal end")
+	}
+	end := invokeStreamBodyWithID(t, formatOpenAI, streamID, pluginapi.StreamChunkEndIndex, nil)
+	if end.DropChunk || len(end.Body) != 0 {
+		t.Fatalf("end callback attempted to deliver withheld bytes: %+v", end)
+	}
+	if streamCarry.has(streamID) {
+		t.Fatal("abnormal end did not remove stream entry")
+	}
+}
+
+func TestArgumentHardEntryEvictLosesOnlySuffix(t *testing.T) {
+	const channel = "argument:openai:choice:0:tool:0"
+	label := "REDACTED"
+	store := newStreamStore()
+	secretA := "evicted-request-secret"
+	tokenA := makeToken(label, secretA)
+	tokenB := makeToken(label, "other-request-secret")
+	v := newVault(2, time.Hour)
+	v.Put(tokenA, secretA)
+	v.Put(tokenB, "other-request-secret")
+	firstKey := "evicted-active-argument"
+	store.begin(firstKey)
+	split := len(tokenA) / 2
+	owner := map[string]any{"arguments": `{"value":"` + tokenA[:split]}
+	part := &semanticArgumentPart{frame: &semanticFrame{}, channel: channel, owner: owner, field: "arguments", original: owner["arguments"], text: owner["arguments"].(string)}
+	store.rewriteJSONArgumentOps(firstKey, []semanticArgumentOp{{part: part}}, tokenPattern(label), []string{label}, map[string]struct{}{tokenA: {}}, v)
+	store.mu.Lock()
+	state := store.entries[firstKey].arguments[channel]
+	stateCount := len(store.entries[firstKey].arguments)
+	store.mu.Unlock()
+	if stateCount != 1 || state.tail != tokenA[:split] {
+		t.Fatalf("retained state before eviction = %+v count=%d", state, stateCount)
+	}
+	for i := 0; i < streamCarryMaxEntries; i++ {
+		store.begin(fmt.Sprintf("other-active-%d", i))
+	}
+	if store.has(firstKey) {
+		t.Fatal("hard entry pressure did not evict the least-recent active argument")
+	}
+
+	otherOwner := map[string]any{"arguments": `{"value":"` + tokenA + `"}`}
+	otherPart := &semanticArgumentPart{frame: &semanticFrame{}, channel: channel, owner: otherOwner, field: "arguments", original: otherOwner["arguments"], text: otherOwner["arguments"].(string)}
+	store.rewriteJSONArgumentOps("other-request", []semanticArgumentOp{{part: otherPart}}, tokenPattern(label), []string{label}, map[string]struct{}{tokenB: {}}, v)
+	if got := otherOwner["arguments"].(string); got != `{"value":"`+tokenA+`"}` || strings.Contains(got, secretA) {
+		t.Fatalf("other request crossed restoration gates after eviction: %q", got)
+	}
+}
+
+func TestArgumentVaultExpirePreservesRepresentation(t *testing.T) {
+	label := "REDACTED"
+	token := makeToken(label, "expired-between-deltas")
+	tokenRe := tokenPattern(label)
+	escaped := strings.ReplaceAll(strings.ReplaceAll(token, "<", `\u003c`), ">", `\u003e`)
+	for _, tc := range []struct {
+		name     string
+		argument string
+	}{
+		{name: "literal", argument: `{"value":"` + token + `"}`},
+		{name: "Unicode escaped", argument: `{"value":"` + escaped + `"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			v := newVault(1, time.Hour)
+			v.Put(token, "expired-between-deltas")
+			split := strings.Index(tc.argument, "REDACTED") + 4
+			first, state := rewriteJSONArgumentFragment(tc.argument[:split], jsonArgumentState{}, tokenRe, []string{label}, map[string]struct{}{token: {}}, v, false)
+			v.mu.Lock()
+			v.items[token].Value.(*vaultEntry).expiresAt = time.Now().Add(-time.Second)
+			v.mu.Unlock()
+			second, state := rewriteJSONArgumentFragment(tc.argument[split:], state, tokenRe, []string{label}, map[string]struct{}{token: {}}, v, true)
+			if state.tail != "" || first+second != tc.argument {
+				t.Fatalf("expired %s representation changed: got %q want %q state=%+v", tc.name, first+second, tc.argument, state)
+			}
+		})
+	}
+}
+
+func TestArgumentProtocolsRemainOnePass(t *testing.T) {
+	callRegister(t, pluginabi.MethodPluginRegister, "")
+	st := activeSnapshot()
+	innerToken := makeToken(st.label, "one-pass-inner")
+	outerSecret := "contains " + innerToken
+	outerToken := makeToken(st.label, outerSecret)
+	st.vault.Put(innerToken, "one-pass-inner")
+	st.vault.Put(outerToken, outerSecret)
+	requestBody := []byte(`{"input":"` + outerToken + ` ` + innerToken + `"}`)
+	split := len(outerToken) / 2
+
+	tests := []struct {
+		name     string
+		first    func() []byte
+		second   func() []byte
+		format   string
+		argument func([]byte) string
+	}{
+		{name: "Chat", format: formatOpenAI,
+			first:    func() []byte { return openAIChatToolArgumentSSEBody(t, 0, 0, `{"value":"`+outerToken[:split], nil) },
+			second:   func() []byte { return openAIChatToolArgumentSSEBody(t, 0, 0, outerToken[split:]+`"}`, nil) },
+			argument: func(body []byte) string { return openAIChatToolArguments(t, body)["0:0"] }},
+		{name: "Responses", format: formatOpenAIResponse,
+			first: func() []byte {
+				return responsesFunctionArgumentSSEBody("response.function_call_arguments.delta", responsesFunctionArgumentDelta(t, 0, "call_one_pass", `{"value":"`+outerToken[:split]))
+			},
+			second: func() []byte {
+				return responsesFunctionArgumentSSEBody("response.function_call_arguments.delta", responsesFunctionArgumentDelta(t, 0, "call_one_pass", outerToken[split:]+`"}`))
+			},
+			argument: func(body []byte) string { return openAIResponsesFunctionArgumentDeltas(t, body)["0:call_one_pass"] }},
+		{name: "Claude", format: formatClaude,
+			first:    func() []byte { return claudeInputJSONDeltaBody(t, 0, `{"value":"`+outerToken[:split]) },
+			second:   func() []byte { return claudeInputJSONDeltaBody(t, 0, outerToken[split:]+`"}`) },
+			argument: func(body []byte) string { return claudeInputJSONByBlock(t, body)[0] }},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			resetStreamCarry(requestBody)
+			firstBody := tc.first()
+			first := invokeStreamBody(t, tc.format, requestBody, 0, firstBody)
+			secondBody := tc.second()
+			second := invokeStreamBody(t, tc.format, requestBody, 1, secondBody)
+			delivered := append(deliveredStreamBody(first, firstBody), deliveredStreamBody(second, secondBody)...)
+			argument := tc.argument(delivered)
+			var decoded map[string]string
+			if err := json.Unmarshal([]byte(argument), &decoded); err != nil || decoded["value"] != outerSecret {
+				t.Fatalf("%s one-pass argument = %q decoded=%#v err=%v", tc.name, argument, decoded, err)
+			}
+			if decoded["value"] == "contains one-pass-inner" {
+				t.Fatalf("%s recursively restored nested token: %q", tc.name, decoded["value"])
+			}
+		})
+	}
+}
+
 // TestStreamStatefulRestoresByStreamID covers the streaming-performance fix: a
 // stateful stream caches its per-request token allowlist at the header-init call
 // (keyed by StreamID) so payload chunks that carry only StreamID and no
@@ -2435,6 +4061,77 @@ func TestStreamStatefulEndReleasesState(t *testing.T) {
 	}
 	if streamCarry.has(streamID) {
 		t.Fatal("stream end did not release state")
+	}
+}
+
+func TestStreamStatefulRepeatedInitReplacesAbandonedAttempt(t *testing.T) {
+	callRegister(t, pluginabi.MethodPluginRegister, "")
+	st := activeSnapshot()
+	firstSecret := "stateful-first-attempt-secret"
+	secondSecret := "stateful-second-attempt-secret"
+	firstToken := makeToken(st.label, firstSecret)
+	secondToken := makeToken(st.label, secondSecret)
+	st.vault.Put(firstToken, firstSecret)
+	st.vault.Put(secondToken, secondSecret)
+	streamID := "stream-stateful-retry"
+
+	initStreamWithID(t, formatOpenAI, streamID, []byte(`{"messages":[{"content":"`+firstToken+`"}]}`))
+	streamCarry.mu.Lock()
+	entry := streamCarry.entries[streamID]
+	entry.carry = []byte("abandoned-carry")
+	entry.content = map[string]string{"abandoned-content": "value"}
+	entry.arguments = map[string]jsonArgumentState{"abandoned-argument": {tail: "value"}}
+	entry.argumentOverflow = true
+	streamCarry.mu.Unlock()
+
+	initStreamWithID(t, formatOpenAI, streamID, []byte(`{"messages":[{"content":"`+secondToken+`"}]}`))
+	streamCarry.mu.Lock()
+	entry = streamCarry.entries[streamID]
+	if entry == nil || !entry.active {
+		streamCarry.mu.Unlock()
+		t.Fatal("repeated stream init did not create active replacement state")
+	}
+	_, hasFirst := entry.allowed[firstToken]
+	_, hasSecond := entry.allowed[secondToken]
+	staleState := len(entry.carry) != 0 || len(entry.content) != 0 || len(entry.arguments) != 0 || entry.argumentOverflow
+	streamCarry.mu.Unlock()
+	if hasFirst || !hasSecond {
+		t.Fatalf("replacement allowlist hasFirst=%v hasSecond=%v", hasFirst, hasSecond)
+	}
+	if staleState {
+		t.Fatal("repeated stream init retained carry or semantic state from abandoned attempt")
+	}
+
+	firstBody := []byte(`data: {"delta":"` + firstToken + `"}` + "\n\n")
+	first := invokeStreamBodyWithID(t, formatOpenAI, streamID, 0, firstBody)
+	firstDelivered := deliveredStreamBody(first, firstBody)
+	if bytes.Contains(firstDelivered, []byte(firstSecret)) || !bytes.Contains(firstDelivered, []byte(firstToken)) {
+		t.Fatalf("abandoned allowlist remained usable: %q", firstDelivered)
+	}
+	secondBody := []byte(`data: {"delta":"` + secondToken + `"}` + "\n\n")
+	second := invokeStreamBodyWithID(t, formatOpenAI, streamID, 1, secondBody)
+	secondDelivered := deliveredStreamBody(second, secondBody)
+	if !bytes.Contains(secondDelivered, []byte(secondSecret)) || bytes.Contains(secondDelivered, []byte(secondToken)) {
+		t.Fatalf("replacement allowlist was not used: %q", secondDelivered)
+	}
+}
+
+func TestStreamStatefulEndIsIdempotentAndDropsRetainedSuffix(t *testing.T) {
+	callRegister(t, pluginabi.MethodPluginRegister, "")
+	streamID := "stream-stateful-repeated-end"
+	initStreamWithID(t, formatOpenAI, streamID, []byte(`{"messages":[]}`))
+	if !streamCarry.setCarry(streamID, []byte("withheld-secret-suffix")) {
+		t.Fatal("could not stage retained stream suffix")
+	}
+
+	for i := 0; i < 2; i++ {
+		response := invokeStreamBodyWithID(t, formatOpenAI, streamID, pluginapi.StreamChunkEndIndex, nil)
+		if response.DropChunk || len(response.Body) != 0 {
+			t.Fatalf("end call %d emitted retained state: %+v", i+1, response)
+		}
+		if streamCarry.has(streamID) {
+			t.Fatalf("end call %d retained stream state", i+1)
+		}
 	}
 }
 

@@ -41,15 +41,17 @@ const (
 // any bytes withheld because they may be the start of a token split across the
 // next chunk boundary. touchedAt drives TTL and LRU-style eviction.
 type streamEntry struct {
-	key       string
-	allowed   map[string]struct{}
-	hasAllow  bool
-	active    bool
-	carry     []byte
-	content   map[string]string
-	touchedAt time.Time
-	element   *list.Element
-	bytes     int
+	key              string
+	allowed          map[string]struct{}
+	hasAllow         bool
+	active           bool
+	carry            []byte
+	content          map[string]string
+	arguments        map[string]jsonArgumentState
+	argumentOverflow bool
+	touchedAt        time.Time
+	element          *list.Element
+	bytes            int
 }
 
 // streamStore is a bounded map of per-stream state. Active state is retained
@@ -316,7 +318,17 @@ func (s *streamStore) resizeEntryLocked(e *streamEntry) {
 	for channel, pending := range e.content {
 		e.bytes += len(channel) + len(pending)
 	}
+	for channel, state := range e.arguments {
+		e.bytes += len(channel) + jsonArgumentStateBytes(state)
+	}
+	if e.argumentOverflow || len(e.arguments) > 0 {
+		e.bytes++
+	}
 	s.totalBytes += e.bytes
+}
+
+func streamEntryChannelCount(e *streamEntry) int {
+	return len(e.content) + len(e.arguments)
 }
 
 func (s *streamStore) evictBytesLocked(keep *streamEntry) {
@@ -468,10 +480,10 @@ func tokenLabels(tokens map[string]struct{}) []string {
 // rather than fetched here, so the label used to build tokenRe/allowed and the
 // vault used to resolve them always come from the same reconfigure generation.
 func restoreBody(data []byte, tokenRe *regexp.Regexp, allowed map[string]struct{}, v *vault) []byte {
-	return restoreBodyForMediaType(data, tokenRe, allowed, v, "")
+	return restoreBodyForMediaType(data, tokenRe, allowed, v, "", "")
 }
 
-func restoreBodyForMediaType(data []byte, tokenRe *regexp.Regexp, allowed map[string]struct{}, v *vault, mediaType string) []byte {
+func restoreBodyForMediaType(data []byte, tokenRe *regexp.Regexp, allowed map[string]struct{}, v *vault, mediaType, sourceFormat string) []byte {
 	if v == nil || len(data) == 0 {
 		return data
 	}
@@ -481,10 +493,7 @@ func restoreBodyForMediaType(data []byte, tokenRe *regexp.Regexp, allowed map[st
 		return data
 	}
 	if isJSONMediaType(mediaType) {
-		if restored, ok := restoreJSONDoc(data, tokenRe, allowed, v); ok {
-			return restored
-		}
-		return data
+		return restoreJSONDocForFormat(data, tokenRe, tokenLabels(allowed), allowed, v, sourceFormat)
 	}
 	if strings.EqualFold(mediaType, "text/event-stream") {
 		return restoreSSE(data, tokenRe, allowed, v)
@@ -500,7 +509,7 @@ func restoreBodyForMediaType(data []byte, tokenRe *regexp.Regexp, allowed map[st
 	// <LABEL_hash> or JSON-escaped as \u003cLABEL_hash\u003e. Decoding the JSON
 	// normalizes both. restoreJSONDoc only rewrites the body when it actually
 	// restores something, so token-free responses are left byte-for-byte intact.
-	if restored, ok := restoreJSONDoc(data, tokenRe, allowed, v); ok {
+	if restored, ok := restoreJSONDocForFormatResult(data, tokenRe, tokenLabels(allowed), allowed, v, sourceFormat); ok {
 		return restored
 	}
 	if isSSEData(data) {
@@ -521,6 +530,331 @@ func restoreBodyForMediaType(data []byte, tokenRe *regexp.Regexp, allowed map[st
 func isJSONMediaType(mediaType string) bool {
 	mediaType = strings.ToLower(strings.TrimSpace(mediaType))
 	return mediaType == "application/json" || strings.HasSuffix(mediaType, "+json")
+}
+
+const (
+	jsonArgumentOutsideString uint8 = iota
+	jsonArgumentInsideString
+	jsonArgumentStateFixedBytes = 8
+)
+
+type jsonArgumentLexState struct {
+	mode          uint8
+	escaped       bool
+	unicodeDigits uint8
+	invalid       bool
+}
+
+type jsonArgumentState struct {
+	tail      string
+	tailStart jsonArgumentLexState
+	next      jsonArgumentLexState
+	disabled  bool
+}
+
+type jsonArgumentMatch struct {
+	start     int
+	end       int
+	canonical string
+}
+
+func advanceJSONArgumentLex(state jsonArgumentLexState, data string) jsonArgumentLexState {
+	for i := 0; i < len(data); i++ {
+		if state.invalid {
+			return state
+		}
+
+		c := data[i]
+		if state.mode == jsonArgumentOutsideString {
+			if c == '"' {
+				state.mode = jsonArgumentInsideString
+			} else if c < 0x20 {
+				state.invalid = true
+			}
+			continue
+		}
+
+		if state.unicodeDigits > 0 {
+			if !isLowerOrUpperHex(c) {
+				state.invalid = true
+				continue
+			}
+			state.unicodeDigits--
+			continue
+		}
+		if state.escaped {
+			state.escaped = false
+			switch c {
+			case '"', '\\', '/', 'b', 'f', 'n', 'r', 't':
+			case 'u':
+				state.unicodeDigits = 4
+			default:
+				state.invalid = true
+			}
+			continue
+		}
+
+		switch c {
+		case '"':
+			state.mode = jsonArgumentOutsideString
+		case '\\':
+			state.escaped = true
+		default:
+			if c < 0x20 {
+				state.invalid = true
+			}
+		}
+	}
+	return state
+}
+
+func isLowerOrUpperHex(c byte) bool {
+	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+}
+
+func findJSONArgumentMatches(data string, start jsonArgumentLexState, tokenRe *regexp.Regexp) []jsonArgumentMatch {
+	return findJSONArgumentMatchesWithWork(data, start, tokenRe, nil)
+}
+
+// findJSONArgumentMatchesWithWork shares the production scanner while allowing
+// tests to count byte visits and candidate validation work deterministically.
+func findJSONArgumentMatchesWithWork(data string, start jsonArgumentLexState, tokenRe *regexp.Regexp, work *int) []jsonArgumentMatch {
+	literalMatches := tokenRe.FindAllStringIndex(data, -1)
+	escapedMatches := findEscapedJSONArgumentMatches(data, tokenRe, work)
+	literalIndex := 0
+	escapedIndex := 0
+	lastEnd := 0
+	state := start
+	var matches []jsonArgumentMatch
+
+	for i := 0; i < len(data); i++ {
+		if work != nil {
+			*work++
+		}
+		for literalIndex < len(literalMatches) && literalMatches[literalIndex][0] < i {
+			literalIndex++
+		}
+		for escapedIndex < len(escapedMatches) && escapedMatches[escapedIndex].start < i {
+			escapedIndex++
+		}
+		canStart := !state.invalid && state.mode == jsonArgumentInsideString && !state.escaped && state.unicodeDigits == 0 && i >= lastEnd
+		if canStart && literalIndex < len(literalMatches) && literalMatches[literalIndex][0] == i {
+			match := literalMatches[literalIndex]
+			matches = append(matches, jsonArgumentMatch{start: match[0], end: match[1], canonical: data[match[0]:match[1]]})
+			lastEnd = match[1]
+			literalIndex++
+		} else if canStart && escapedIndex < len(escapedMatches) && escapedMatches[escapedIndex].start == i {
+			match := escapedMatches[escapedIndex]
+			matches = append(matches, match)
+			lastEnd = match.end
+			escapedIndex++
+		}
+		state = advanceJSONArgumentLex(state, data[i:i+1])
+	}
+	return matches
+}
+
+func findEscapedJSONArgumentMatches(data string, tokenRe *regexp.Regexp, work *int) []jsonArgumentMatch {
+	candidateStart := -1
+	var matches []jsonArgumentMatch
+	for i := 0; i < len(data); i++ {
+		if work != nil {
+			*work++
+		}
+		if hasEscapedJSONArgumentOpening(data[i:]) {
+			candidateStart = i
+			continue
+		}
+		if candidateStart < 0 || !hasEscapedJSONArgumentClosing(data[i:]) {
+			continue
+		}
+
+		end := i + len(`\u003e`)
+		candidate := data[candidateStart:end]
+		if work != nil {
+			// Account for canonicalization and the configured-token regexp pass.
+			*work += 2 * len(candidate)
+		}
+		canonical, ok := canonicalEscapedArgumentToken(candidate)
+		location := tokenRe.FindStringIndex(canonical)
+		if ok && location != nil && location[0] == 0 && location[1] == len(canonical) {
+			matches = append(matches, jsonArgumentMatch{start: candidateStart, end: end, canonical: canonical})
+		}
+		candidateStart = -1
+	}
+	return matches
+}
+
+func hasEscapedJSONArgumentOpening(value string) bool {
+	return strings.HasPrefix(value, `\u003c`) || strings.HasPrefix(value, `\u003C`)
+}
+
+func hasEscapedJSONArgumentClosing(value string) bool {
+	return strings.HasPrefix(value, `\u003e`) || strings.HasPrefix(value, `\u003E`)
+}
+
+func incompleteJSONArgumentTokenTail(data string, start jsonArgumentLexState, labels []string) (int, jsonArgumentLexState) {
+	states := make([]jsonArgumentLexState, len(data)+1)
+	states[0] = start
+	for i := 0; i < len(data); i++ {
+		states[i+1] = advanceJSONArgumentLex(states[i], data[i:i+1])
+	}
+
+	maxTail := 0
+	for _, label := range labels {
+		if encodedLength := tokenLength(label) + 10; encodedLength-1 > maxTail {
+			maxTail = encodedLength - 1
+		}
+	}
+	if maxTail > len(data) {
+		maxTail = len(data)
+	}
+
+	for hold := maxTail; hold > 0; hold-- {
+		position := len(data) - hold
+		state := states[position]
+		if state.invalid || state.mode != jsonArgumentInsideString || state.escaped || state.unicodeDigits != 0 {
+			continue
+		}
+		suffix := data[position:]
+		for _, label := range labels {
+			if (suffix[0] == '<' && isTokenPrefix([]byte(suffix), label)) || isEscapedJSONArgumentTokenPrefix(suffix, label) {
+				return hold, state
+			}
+		}
+	}
+	return 0, states[len(data)]
+}
+
+func isEscapedJSONArgumentTokenPrefix(value, label string) bool {
+	openLower := `\u003c`
+	openUpper := `\u003C`
+	if len(value) <= len(openLower) {
+		return strings.HasPrefix(openLower, value) || strings.HasPrefix(openUpper, value)
+	}
+	if !strings.HasPrefix(value, openLower) && !strings.HasPrefix(value, openUpper) {
+		return false
+	}
+
+	rest := value[len(openLower):]
+	labelPrefix := label + "_"
+	if len(rest) <= len(labelPrefix) {
+		return strings.HasPrefix(labelPrefix, rest)
+	}
+	if !strings.HasPrefix(rest, labelPrefix) {
+		return false
+	}
+
+	rest = rest[len(labelPrefix):]
+	if len(rest) <= tokenHexLen {
+		for i := 0; i < len(rest); i++ {
+			if rest[i] < '0' || (rest[i] > '9' && rest[i] < 'a') || rest[i] > 'f' {
+				return false
+			}
+		}
+		return true
+	}
+	for i := 0; i < tokenHexLen; i++ {
+		if rest[i] < '0' || (rest[i] > '9' && rest[i] < 'a') || rest[i] > 'f' {
+			return false
+		}
+	}
+	rest = rest[tokenHexLen:]
+	if len(rest) >= len(`\u003e`) {
+		return false
+	}
+	return strings.HasPrefix(`\u003e`, rest) || strings.HasPrefix(`\u003E`, rest)
+}
+
+func canonicalEscapedArgumentToken(candidate string) (string, bool) {
+	const delimiterLength = len(`\u003c`)
+	if len(candidate) < 2*delimiterLength+tokenHexLen+2 || !hasEscapedJSONArgumentOpening(candidate) {
+		return "", false
+	}
+	closing := candidate[len(candidate)-delimiterLength:]
+	if closing != `\u003e` && closing != `\u003E` {
+		return "", false
+	}
+	inner := candidate[delimiterLength : len(candidate)-delimiterLength]
+	underscore := len(inner) - tokenHexLen - 1
+	if underscore < 1 || inner[underscore] != '_' {
+		return "", false
+	}
+	for i := underscore + 1; i < len(inner); i++ {
+		c := inner[i]
+		if c < '0' || (c > '9' && c < 'a') || c > 'f' {
+			return "", false
+		}
+	}
+	return "<" + inner + ">", true
+}
+
+func encodeJSONStringContent(value string) string {
+	var encoded bytes.Buffer
+	enc := json.NewEncoder(&encoded)
+	enc.SetEscapeHTML(false)
+	_ = enc.Encode(value)
+	quoted := bytes.TrimSuffix(encoded.Bytes(), []byte{'\n'})
+	return string(quoted[1 : len(quoted)-1])
+}
+
+func jsonArgumentStateBytes(state jsonArgumentState) int {
+	return len(state.tail) + jsonArgumentStateFixedBytes
+}
+
+func rewriteJSONArgumentFragment(fragment string, prior jsonArgumentState, tokenRe *regexp.Regexp, labels []string, allowed map[string]struct{}, v *vault, flush bool) (string, jsonArgumentState) {
+	if prior.disabled {
+		unchanged := prior.tail + fragment
+		prior.tail = ""
+		prior.disabled = true
+		return unchanged, prior
+	}
+
+	combined := prior.tail + fragment
+	start := prior.next
+	if prior.tail != "" {
+		start = prior.tailStart
+	}
+	end := advanceJSONArgumentLex(start, combined)
+	if end.invalid {
+		return combined, jsonArgumentState{next: end, disabled: true}
+	}
+
+	hold := 0
+	tailStart := end
+	if !flush {
+		hold, tailStart = incompleteJSONArgumentTokenTail(combined, start, labels)
+	}
+	emitted := combined[:len(combined)-hold]
+	retained := strings.Clone(combined[len(emitted):])
+	matches := findJSONArgumentMatches(emitted, start, tokenRe)
+	if len(matches) == 0 {
+		return emitted, jsonArgumentState{tail: retained, tailStart: tailStart, next: end}
+	}
+
+	var restored strings.Builder
+	last := 0
+	for _, match := range matches {
+		restored.WriteString(emitted[last:match.start])
+		replacement := emitted[match.start:match.end]
+		if _, ok := allowed[match.canonical]; ok && v != nil {
+			if secret, ok := v.Get(match.canonical); ok {
+				replacement = encodeJSONStringContent(secret)
+			}
+		}
+		restored.WriteString(replacement)
+		last = match.end
+	}
+	restored.WriteString(emitted[last:])
+	return restored.String(), jsonArgumentState{tail: retained, tailStart: tailStart, next: end}
+}
+
+func restoreAtomicJSONArgument(arguments string, tokenRe *regexp.Regexp, labels []string, allowed map[string]struct{}, v *vault) (string, bool) {
+	if !json.Valid([]byte(arguments)) {
+		return arguments, false
+	}
+	restored, _ := rewriteJSONArgumentFragment(arguments, jsonArgumentState{}, tokenRe, labels, allowed, v, true)
+	return restored, restored != arguments
 }
 
 // restorer reinstates allowed tokens inside decoded JSON string leaves and
@@ -583,6 +917,95 @@ func restoreRaw(data []byte, tokenRe *regexp.Regexp, allowed map[string]struct{}
 	})
 }
 
+type jsonArgumentField struct {
+	owner map[string]any
+	field string
+	text  string
+}
+
+func responseJSONArgumentFields(doc any, sourceFormat string) []jsonArgumentField {
+	root, ok := doc.(map[string]any)
+	if !ok {
+		return nil
+	}
+	var fields []jsonArgumentField
+	switch sourceFormat {
+	case formatOpenAI:
+		rawChoices, exists := root["choices"]
+		if !exists {
+			return nil
+		}
+		choices, ok := rawChoices.([]any)
+		if !ok {
+			return nil
+		}
+		for _, rawChoice := range choices {
+			choice, ok := rawChoice.(map[string]any)
+			if !ok {
+				continue
+			}
+			rawMessage, exists := choice["message"]
+			if !exists {
+				continue
+			}
+			message, ok := rawMessage.(map[string]any)
+			if !ok {
+				continue
+			}
+			rawToolCalls, exists := message["tool_calls"]
+			if !exists {
+				continue
+			}
+			toolCalls, ok := rawToolCalls.([]any)
+			if !ok {
+				continue
+			}
+			for _, rawToolCall := range toolCalls {
+				toolCall, ok := rawToolCall.(map[string]any)
+				if !ok {
+					continue
+				}
+				rawFunction, exists := toolCall["function"]
+				if !exists {
+					continue
+				}
+				function, ok := rawFunction.(map[string]any)
+				if !ok {
+					continue
+				}
+				arguments, ok := function["arguments"].(string)
+				if ok {
+					fields = append(fields, jsonArgumentField{owner: function, field: "arguments", text: arguments})
+				}
+			}
+		}
+	case formatOpenAIResponse:
+		rawOutput, exists := root["output"]
+		if !exists {
+			return nil
+		}
+		output, ok := rawOutput.([]any)
+		if !ok {
+			return nil
+		}
+		for _, rawItem := range output {
+			item, ok := rawItem.(map[string]any)
+			if !ok {
+				continue
+			}
+			itemType, typeOK := item["type"].(string)
+			if !typeOK || itemType != "function_call" {
+				continue
+			}
+			arguments, ok := item["arguments"].(string)
+			if ok {
+				fields = append(fields, jsonArgumentField{owner: item, field: "arguments", text: arguments})
+			}
+		}
+	}
+	return fields
+}
+
 // restoreJSONDoc decodes data as a single JSON document, reinstates tokens
 // inside every string value, and re-encodes with escaping intact. Decoding
 // normalizes token spans so a token is recognized whether it was rendered
@@ -596,30 +1019,54 @@ func restoreRaw(data []byte, tokenRe *regexp.Regexp, allowed map[string]struct{}
 // insignificant whitespace is dropped). The result is semantically equivalent
 // but not byte-identical to the upstream bytes.
 func restoreJSONDoc(data []byte, tokenRe *regexp.Regexp, allowed map[string]struct{}, v *vault) ([]byte, bool) {
+	restored := restoreJSONDocForFormat(data, tokenRe, tokenLabels(allowed), allowed, v, "")
+	if _, ok := decodeOneJSON(data); !ok {
+		return nil, false
+	}
+	return restored, true
+}
+
+func restoreJSONDocForFormat(data []byte, tokenRe *regexp.Regexp, labels []string, allowed map[string]struct{}, v *vault, sourceFormat string) []byte {
+	restored, _ := restoreJSONDocForFormatResult(data, tokenRe, labels, allowed, v, sourceFormat)
+	return restored
+}
+
+func restoreJSONDocForFormatResult(data []byte, tokenRe *regexp.Regexp, labels []string, allowed map[string]struct{}, v *vault, sourceFormat string) ([]byte, bool) {
 	trimmed := bytes.TrimSpace(data)
 	if len(trimmed) == 0 {
-		return nil, false
+		return data, false
 	}
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.UseNumber()
 	var doc any
 	if err := dec.Decode(&doc); err != nil {
-		return nil, false
+		return data, false
 	}
 	var trailing any
 	if err := dec.Decode(&trailing); err != io.EOF {
-		return nil, false
+		return data, false
+	}
+	argumentFields := responseJSONArgumentFields(doc, sourceFormat)
+	for _, field := range argumentFields {
+		delete(field.owner, field.field)
 	}
 	r := &restorer{tokenRe: tokenRe, allowed: allowed, v: v}
 	walked := r.walk(doc)
-	if !r.changed {
+	argumentChanged := false
+	for _, field := range argumentFields {
+		field.owner[field.field] = field.text
+		restored, changed := restoreAtomicJSONArgument(field.text, tokenRe, labels, allowed, v)
+		field.owner[field.field] = restored
+		argumentChanged = argumentChanged || changed
+	}
+	if !r.changed && !argumentChanged {
 		return data, true
 	}
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
 	enc.SetEscapeHTML(false)
 	if err := enc.Encode(walked); err != nil {
-		return nil, false
+		return data, false
 	}
 	return bytes.TrimRight(buf.Bytes(), "\n"), true
 }
@@ -676,7 +1123,7 @@ func restoreSSE(data []byte, tokenRe *regexp.Regexp, allowed map[string]struct{}
 			// Decode JSON frames first so escaped tokens (\u003c..\u003e) are
 			// recognized; fall back to byte-level replacement for non-JSON frames.
 			var restored []byte
-			if r, ok := restoreJSONDoc(payload, tokenRe, allowed, v); ok {
+			if r, ok := restoreJSONDocForFormatResult(payload, tokenRe, tokenLabels(allowed), allowed, v, ""); ok {
 				restored = r
 			} else if !looksLikeJSON(payload) && tokenRe.Find(payload) != nil {
 				restored = restoreRaw(payload, tokenRe, allowed, v)
@@ -863,6 +1310,9 @@ func isTokenPrefix(tail []byte, label string) bool {
 	if len(s) <= len(full) {
 		return strings.HasPrefix(full, s)
 	}
+	if !strings.HasPrefix(s, full) {
+		return false
+	}
 	rest := s[len(full):]
 	if len(rest) > tokenHexLen {
 		return false
@@ -988,5 +1438,5 @@ func detokenizeStreamChunkForMediaType(key string, chunk []byte, tokenRe *regexp
 	if restored, handled := restoreSemanticStream(key, buf, tokenRe, labels, allowed, v, mediaType, sourceFormat); handled {
 		return restored, false
 	}
-	return restoreBodyForMediaType(buf, tokenRe, allowed, v, mediaType), false
+	return restoreBodyForMediaType(buf, tokenRe, allowed, v, mediaType, sourceFormat), false
 }
