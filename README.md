@@ -49,7 +49,7 @@ flowchart LR
 
 The host loads the shared library and drives it over a small C ABI (`cliproxy_plugin_init` / `call` / `free_buffer` / `shutdown`). Every call carries a method name and a JSON request and returns a JSON envelope (`{ok, result, error}`). The methods the plugin implements are:
 
-Protocol compatibility uses two independent version numbers. The native C ABI remains `pluginabi.ABIVersion == 1`. Lifecycle JSON RPC requests require `schema_version >= 2`; a missing version or V1 is rejected before configuration parsing or runtime mutation. The plugin always advertises its implemented `pluginabi.SchemaVersionV2` contract, including when a later host schema version is received. Accepting that later lifecycle version does not claim support for unknown future schema features.
+Protocol compatibility uses two independent version numbers. The native C ABI remains `pluginabi.ABIVersion == 1`. Lifecycle JSON RPC requests require `schema_version >= 3`; a missing version, V1, or V2 is rejected before configuration parsing or runtime mutation. Schema 3 is required for stateful stream-session negotiation and lifecycle callbacks. The plugin always advertises its implemented schema 3 contract, including when a later host schema version is received. Accepting that later lifecycle version does not claim support for unknown future schema features.
 
 - `plugin.register` / `plugin.reconfigure` — parse and validate the config, compile the active rule set, reconfigure the shared vault in place, and publish mode, rules, label, patterns, and vault together as one atomic runtime snapshot. Sharing the vault preserves in-flight mappings and late writes from handlers using an older snapshot.
 - `request.intercept_before` / `request.intercept_after` — redact the outbound request body.
@@ -62,7 +62,7 @@ Protocol compatibility uses two independent version numbers. The native C ABI re
 ```mermaid
 flowchart TB
     start([Outbound request body]) --> snap{Runtime snapshot<br/>loaded?}
-    snap -->|not configured / panic| reject[Return Reject<br/>fail-closed]
+    snap -->|not configured / panic| reject[Terminate with JSON 403<br/>fail-closed]
     snap -->|yes| classify{Classify<br/>source format}
     classify -->|image / video| parsePrompt[Parse top-level prompt]
     parsePrompt --> scan
@@ -84,7 +84,7 @@ flowchart TB
 ```
 
 1. The host hands the plugin the outbound request body along with its source format (the inbound client format, e.g. `openai`, `claude`, `gemini`).
-2. The plugin loads the current runtime snapshot (rules + label + vault). If the plugin is not configured yet or panics, it returns `Reject` — the request is refused rather than forwarded unscanned. This is the fail-closed guarantee.
+2. The plugin loads the current runtime snapshot (rules + label + vault). If the plugin is not configured yet or panics, it returns `Terminate` with an HTTP 403 JSON error response — the request is refused rather than forwarded unscanned. This is the fail-closed guarantee.
 3. It classifies the source format:
    - **Recognized conversational formats** (`openai`, `openai-response`, `claude`, `gemini`) have their content regions scanned.
    - **Image and video formats** (`openai-image`, `openai-video`) have only their top-level text prompt scanned; media and generation parameters remain outside the scanner.
@@ -239,7 +239,7 @@ Builtin rules are defined in [`builtin_rules.json`](./builtin_rules.json) and em
 The plugin dispatches on the request's source format and only ever applies rules inside content regions:
 
 - **Scanned** — `openai` (message content, refusal/reasoning text, and legacy/current function or custom-tool runtime input), `openai-response` (recognized message/instructions, computer typing, shell, patch, MCP, program, code-interpreter, search, and runtime tool data), `claude` (recognized text/document/system blocks and runtime/server-tool results), `gemini` (known content-part text/code, legacy/current function/tool call and response data, and system instruction), `openai-image` and `openai-video` (top-level prompt only). In `filter` mode matches are redacted; in `block` mode the first match rejects the request and stops further rule scanning. Provider-specific visitors leave tool schemas, model names, URLs, Base64/file data, MIME/discriminator metadata, encrypted content, Gemini `inlineData.data`, and sampling parameters outside the scanner.
-- **Rejected (fail-closed)** — any unsupported source format, any body that is not exactly one JSON object, malformed required content, and unsupported members or types inside explicitly validated runtime content objects. The host turns the rejection into an HTTP 403. The plugin does not validate every top-level protocol field or every member of an opaque nested object.
+- **Rejected (fail-closed)** — any unsupported source format, any body that is not exactly one JSON object, malformed required content, and unsupported members or types inside explicitly validated runtime content objects. The plugin terminates the request through the host with an HTTP 403 JSON error response. The plugin does not validate every top-level protocol field or every member of an opaque nested object.
 
 ### Builtin field rules (all default-on)
 

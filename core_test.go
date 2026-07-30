@@ -12,6 +12,15 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
+func TestPluginSchemaVersionIsStatefulStreamContract(t *testing.T) {
+	if pluginSchemaVersion != 3 {
+		t.Fatalf("plugin schema version = %d, want 3", pluginSchemaVersion)
+	}
+	if pluginabi.SchemaVersion < pluginSchemaVersion {
+		t.Fatalf("host SDK schema version = %d, below plugin requirement %d", pluginabi.SchemaVersion, pluginSchemaVersion)
+	}
+}
+
 // callRegister invokes handleMethod for a lifecycle method with the given YAML config.
 func callRegister(t *testing.T, method, yamlText string) registration {
 	t.Helper()
@@ -36,8 +45,8 @@ func callRegister(t *testing.T, method, yamlText string) registration {
 
 func TestRegisterReturnsCapabilitiesAndMetadata(t *testing.T) {
 	reg := callRegister(t, pluginabi.MethodPluginRegister, "")
-	if reg.SchemaVersion != pluginabi.SchemaVersionV2 {
-		t.Fatalf("schema version = %d, want %d", reg.SchemaVersion, pluginabi.SchemaVersionV2)
+	if reg.SchemaVersion != pluginSchemaVersion {
+		t.Fatalf("schema version = %d, want %d", reg.SchemaVersion, pluginSchemaVersion)
 	}
 	if !reg.Capabilities.RequestInterceptor || !reg.Capabilities.ResponseInterceptor || !reg.Capabilities.StreamChunkInterceptor || !reg.Capabilities.StreamChunkInterceptorStateful {
 		t.Fatalf("expected all interceptor capabilities true, got %+v", reg.Capabilities)
@@ -48,8 +57,8 @@ func TestRegisterReturnsCapabilitiesAndMetadata(t *testing.T) {
 	if len(reg.Metadata.ConfigFields) == 0 {
 		t.Fatalf("expected config fields declared")
 	}
-	if reg.Metadata.Version != "0.0.2" {
-		t.Fatalf("metadata version = %q, want 0.0.2", reg.Metadata.Version)
+	if reg.Metadata.Version != "0.0.3" {
+		t.Fatalf("metadata version = %q, want 0.0.3", reg.Metadata.Version)
 	}
 }
 
@@ -59,7 +68,7 @@ func TestLifecycleRejectsUnsupportedSchemaBeforeConfigParsing(t *testing.T) {
 	token := makeToken("STABLE", "in-flight")
 	before.vault.Put(token, "in-flight")
 
-	for _, schemaVersion := range []uint32{0, pluginabi.SchemaVersionV1} {
+	for _, schemaVersion := range []uint32{0, pluginSchemaVersion - 1} {
 		t.Run(fmt.Sprintf("schema_%d", schemaVersion), func(t *testing.T) {
 			raw, err := handleMethod(
 				pluginabi.MethodPluginReconfigure,
@@ -76,7 +85,7 @@ func TestLifecycleRejectsUnsupportedSchemaBeforeConfigParsing(t *testing.T) {
 				t.Fatalf("expected unsupported_schema_version envelope, got %+v", env)
 			}
 			if !strings.Contains(env.Error.Message, fmt.Sprint(schemaVersion)) ||
-				!strings.Contains(env.Error.Message, fmt.Sprint(pluginabi.SchemaVersionV2)) {
+				!strings.Contains(env.Error.Message, fmt.Sprint(pluginSchemaVersion)) {
 				t.Fatalf("schema error lacks received/minimum versions: %q", env.Error.Message)
 			}
 			if activeSnapshot() != before {
@@ -89,10 +98,10 @@ func TestLifecycleRejectsUnsupportedSchemaBeforeConfigParsing(t *testing.T) {
 	}
 }
 
-func TestLifecycleAcceptsFutureSchemaAndAdvertisesV2(t *testing.T) {
+func TestLifecycleAcceptsFutureSchemaAndAdvertisesV3(t *testing.T) {
 	raw, err := handleMethod(
 		pluginabi.MethodPluginReconfigure,
-		lifecycleRequestForSchema(t, "token_label: FUTURE\n", pluginabi.SchemaVersionV2+7),
+		lifecycleRequestForSchema(t, "token_label: FUTURE\n", pluginSchemaVersion+7),
 	)
 	if err != nil {
 		t.Fatalf("handleMethod returned Go error: %v", err)
@@ -108,8 +117,8 @@ func TestLifecycleAcceptsFutureSchemaAndAdvertisesV2(t *testing.T) {
 	if err := json.Unmarshal(env.Result, &reg); err != nil {
 		t.Fatalf("unmarshal registration: %v", err)
 	}
-	if reg.SchemaVersion != pluginabi.SchemaVersionV2 {
-		t.Fatalf("schema version = %d, want implemented V2", reg.SchemaVersion)
+	if reg.SchemaVersion != pluginSchemaVersion {
+		t.Fatalf("schema version = %d, want implemented V3", reg.SchemaVersion)
 	}
 	if _, label := activeRuleSet(); label != "FUTURE" {
 		t.Fatalf("future host config was not applied: label=%q", label)
@@ -400,7 +409,7 @@ func TestReconfigureBetweenRequestStagesDoesNotDoubleTokenize(t *testing.T) {
 	}
 }
 
-func invokeRequestIntercept(t *testing.T, method, format string, body []byte) pluginapi.RequestInterceptResponse {
+func invokeRequestIntercept(t *testing.T, method, format string, body []byte) requestInterceptResult {
 	t.Helper()
 	req, _ := json.Marshal(pluginapi.RequestInterceptRequest{SourceFormat: format, Body: body})
 	raw, err := handleMethod(method, req)
@@ -415,7 +424,7 @@ func invokeRequestIntercept(t *testing.T, method, format string, body []byte) pl
 	if err := json.Unmarshal(env.Result, &response); err != nil {
 		t.Fatalf("unmarshal request response: %v", err)
 	}
-	return response
+	return requestResult(t, response)
 }
 
 type scanLogCapture struct {
@@ -479,6 +488,108 @@ func TestLogScanMatchesAggregatesAndBoundsPaths(t *testing.T) {
 	}
 	if strings.Contains(fmt.Sprint(entries), "plaintext-marker") {
 		t.Fatalf("logs retained scan context: %#v", entries)
+	}
+}
+
+func TestRequestScanErrorLogsUnsupportedContent(t *testing.T) {
+	callRegister(t, pluginabi.MethodPluginRegister, "")
+	logger := logrus.StandardLogger()
+	previousOutput := logger.Out
+	previousHooks := logger.ReplaceHooks(make(logrus.LevelHooks))
+	hook := &scanLogCapture{}
+	logger.AddHook(hook)
+	logger.SetOutput(io.Discard)
+	t.Cleanup(func() {
+		logger.SetOutput(previousOutput)
+		logger.ReplaceHooks(previousHooks)
+	})
+
+	resp := invokeRequestIntercept(t, pluginabi.MethodRequestInterceptBefore, formatOpenAIResponse,
+		[]byte(`{"input":[{"type":"future_block","payload":"PLAINTEXT-MUST-NOT-BE-LOGGED"}]}`))
+	if !resp.Reject {
+		t.Fatal("unsupported Responses input was not rejected")
+	}
+	if len(hook.entries) != 1 {
+		t.Fatalf("warning log entries = %d, want 1: %#v", len(hook.entries), hook.entries)
+	}
+	entry := hook.entries[0]
+	if entry["unsupported_content"] != "future_block" {
+		t.Fatalf("unsupported_content = %#v, want future_block", entry["unsupported_content"])
+	}
+	if strings.Contains(fmt.Sprint(entry), "PLAINTEXT-MUST-NOT-BE-LOGGED") {
+		t.Fatalf("unsupported payload leaked into logs: %#v", entry)
+	}
+}
+
+func TestRequestScanErrorBoundsUnsupportedContentLog(t *testing.T) {
+	callRegister(t, pluginabi.MethodPluginRegister, "")
+	logger := logrus.StandardLogger()
+	previousOutput := logger.Out
+	previousHooks := logger.ReplaceHooks(make(logrus.LevelHooks))
+	hook := &scanLogCapture{}
+	logger.AddHook(hook)
+	logger.SetOutput(io.Discard)
+	t.Cleanup(func() {
+		logger.SetOutput(previousOutput)
+		logger.ReplaceHooks(previousHooks)
+	})
+
+	unsupportedType := "\n" + strings.Repeat("APIKEY-", unsupportedContentLogMaxRunes)
+	body, err := json.Marshal(map[string]any{
+		"input": []any{map[string]any{"type": unsupportedType}},
+	})
+	if err != nil {
+		t.Fatalf("marshal body: %v", err)
+	}
+	resp := invokeRequestIntercept(t, pluginabi.MethodRequestInterceptBefore, formatOpenAIResponse, body)
+	if !resp.Reject {
+		t.Fatal("unsupported Responses input was not rejected")
+	}
+	if len(hook.entries) != 1 {
+		t.Fatalf("warning log entries = %d, want 1: %#v", len(hook.entries), hook.entries)
+	}
+	logged, ok := hook.entries[0]["unsupported_content"].(string)
+	if !ok {
+		t.Fatalf("unsupported_content = %#v, want string", hook.entries[0]["unsupported_content"])
+	}
+	if len([]rune(logged)) > unsupportedContentLogMaxRunes {
+		t.Fatalf("unsupported_content log value is unbounded: %d runes", len([]rune(logged)))
+	}
+	if logged == unsupportedType {
+		t.Fatal("unsupported_content log value was not bounded")
+	}
+	if strings.ContainsAny(logged, "\r\n") {
+		t.Fatalf("unsupported_content log value contains a line break: %q", logged)
+	}
+}
+
+func TestRequestScanErrorLogsEmptyUnsupportedContent(t *testing.T) {
+	callRegister(t, pluginabi.MethodPluginRegister, "")
+	logger := logrus.StandardLogger()
+	previousOutput := logger.Out
+	previousHooks := logger.ReplaceHooks(make(logrus.LevelHooks))
+	hook := &scanLogCapture{}
+	logger.AddHook(hook)
+	logger.SetOutput(io.Discard)
+	t.Cleanup(func() {
+		logger.SetOutput(previousOutput)
+		logger.ReplaceHooks(previousHooks)
+	})
+
+	resp := invokeRequestIntercept(t, pluginabi.MethodRequestInterceptBefore, formatOpenAIResponse,
+		[]byte(`{"input":[{"type":"message","role":"user","content":[],"":1}]}`))
+	if !resp.Reject {
+		t.Fatal("request with an empty unsupported member was accepted")
+	}
+	if len(hook.entries) != 1 {
+		t.Fatalf("warning log entries = %d, want 1: %#v", len(hook.entries), hook.entries)
+	}
+	logged, exists := hook.entries[0]["unsupported_content"]
+	if !exists {
+		t.Fatalf("unsupported_content field is missing: %#v", hook.entries[0])
+	}
+	if logged != "" {
+		t.Fatalf("unsupported_content = %#v, want empty string", logged)
 	}
 }
 

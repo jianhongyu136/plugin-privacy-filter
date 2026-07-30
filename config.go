@@ -11,7 +11,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 	"gopkg.in/yaml.v3"
 )
@@ -39,6 +38,9 @@ type lifecycleRequestPayload struct {
 	SchemaVersion uint32 `json:"schema_version"`
 }
 
+// Schema 3 provides the stateful stream session lifecycle required by this plugin.
+const pluginSchemaVersion uint32 = 3
+
 type unsupportedSchemaVersionError struct {
 	received uint32
 }
@@ -47,7 +49,7 @@ func (e *unsupportedSchemaVersionError) Error() string {
 	return fmt.Sprintf(
 		"unsupported schema version %d; minimum supported version is %d",
 		e.received,
-		pluginabi.SchemaVersionV2,
+		pluginSchemaVersion,
 	)
 }
 
@@ -97,7 +99,7 @@ func parseLifecycleConfig(request []byte) (pluginConfig, error) {
 	if err := json.Unmarshal(request, &payload); err != nil {
 		return pluginConfig{}, err
 	}
-	if payload.SchemaVersion < pluginabi.SchemaVersionV2 {
+	if payload.SchemaVersion < pluginSchemaVersion {
 		return pluginConfig{}, &unsupportedSchemaVersionError{received: payload.SchemaVersion}
 	}
 	cfg := defaultConfig()

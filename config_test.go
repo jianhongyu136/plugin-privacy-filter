@@ -7,12 +7,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
 func lifecycleRequest(t *testing.T, yamlText string) []byte {
-	return lifecycleRequestForSchema(t, yamlText, pluginabi.SchemaVersionV2)
+	return lifecycleRequestForSchema(t, yamlText, pluginSchemaVersion)
 }
 
 func lifecycleRequestForSchema(t *testing.T, yamlText string, schemaVersion uint32) []byte {

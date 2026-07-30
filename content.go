@@ -169,8 +169,10 @@ func scanImageVideoContent(s *scanner, doc map[string]any) *contentScanError {
 // deliberately sanitized so it can be returned and logged without including
 // any part of the argument value.
 type contentScanError struct {
-	Path   string
-	Detail string
+	Path                  string
+	Detail                string
+	UnsupportedContent    string
+	HasUnsupportedContent bool
 }
 
 // scanContentValue scans one content region. A plain string is scanned with the
@@ -377,7 +379,7 @@ func scanOpenAIToolCallArguments(s *scanner, msg map[string]any, messagePath str
 			continue
 		}
 		if kind != "function" {
-			return &contentScanError{Path: toolCallPath + ".type", Detail: "unsupported tool call type"}
+			return &contentScanError{Path: toolCallPath + ".type", Detail: "unsupported tool call type", UnsupportedContent: kind, HasUnsupportedContent: true}
 		}
 		if err := validateAllowedKeys(toolCall, toolCallPath, "id", "index", "type", "function"); err != nil {
 			return err
@@ -473,7 +475,7 @@ func validateAllowedKeys(object map[string]any, path string, keys ...string) *co
 	}
 	for key := range object {
 		if _, ok := allowed[key]; !ok {
-			return &contentScanError{Path: path, Detail: "unsupported object member"}
+			return &contentScanError{Path: path, Detail: "unsupported object member", UnsupportedContent: key, HasUnsupportedContent: true}
 		}
 	}
 	return nil
@@ -622,8 +624,8 @@ func contentBlockType(block map[string]any, path string) (string, *contentScanEr
 	return kind, nil
 }
 
-func unknownContentBlock(path, _ string) *contentScanError {
-	return &contentScanError{Path: path + ".type", Detail: "unsupported content block type"}
+func unknownContentBlock(path, kind string) *contentScanError {
+	return &contentScanError{Path: path + ".type", Detail: "unsupported content block type", UnsupportedContent: kind, HasUnsupportedContent: true}
 }
 
 func scanStringMember(s *scanner, object map[string]any, key, path string, required bool) *contentScanError {
@@ -894,7 +896,15 @@ func scanResponsesInput(s *scanner, value any, path string) (any, *contentScanEr
 				return nil, &contentScanError{Path: itemPath + ".arguments", Detail: "arguments is required"}
 			}
 			item["arguments"] = s.scanContentValue(rawArguments, itemPath+".arguments")
-		case "tool_search_output", "additional_tools":
+		case "tool_search_output":
+			// Tool definitions and their schemas are configuration, not runtime text.
+		case "additional_tools":
+			if rawRole, exists := item["role"]; exists {
+				role, ok := rawRole.(string)
+				if !ok || strings.TrimSpace(role) == "" {
+					return nil, &contentScanError{Path: itemPath + ".role", Detail: "role must be a non-empty string"}
+				}
+			}
 			// Tool definitions and their schemas are configuration, not runtime text.
 		case "input_image", "input_file":
 			if err := validatePromptCacheBreakpoint(item, itemPath); err != nil {
@@ -965,8 +975,10 @@ func validateResponsesItemKeys(item map[string]any, path, kind string) *contentS
 		keys = []string{"type", "id", "queries", "results", "status"}
 	case "tool_search_call":
 		keys = []string{"type", "id", "arguments", "status"}
-	case "tool_search_output", "additional_tools":
+	case "tool_search_output":
 		keys = []string{"type", "id", "tools", "status"}
+	case "additional_tools":
+		keys = []string{"type", "id", "role", "tools", "status"}
 	case "input_image":
 		keys = []string{"type", "detail", "file_id", "image_url", "prompt_cache_breakpoint"}
 	case "input_file":
@@ -1698,7 +1710,7 @@ func scanClaudeToolResultContent(s *scanner, value any, path string) (any, *cont
 		case "image", "pdf":
 			// Binary/media content remains opaque.
 		default:
-			return nil, &contentScanError{Path: path + ".file_type", Detail: "unsupported file_type"}
+			return nil, &contentScanError{Path: path + ".file_type", Detail: "unsupported file_type", UnsupportedContent: fileType, HasUnsupportedContent: true}
 		}
 	case "text_editor_code_execution_str_replace_result":
 		if err := scanOptionalStringArrayMember(s, result, "lines", path); err != nil {
@@ -1979,7 +1991,7 @@ func scanGeminiParts(s *scanner, content map[string]any, contentPath string) *co
 		}
 		for key := range part {
 			if _, allowed := allowedKeys[key]; !allowed {
-				return &contentScanError{Path: partPath, Detail: "unsupported part field"}
+				return &contentScanError{Path: partPath, Detail: "unsupported part field", UnsupportedContent: key, HasUnsupportedContent: true}
 			}
 		}
 		contentFields := 0

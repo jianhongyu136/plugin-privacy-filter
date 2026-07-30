@@ -13,7 +13,7 @@ import (
 
 // requestIntercept runs handleRequestIntercept for the given source format and
 // body and returns the decoded response.
-func requestIntercept(t *testing.T, sourceFormat string, body []byte) pluginapi.RequestInterceptResponse {
+func requestIntercept(t *testing.T, sourceFormat string, body []byte) requestInterceptResult {
 	t.Helper()
 	req, _ := json.Marshal(pluginapi.RequestInterceptRequest{
 		SourceFormat: sourceFormat,
@@ -34,7 +34,7 @@ func requestIntercept(t *testing.T, sourceFormat string, body []byte) pluginapi.
 	if err := json.Unmarshal(env.Result, &resp); err != nil {
 		t.Fatalf("unmarshal response: %v", err)
 	}
-	return resp
+	return requestResult(t, resp)
 }
 
 func TestOpenAIContentRedacted(t *testing.T) {
@@ -815,6 +815,45 @@ func TestResponsesCurrentRuntimeItemsRedacted(t *testing.T) {
 	}
 	if !strings.Contains(string(resp.Body), "OPAQUESECRET") {
 		t.Fatalf("opaque Responses metadata was unexpectedly modified: %s", resp.Body)
+	}
+}
+
+func TestResponsesAdditionalToolsRoleAccepted(t *testing.T) {
+	callRegister(t, pluginabi.MethodPluginRegister, "builtin_rules_enabled: false\ncustom_value_rules:\n  - name: marker\n    regex: '(TEXTSECRET|TOOLSCHEMASECRET)'\n")
+	body := []byte(`{"input":[{"type":"additional_tools","role":"developer","tools":[{"type":"custom","name":"exec","description":"TOOLSCHEMASECRET"}]},{"type":"message","role":"user","content":[{"type":"input_text","text":"TEXTSECRET"}]}]}`)
+
+	resp := requestIntercept(t, formatOpenAIResponse, body)
+	if resp.Reject || len(resp.Body) == 0 {
+		t.Fatalf("additional_tools with role rejected or unchanged: reject=%v reason=%q", resp.Reject, resp.RejectReason)
+	}
+	if strings.Contains(string(resp.Body), "TEXTSECRET") {
+		t.Fatalf("message text was not redacted: %s", resp.Body)
+	}
+	if !strings.Contains(string(resp.Body), `"role":"developer"`) || !strings.Contains(string(resp.Body), "TOOLSCHEMASECRET") {
+		t.Fatalf("additional_tools metadata was modified: %s", resp.Body)
+	}
+}
+
+func TestResponsesAdditionalToolsRoleMustBeString(t *testing.T) {
+	callRegister(t, pluginabi.MethodPluginRegister, "")
+	for _, role := range []string{`{"secret":"MUST-NOT-PASS"}`, "null", `""`, `"   "`} {
+		body := []byte(`{"input":[{"type":"additional_tools","role":` + role + `,"tools":[]}]}`)
+		resp := requestIntercept(t, formatOpenAIResponse, body)
+		if !resp.Reject {
+			t.Fatalf("additional_tools with invalid role %s was accepted", role)
+		}
+		if strings.Contains(resp.RejectReason, "MUST-NOT-PASS") {
+			t.Fatalf("reject reason leaked role content: %q", resp.RejectReason)
+		}
+	}
+}
+
+func TestResponsesToolSearchOutputDoesNotAcceptAdditionalToolsRole(t *testing.T) {
+	callRegister(t, pluginabi.MethodPluginRegister, "")
+	body := []byte(`{"input":[{"type":"tool_search_output","role":"developer","tools":[]}]}`)
+
+	if resp := requestIntercept(t, formatOpenAIResponse, body); !resp.Reject {
+		t.Fatal("tool_search_output with additional_tools-only role was accepted")
 	}
 }
 

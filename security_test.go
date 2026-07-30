@@ -3583,10 +3583,11 @@ func TestRequestInterceptMalformedRejects(t *testing.T) {
 	if !env.OK {
 		t.Fatalf("expected ok envelope carrying a Reject response, got %+v", env.Error)
 	}
-	var resp pluginapi.RequestInterceptResponse
-	if err := json.Unmarshal(env.Result, &resp); err != nil {
+	var wireResponse pluginapi.RequestInterceptResponse
+	if err := json.Unmarshal(env.Result, &wireResponse); err != nil {
 		t.Fatalf("unmarshal response: %v", err)
 	}
+	resp := requestResult(t, wireResponse)
 	if !resp.Reject {
 		t.Fatalf("malformed request must be rejected (fail closed), got %+v", resp)
 	}

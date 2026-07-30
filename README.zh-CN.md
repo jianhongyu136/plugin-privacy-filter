@@ -49,7 +49,7 @@ flowchart LR
 
 宿主加载共享库，并通过一套精简的 C ABI（`cliproxy_plugin_init` / `call` / `free_buffer` / `shutdown`）驱动它。每次调用都携带一个方法名和一段 JSON 请求，返回一个 JSON 信封（`{ok, result, error}`）。插件实现的方法有：
 
-协议兼容性使用两个彼此独立的版本号。原生 C ABI 仍为 `pluginabi.ABIVersion == 1`。生命周期 JSON RPC 请求要求 `schema_version >= 2`；缺失版本或 V1 会在解析配置和修改运行时状态之前被拒绝。即使收到更高的宿主 schema 版本，插件也始终只声明自身实际实现的 `pluginabi.SchemaVersionV2` 契约。接受更高的生命周期版本并不表示插件支持未知的未来 schema 功能。
+协议兼容性使用两个彼此独立的版本号。原生 C ABI 仍为 `pluginabi.ABIVersion == 1`。生命周期 JSON RPC 请求要求 `schema_version >= 3`；缺失版本、V1 或 V2 会在解析配置和修改运行时状态之前被拒绝。Schema 3 提供插件依赖的有状态流会话协商和生命周期回调。即使收到更高的宿主 schema 版本，插件也始终只声明自身实际实现的 schema 3 契约。接受更高的生命周期版本并不表示插件支持未知的未来 schema 功能。
 
 - `plugin.register` / `plugin.reconfigure` —— 解析并校验配置、编译当前规则集、原地重配置共享 vault，并把工作模式、规则、标签、匹配模式和 vault 作为一个原子的运行时快照一起发布。共享 vault 会保留在途映射及仍持有旧快照的处理器产生的延迟写入。
 - `request.intercept_before` / `request.intercept_after` —— 脱敏出站请求体。
@@ -62,7 +62,7 @@ flowchart LR
 ```mermaid
 flowchart TB
     start([出站请求体]) --> snap{运行时快照<br/>已加载？}
-    snap -->|未配置 / panic| reject[返回 Reject<br/>失败即拒绝]
+    snap -->|未配置 / panic| reject[通过 Terminate 返回 JSON 403<br/>失败即拒绝]
     snap -->|是| classify{判定<br/>源格式}
     classify -->|图像 / 视频| parsePrompt[解析顶层 prompt]
     parsePrompt --> scan
@@ -84,7 +84,7 @@ flowchart TB
 ```
 
 1. 宿主把出站请求体连同其源格式（入站客户端格式，如 `openai`、`claude`、`gemini`）一起交给插件。
-2. 插件加载当前运行时快照（规则 + 标签 + vault）。如果插件尚未配置或发生 panic，它会返回 `Reject` —— 请求被拒绝，而非未经扫描就转发。这就是失败即拒绝（fail-closed）的保证。
+2. 插件加载当前运行时快照（规则 + 标签 + vault）。如果插件尚未配置或发生 panic，它会返回 `Terminate` 和 HTTP 403 JSON 错误响应，请求因此被拒绝，而非未经扫描就转发。这就是失败即拒绝（fail-closed）的保证。
 3. 插件判定源格式：
    - **已识别的对话格式**（`openai`、`openai-response`、`claude`、`gemini`）会扫描其内容区域。
    - **图像与视频格式**（`openai-image`、`openai-video`）只扫描顶层文本 prompt；媒体数据和生成参数不进入扫描器。
@@ -239,7 +239,7 @@ plugins:
 插件根据请求的源格式分派，且只在内容区域内应用规则：
 
 - **扫描** —— `openai`（消息内容、拒绝/推理文本，以及新旧函数或 custom tool 的运行时输入）、`openai-response`（已识别消息/instructions、电脑输入、shell、补丁、MCP、程序、代码解释器、搜索和运行时工具数据）、`claude`（已识别文本/文档/system 块与运行时/服务端工具结果）、`gemini`（已知 content part 文本/代码、新旧函数/工具调用与响应数据，以及 system instruction）、`openai-image` 与 `openai-video`（仅顶层 prompt）。`filter` 模式对命中内容脱敏；`block` 模式在首个命中时拒绝请求并停止后续规则扫描。各服务商专用访问器不会把工具 schema、模型名、URL、Base64/文件数据、MIME/类型元数据、加密内容、Gemini `inlineData.data` 和采样参数送入扫描器。
-- **拒绝（失败即拒绝）** —— 不支持的源格式、不是严格单一 JSON 对象的请求体、格式错误的必需内容，以及明确校验的运行时内容对象中不支持的成员或类型。宿主会把拒绝转化为 HTTP 403。插件不会校验所有顶层协议字段，也不会校验每个不透明嵌套对象的所有成员。
+- **拒绝（失败即拒绝）** —— 不支持的源格式、不是严格单一 JSON 对象的请求体、格式错误的必需内容，以及明确校验的运行时内容对象中不支持的成员或类型。插件通过宿主终止请求并返回 HTTP 403 JSON 错误响应。插件不会校验所有顶层协议字段，也不会校验每个不透明嵌套对象的所有成员。
 
 ### 内置字段规则（默认全部开启）
 
