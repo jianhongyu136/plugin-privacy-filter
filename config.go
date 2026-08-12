@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 	"gopkg.in/yaml.v3"
 )
@@ -38,8 +39,8 @@ type lifecycleRequestPayload struct {
 	SchemaVersion uint32 `json:"schema_version"`
 }
 
-// Schema 3 provides the stateful stream session lifecycle required by this plugin.
-const pluginSchemaVersion uint32 = 3
+// Schema 4 provides the stateful stream session lifecycle required by this plugin.
+const pluginSchemaVersion uint32 = pluginabi.SchemaVersionStatefulStreamInterceptor
 
 type unsupportedSchemaVersionError struct {
 	received uint32

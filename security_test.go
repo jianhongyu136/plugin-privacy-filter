@@ -397,11 +397,13 @@ func TestSSEPrefixCarryRequiresEventStreamContentType(t *testing.T) {
 	token := makeToken(st.label, secret)
 	st.vault.Put(token, secret)
 	requestBody := []byte(`{"message":"` + token + `"}`)
+	streamID := streamKey(requestBody)
+	initStreamWithID(t, formatOpenAIResponse, streamID, requestBody)
 
 	invoke := func(index int, body []byte, contentType string) pluginapi.StreamChunkInterceptResponse {
 		t.Helper()
 		req, _ := json.Marshal(pluginapi.StreamChunkInterceptRequest{
-			RequestBody:     requestBody,
+			StreamID:        streamID,
 			Body:            body,
 			ChunkIndex:      index,
 			ResponseHeaders: http.Header{"Content-Type": []string{contentType}},
@@ -427,6 +429,7 @@ func TestSSEPrefixCarryRequiresEventStreamContentType(t *testing.T) {
 	}
 
 	resetStreamCarry(requestBody)
+	initStreamWithID(t, formatOpenAIResponse, streamID, requestBody)
 	first := invoke(0, []byte("da"), "text/event-stream; charset=utf-8")
 	if !first.DropChunk {
 		t.Fatalf("SSE data prefix was not withheld: %+v", first)
@@ -465,10 +468,12 @@ func TestStreamRestorationToEmptyDropsChunk(t *testing.T) {
 	token := makeToken(st.label, "")
 	st.vault.Put(token, "")
 	requestBody := []byte(`{"message":"` + token + `"}`)
+	streamID := streamKey(requestBody)
+	initStreamWithID(t, formatOpenAIResponse, streamID, requestBody)
 	req, err := json.Marshal(pluginapi.StreamChunkInterceptRequest{
-		RequestBody: requestBody,
-		Body:        []byte(token),
-		ChunkIndex:  0,
+		StreamID:   streamID,
+		Body:       []byte(token),
+		ChunkIndex: 0,
 	})
 	if err != nil {
 		t.Fatalf("marshal stream request: %v", err)
@@ -498,11 +503,13 @@ func TestEscapedRequestTokenAllowsStreamRestoration(t *testing.T) {
 	st.vault.Put(token, secret)
 	escapedToken := strings.ReplaceAll(strings.ReplaceAll(token, "<", `\u003c`), ">", `\u003e`)
 	requestBody := []byte(`{"message":"` + escapedToken + `"}`)
+	streamID := streamKey(requestBody)
+	initStreamWithID(t, formatOpenAIResponse, streamID, requestBody)
 
 	req, err := json.Marshal(pluginapi.StreamChunkInterceptRequest{
-		RequestBody: requestBody,
-		Body:        []byte(token),
-		ChunkIndex:  0,
+		StreamID:   streamID,
+		Body:       []byte(token),
+		ChunkIndex: 0,
 	})
 	if err != nil {
 		t.Fatalf("marshal stream request: %v", err)
@@ -3462,13 +3469,21 @@ func openAIResponsesStreamText(t *testing.T, body []byte) string {
 
 func invokeStreamBody(t *testing.T, sourceFormat string, requestBody []byte, index int, body []byte) pluginapi.StreamChunkInterceptResponse {
 	t.Helper()
-	req, err := json.Marshal(pluginapi.StreamChunkInterceptRequest{
+	streamID := streamKey(requestBody)
+	if index != pluginapi.StreamChunkHeaderInitIndex && !streamCarry.has(streamID) {
+		initStreamWithID(t, sourceFormat, streamID, requestBody)
+	}
+	wireRequest := pluginapi.StreamChunkInterceptRequest{
+		StreamID:        streamID,
 		SourceFormat:    sourceFormat,
-		RequestBody:     requestBody,
 		ResponseHeaders: http.Header{"Content-Type": []string{"text/event-stream"}},
 		Body:            body,
 		ChunkIndex:      index,
-	})
+	}
+	if index == pluginapi.StreamChunkHeaderInitIndex {
+		wireRequest.RequestBody = requestBody
+	}
+	req, err := json.Marshal(wireRequest)
 	if err != nil {
 		t.Fatalf("marshal stream request: %v", err)
 	}
@@ -3545,10 +3560,12 @@ func TestUnchangedResponseAndChunkReturnNoBody(t *testing.T) {
 		t.Fatalf("unchanged response returned redundant body: %q", response.Body)
 	}
 
+	streamID := streamKey(requestBody)
+	initStreamWithID(t, formatOpenAI, streamID, requestBody)
 	chunkReq, _ := json.Marshal(pluginapi.StreamChunkInterceptRequest{
-		RequestBody: requestBody,
-		Body:        responseBody,
-		ChunkIndex:  0,
+		StreamID:   streamID,
+		Body:       responseBody,
+		ChunkIndex: 0,
 	})
 	chunkRaw, err := handleMethod(pluginabi.MethodResponseInterceptStreamChunk, chunkReq)
 	if err != nil {
@@ -3625,9 +3642,11 @@ func TestStreamChunkInterceptDropSignaled(t *testing.T) {
 	token := "<REDACTED_1a2b000000000000>"
 	activeSnapshot().vault.Put(token, "stream-secret")
 	requestBody := []byte(`{"message":"` + token + `"}`)
+	streamID := streamKey(requestBody)
 
 	// Header-init resets carry.
 	initReq, _ := json.Marshal(pluginapi.StreamChunkInterceptRequest{
+		StreamID:    streamID,
 		ChunkIndex:  pluginapi.StreamChunkHeaderInitIndex,
 		RequestBody: requestBody,
 	})
@@ -3636,9 +3655,9 @@ func TestStreamChunkInterceptDropSignaled(t *testing.T) {
 	}
 
 	chunkReq, _ := json.Marshal(pluginapi.StreamChunkInterceptRequest{
-		ChunkIndex:  0,
-		Body:        []byte("<REDACTED_1a2b"),
-		RequestBody: requestBody,
+		StreamID:   streamID,
+		ChunkIndex: 0,
+		Body:       []byte("<REDACTED_1a2b"),
 	})
 	raw, err := handleMethod(pluginabi.MethodResponseInterceptStreamChunk, chunkReq)
 	if err != nil {
@@ -3747,29 +3766,31 @@ func TestStreamStatefulChatArgumentRestoration(t *testing.T) {
 	}
 }
 
-func TestStreamLegacyChatArgumentRestoration(t *testing.T) {
+func TestStreamChatArgumentRestorationForNonzeroChoice(t *testing.T) {
 	callRegister(t, pluginabi.MethodPluginRegister, "mode: filter\n")
 	st := activeSnapshot()
-	secret := "legacy-chat-tool-argument"
+	secret := "nonzero-choice-chat-tool-argument"
 	token := makeToken(st.label, secret)
 	st.vault.Put(token, secret)
 	requestBody := []byte(`{"messages":[{"content":"` + token + `"}]}`)
-	resetStreamCarry(requestBody)
+	streamID := "nonzero-choice-chat-argument"
+	initStreamWithID(t, formatOpenAI, streamID, requestBody)
+	t.Cleanup(func() { invokeStreamBodyWithID(t, formatOpenAI, streamID, pluginapi.StreamChunkEndIndex, nil) })
 	split := len(token) / 2
 
 	firstBody := openAIChatToolArgumentSSEBody(t, 2, 3, `{"value":"`+token[:split], nil)
-	first := invokeStreamBody(t, formatOpenAI, requestBody, 0, firstBody)
+	first := invokeStreamBodyWithID(t, formatOpenAI, streamID, 0, firstBody)
 	secondBody := openAIChatToolArgumentSSEBody(t, 2, 3, token[split:]+`"}`, nil)
-	second := invokeStreamBody(t, formatOpenAI, requestBody, 1, secondBody)
+	second := invokeStreamBodyWithID(t, formatOpenAI, streamID, 1, secondBody)
 	delivered := append(deliveredStreamBody(first, firstBody), deliveredStreamBody(second, secondBody)...)
 	argument := openAIChatToolArguments(t, delivered)["2:3"]
 	var decoded map[string]string
 	if err := json.Unmarshal([]byte(argument), &decoded); err != nil || decoded["value"] != secret {
-		t.Fatalf("legacy arguments = %q decoded=%#v err=%v", argument, decoded, err)
+		t.Fatalf("nonzero-choice arguments = %q decoded=%#v err=%v", argument, decoded, err)
 	}
 	finishBody := openAIChatToolArgumentSSEBody(t, 2, 3, "", "stop")
-	_ = invokeStreamBody(t, formatOpenAI, requestBody, 2, finishBody)
-	assertNoArgumentState(t, streamKey(requestBody), "argument:openai:")
+	_ = invokeStreamBodyWithID(t, formatOpenAI, streamID, 2, finishBody)
+	assertNoArgumentState(t, streamID, "argument:openai:")
 }
 
 func TestToolArgumentRestoresAcrossReconfig(t *testing.T) {
@@ -4220,12 +4241,14 @@ func TestReconfigureOldLabelSplitStreamRestores(t *testing.T) {
 	getSharedVault().Put(token, secret)
 	callRegister(t, pluginabi.MethodPluginReconfigure, "token_label: NEW\n")
 	requestBody := []byte(`{"messages":[{"content":"` + token + `"}]}`)
+	streamID := streamKey(requestBody)
+	initStreamWithID(t, formatOpenAI, streamID, requestBody)
 
 	half := len(token) / 2
 	firstReq, _ := json.Marshal(pluginapi.StreamChunkInterceptRequest{
-		RequestBody: requestBody,
-		Body:        []byte(token[:half]),
-		ChunkIndex:  0,
+		StreamID:   streamID,
+		Body:       []byte(token[:half]),
+		ChunkIndex: 0,
 	})
 	firstRaw, err := handleMethod(pluginabi.MethodResponseInterceptStreamChunk, firstReq)
 	if err != nil {
@@ -4244,9 +4267,9 @@ func TestReconfigureOldLabelSplitStreamRestores(t *testing.T) {
 	}
 
 	secondReq, _ := json.Marshal(pluginapi.StreamChunkInterceptRequest{
-		RequestBody: requestBody,
-		Body:        []byte(token[half:]),
-		ChunkIndex:  1,
+		StreamID:   streamID,
+		Body:       []byte(token[half:]),
+		ChunkIndex: 1,
 	})
 	secondRaw, err := handleMethod(pluginabi.MethodResponseInterceptStreamChunk, secondReq)
 	if err != nil {

@@ -49,7 +49,7 @@ flowchart LR
 
 The host loads the shared library and drives it over a small C ABI (`cliproxy_plugin_init` / `call` / `free_buffer` / `shutdown`). Every call carries a method name and a JSON request and returns a JSON envelope (`{ok, result, error}`). The methods the plugin implements are:
 
-Protocol compatibility uses two independent version numbers. The native C ABI remains `pluginabi.ABIVersion == 1`. Lifecycle JSON RPC requests require `schema_version >= 3`; a missing version, V1, or V2 is rejected before configuration parsing or runtime mutation. Schema 3 is required for stateful stream-session negotiation and lifecycle callbacks. The plugin always advertises its implemented schema 3 contract, including when a later host schema version is received. Accepting that later lifecycle version does not claim support for unknown future schema features.
+Protocol compatibility uses two independent version numbers. The native C ABI remains `pluginabi.ABIVersion == 1`. Lifecycle JSON RPC requests require `schema_version >= 4`; a missing version, V1, V2, or V3 is rejected before configuration parsing or runtime mutation. Schema 4 is required for stateful stream-session negotiation, stable `StreamID` delivery, and init/end lifecycle callbacks. The plugin always advertises its implemented schema 4 contract, including when a later host schema version is received. Accepting that later lifecycle version does not claim support for unknown future schema features.
 
 - `plugin.register` / `plugin.reconfigure` — parse and validate the config, compile the active rule set, reconfigure the shared vault in place, and publish mode, rules, label, patterns, and vault together as one atomic runtime snapshot. Sharing the vault preserves in-flight mappings and late writes from handlers using an older snapshot.
 - `request.intercept_before` / `request.intercept_after` — redact the outbound request body.
@@ -129,10 +129,12 @@ flowchart TB
 
 ```mermaid
 flowchart TB
-    chunk([Incoming chunk]) --> init{ChunkIndex == -1?}
-    init -->|yes| reset[Reset reassembly<br/>buffer for this stream]
+    chunk([Incoming chunk with<br/>required StreamID]) --> init{ChunkIndex?}
+    init -->|init == -1| reset[Reset reassembly<br/>buffer for this stream]
     reset --> done([Return empty response])
-    init -->|no| prepend[Prepend any withheld<br/>bytes from previous chunk]
+    init -->|payload >= 0| prepend[Prepend any withheld<br/>bytes from previous chunk]
+    init -->|end == -2| release[Release all state<br/>for this StreamID]
+    release --> done
     prepend --> split{SSE event, even JSON-complete, still awaiting<br/>its blank separator, or token at chunk end?}
     split -->|yes| hold[Withhold the unfinished SSE event through<br/>its blank separator, or the token tail]
     split -->|no| semantic[Reassemble visible text by<br/>protocol-qualified channel]
@@ -143,7 +145,7 @@ flowchart TB
     detok --> emit([Restored chunk → client])
 ```
 
-1. On the stream-init call (`ChunkIndex == -1`) the plugin resets any leftover reassembly state for this stream. A repeated init for the same `StreamID` replaces the abandoned attempt's allowlist, raw carry, and semantic argument state. A stable host-provided `StreamID` is the primary state key and lets payload chunks omit the request body. Request-body SHA-256 hashing remains a legacy compatibility path for hosts that do not provide `StreamID` and resend the request body on every chunk.
+1. Every stream callback must carry a non-empty host-provided `StreamID`. On the init call (`ChunkIndex == -1`) the plugin resets any leftover reassembly state and builds the request allowlist from the heavy request fields. A repeated init for the same `StreamID` replaces the abandoned attempt's allowlist, raw carry, and semantic argument state. Payload callbacks (`ChunkIndex >= 0`) require a successful init and do not read or hash the request body. The end callback (`ChunkIndex == -2`) releases all retained state and is idempotent.
 2. For each data chunk it prepends raw carry from the previous host chunk and uses the same vault-verified, 1,024-token per-request allowlist. Restoration always requires both membership in that allowlist and a live vault mapping.
 3. For responses whose Content-Type is `text/event-stream`, a JSON `data:` line can be split inside the `data:` prefix or before, inside, or after a token. This raw chunk-carry layer withholds the whole unfinished SSE event from its first field through the blank dispatch separator, even when its JSON line is already complete. Non-SSE streams never buffer a token-free `data:` prefix; all stream types retain bounded partial-token buffering. Original LF, CRLF, or CR framing is preserved.
 4. After raw chunk carry, protocol adapters reassemble possible token prefixes across semantic visible-text events for OpenAI Chat Completions, OpenAI Responses, Claude, and Gemini. Pending text is isolated by protocol and choice/item/block/candidate channel. Gemini streams may contain SSE-framed JSON events or complete bare JSON responses even while the Content-Type remains `text/event-stream`.
@@ -298,7 +300,7 @@ These are intentional tradeoffs, not bugs:
 - **Pattern-based detection.** Rules can produce false positives and false negatives. Broad rules such as email, phone number, JWT, card number, and IPv4 detection are default-off for this reason. Encoded, split, obfuscated, or unsupported credential formats may not match.
 - **JSON reformatting.** When a body is rewritten, it is decoded and re-encoded, so map key order and whitespace may differ from the upstream bytes (semantically equivalent). This only matters for byte-sensitive consumers such as body signing. Bodies with no rule matches pass through untouched.
 - **Non-string secret values.** A non-string secret value (e.g. `{"password": 123456}`) is restored as a JSON string (`"123456"`); the characters are preserved but the JSON kind changes.
-- **Streaming edge cases.** Stable `StreamID` is the primary isolation key. On the legacy request-body-hash path, concurrent streams with byte-identical request bodies share state. Client cancellation, a missing protocol terminal, an end callback, or hard memory eviction can discard the one possible encoded-token suffix retained for each active visible-text or supported argument channel; end callbacks clean state but cannot deliver a flush body.
+- **Streaming edge cases.** Schema 4's stable `StreamID` isolates concurrent streams. Client cancellation, a missing protocol terminal, an end callback, or hard memory eviction can discard the one possible encoded-token suffix retained for each active visible-text or supported argument channel; end callbacks clean state but cannot deliver a flush body.
 - **Streaming semantic scope.** Cross-event restoration covers visible assistant text plus OpenAI Chat standard function arguments, OpenAI Responses standard function-call arguments, and Claude tool input JSON. It does not cover OpenAI Responses custom-tool input or reasoning fields. Gemini `functionCall.args` remains structured JSON restored event by event through the generic walker.
 - **Empty non-streaming restoration.** The host ABI uses an empty response `Body` to mean "no replacement," so it cannot represent restoring a response body that consists solely of a token mapped to the empty string. Streaming has an explicit `DropChunk` signal and handles the equivalent case safely.
 - **Content-region coverage.** Only recognized request formats and explicit runtime content regions are scanned. Headers, schemas, URLs, identifiers, media/file data, encrypted content, protocol metadata, and unvisited fields can carry matching plaintext upstream unchanged. Unsupported source formats are rejected, but provider schema drift can either trigger validation rejection or introduce an unvisited field that is preserved unscanned.

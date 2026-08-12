@@ -13,8 +13,8 @@ import (
 )
 
 func TestPluginSchemaVersionIsStatefulStreamContract(t *testing.T) {
-	if pluginSchemaVersion != 3 {
-		t.Fatalf("plugin schema version = %d, want 3", pluginSchemaVersion)
+	if pluginSchemaVersion != pluginabi.SchemaVersionStatefulStreamInterceptor {
+		t.Fatalf("plugin schema version = %d, want stateful stream schema %d", pluginSchemaVersion, pluginabi.SchemaVersionStatefulStreamInterceptor)
 	}
 	if pluginabi.SchemaVersion < pluginSchemaVersion {
 		t.Fatalf("host SDK schema version = %d, below plugin requirement %d", pluginabi.SchemaVersion, pluginSchemaVersion)
@@ -57,8 +57,8 @@ func TestRegisterReturnsCapabilitiesAndMetadata(t *testing.T) {
 	if len(reg.Metadata.ConfigFields) == 0 {
 		t.Fatalf("expected config fields declared")
 	}
-	if reg.Metadata.Version != "0.0.3" {
-		t.Fatalf("metadata version = %q, want 0.0.3", reg.Metadata.Version)
+	if reg.Metadata.Version != "0.0.4" {
+		t.Fatalf("metadata version = %q, want 0.0.4", reg.Metadata.Version)
 	}
 }
 
@@ -98,7 +98,24 @@ func TestLifecycleRejectsUnsupportedSchemaBeforeConfigParsing(t *testing.T) {
 	}
 }
 
-func TestLifecycleAcceptsFutureSchemaAndAdvertisesV3(t *testing.T) {
+func TestLifecycleRejectsSchemaV3(t *testing.T) {
+	raw, err := handleMethod(
+		pluginabi.MethodPluginReconfigure,
+		lifecycleRequestForSchema(t, "token_label: V3_MUST_NOT_APPLY\n", pluginabi.SchemaVersionStreamChunkOmitRequestBody),
+	)
+	if err != nil {
+		t.Fatalf("handleMethod returned Go error: %v", err)
+	}
+	var env envelope
+	if err := json.Unmarshal(raw, &env); err != nil {
+		t.Fatalf("unmarshal envelope: %v", err)
+	}
+	if env.OK || env.Error == nil || env.Error.Code != "unsupported_schema_version" {
+		t.Fatalf("expected schema v3 to be rejected, got %+v", env)
+	}
+}
+
+func TestLifecycleAcceptsFutureSchemaAndAdvertisesV4(t *testing.T) {
 	raw, err := handleMethod(
 		pluginabi.MethodPluginReconfigure,
 		lifecycleRequestForSchema(t, "token_label: FUTURE\n", pluginSchemaVersion+7),
@@ -118,10 +135,90 @@ func TestLifecycleAcceptsFutureSchemaAndAdvertisesV3(t *testing.T) {
 		t.Fatalf("unmarshal registration: %v", err)
 	}
 	if reg.SchemaVersion != pluginSchemaVersion {
-		t.Fatalf("schema version = %d, want implemented V3", reg.SchemaVersion)
+		t.Fatalf("schema version = %d, want implemented V4", reg.SchemaVersion)
 	}
 	if _, label := activeRuleSet(); label != "FUTURE" {
 		t.Fatalf("future host config was not applied: label=%q", label)
+	}
+}
+
+func TestStreamChunkRequiresNonEmptyStreamID(t *testing.T) {
+	callRegister(t, pluginabi.MethodPluginRegister, "")
+	for _, chunkIndex := range []int{
+		pluginapi.StreamChunkHeaderInitIndex,
+		0,
+		pluginapi.StreamChunkEndIndex,
+	} {
+		t.Run(fmt.Sprintf("chunk_%d", chunkIndex), func(t *testing.T) {
+			request, err := json.Marshal(pluginapi.StreamChunkInterceptRequest{
+				StreamID:    " \t ",
+				RequestBody: []byte(`{"messages":[]}`),
+				Body:        []byte("data: [DONE]\n\n"),
+				ChunkIndex:  chunkIndex,
+			})
+			if err != nil {
+				t.Fatalf("marshal request: %v", err)
+			}
+			raw, err := handleMethod(pluginabi.MethodResponseInterceptStreamChunk, request)
+			if err != nil {
+				t.Fatalf("handleMethod returned Go error: %v", err)
+			}
+			var env envelope
+			if err := json.Unmarshal(raw, &env); err != nil {
+				t.Fatalf("unmarshal envelope: %v", err)
+			}
+			if env.OK || env.Error == nil || env.Error.Code != "invalid_request" || !strings.Contains(env.Error.Message, "stream ID") {
+				t.Fatalf("expected missing stream ID error, got %+v", env)
+			}
+		})
+	}
+}
+
+func TestStreamPayloadRequiresInitialization(t *testing.T) {
+	callRegister(t, pluginabi.MethodPluginRegister, "")
+	streamID := "not-initialized"
+	streamCarry.end(streamID)
+	request, err := json.Marshal(pluginapi.StreamChunkInterceptRequest{
+		StreamID:   streamID,
+		Body:       []byte("data: [DONE]\n\n"),
+		ChunkIndex: 0,
+	})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	raw, err := handleMethod(pluginabi.MethodResponseInterceptStreamChunk, request)
+	if err != nil {
+		t.Fatalf("handleMethod returned Go error: %v", err)
+	}
+	var env envelope
+	if err := json.Unmarshal(raw, &env); err != nil {
+		t.Fatalf("unmarshal envelope: %v", err)
+	}
+	if env.OK || env.Error == nil || env.Error.Code != "invalid_request" || !strings.Contains(env.Error.Message, "not initialized") {
+		t.Fatalf("expected uninitialized stream error, got %+v", env)
+	}
+}
+
+func TestStreamChunkRejectsUnknownLifecycleIndex(t *testing.T) {
+	callRegister(t, pluginabi.MethodPluginRegister, "")
+	streamID := "unknown-lifecycle-index"
+	request, err := json.Marshal(pluginapi.StreamChunkInterceptRequest{
+		StreamID:   streamID,
+		ChunkIndex: -3,
+	})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	raw, err := handleMethod(pluginabi.MethodResponseInterceptStreamChunk, request)
+	if err != nil {
+		t.Fatalf("handleMethod returned Go error: %v", err)
+	}
+	var env envelope
+	if err := json.Unmarshal(raw, &env); err != nil {
+		t.Fatalf("unmarshal envelope: %v", err)
+	}
+	if env.OK || env.Error == nil || env.Error.Code != "invalid_request" || !strings.Contains(env.Error.Message, "unsupported stream chunk index") {
+		t.Fatalf("expected unsupported chunk index error, got %+v", env)
 	}
 }
 

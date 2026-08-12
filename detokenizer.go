@@ -3,8 +3,6 @@ package main
 import (
 	"bytes"
 	"container/list"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -30,9 +28,9 @@ const (
 	// stream. Requests beyond this limit remain safe: excess placeholders are
 	// left unrestored rather than growing persistent state or per-chunk work.
 	streamAllowlistMaxTokens = 1024
-	// streamCarryTTL bounds how long inactive legacy state may live before it is
-	// considered abandoned and eligible for eviction. Stateful streams remain
-	// active until their end marker unless a hard memory cap is reached.
+	// streamCarryTTL bounds how long inactive state may live before it is
+	// considered abandoned and eligible for eviction. Active streams remain
+	// retained until their end callback unless a hard memory cap is reached.
 	streamCarryTTL = 5 * time.Minute
 )
 
@@ -55,7 +53,7 @@ type streamEntry struct {
 }
 
 // streamStore is a bounded map of per-stream state. Active state is retained
-// until an end marker, while inactive legacy state is TTL-evicted. Hard entry
+// until an end callback, while inactive state is TTL-evicted. Hard entry
 // and byte caps keep memory bounded if lifecycle markers are missed.
 type streamStore struct {
 	mu             sync.Mutex
@@ -123,6 +121,21 @@ func (s *streamStore) allowlist(key string, build func() map[string]struct{}) ma
 	}
 	s.touchLocked(e, now)
 	return e.allowed
+}
+
+// activeAllowlist returns state initialized by a schema-v4 header callback.
+// Payload callbacks never rebuild it because heavy request fields are init-only.
+func (s *streamStore) activeAllowlist(key string) (map[string]struct{}, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	s.purgeLocked(now)
+	e, ok := s.entries[key]
+	if !ok || !e.active {
+		return nil, false
+	}
+	s.touchLocked(e, now)
+	return e.allowed, true
 }
 
 // takeCarry returns and clears any withheld bytes for key, mirroring the
@@ -366,12 +379,7 @@ func (s *streamStore) removeLocked(e *streamEntry) {
 	s.totalBytes -= e.bytes
 }
 
-// streamCarry holds per-stream state. New hosts key it by a unique StreamID;
-// legacy hosts fall back to streamKey(requestBody).
-//
-// Legacy limitation: two concurrent streams with identical request bodies
-// share a key. The request-scoped allowlist keeps this same-origin: both streams
-// may only restore tokens their shared request actually emitted.
+// streamCarry holds per-stream state keyed by the schema-v4 StreamID.
 var streamCarry = newStreamStore()
 
 func init() {
@@ -1285,17 +1293,6 @@ func sseCarryNeedsLineBreak(pending, chunk []byte) bool {
 // "<" + label + "_" + tokenHexLen hex chars + ">".
 func tokenLength(label string) int {
 	return len("<"+label+"_") + tokenHexLen + len(">")
-}
-
-// streamKey derives the per-stream carry key from the request body.
-func streamKey(requestBody []byte) string {
-	sum := sha256.Sum256(requestBody)
-	return hex.EncodeToString(sum[:])
-}
-
-// resetStreamCarry drops all per-stream state for the stream (header-init call).
-func resetStreamCarry(requestBody []byte) {
-	streamCarry.reset(streamKey(requestBody))
 }
 
 // isTokenPrefix reports whether tail could be the beginning of a complete token

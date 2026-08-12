@@ -49,7 +49,7 @@ flowchart LR
 
 宿主加载共享库，并通过一套精简的 C ABI（`cliproxy_plugin_init` / `call` / `free_buffer` / `shutdown`）驱动它。每次调用都携带一个方法名和一段 JSON 请求，返回一个 JSON 信封（`{ok, result, error}`）。插件实现的方法有：
 
-协议兼容性使用两个彼此独立的版本号。原生 C ABI 仍为 `pluginabi.ABIVersion == 1`。生命周期 JSON RPC 请求要求 `schema_version >= 3`；缺失版本、V1 或 V2 会在解析配置和修改运行时状态之前被拒绝。Schema 3 提供插件依赖的有状态流会话协商和生命周期回调。即使收到更高的宿主 schema 版本，插件也始终只声明自身实际实现的 schema 3 契约。接受更高的生命周期版本并不表示插件支持未知的未来 schema 功能。
+协议兼容性使用两个彼此独立的版本号。原生 C ABI 仍为 `pluginabi.ABIVersion == 1`。生命周期 JSON RPC 请求要求 `schema_version >= 4`；缺失版本、V1、V2 或 V3 会在解析配置和修改运行时状态之前被拒绝。Schema 4 提供插件依赖的有状态流会话协商、稳定 `StreamID` 以及 init/end 生命周期回调。即使收到更高的宿主 schema 版本，插件也始终只声明自身实际实现的 schema 4 契约。接受更高的生命周期版本并不表示插件支持未知的未来 schema 功能。
 
 - `plugin.register` / `plugin.reconfigure` —— 解析并校验配置、编译当前规则集、原地重配置共享 vault，并把工作模式、规则、标签、匹配模式和 vault 作为一个原子的运行时快照一起发布。共享 vault 会保留在途映射及仍持有旧快照的处理器产生的延迟写入。
 - `request.intercept_before` / `request.intercept_after` —— 脱敏出站请求体。
@@ -129,10 +129,12 @@ flowchart TB
 
 ```mermaid
 flowchart TB
-    chunk([到达的数据块]) --> init{ChunkIndex == -1？}
-    init -->|是| reset[重置本流的<br/>重组缓冲区]
+    chunk([带必需 StreamID 的<br/>到达数据块]) --> init{ChunkIndex？}
+    init -->|初始化 == -1| reset[重置本流的<br/>重组缓冲区]
     reset --> done([返回空响应])
-    init -->|否| prepend[拼接上一块<br/>暂存的字节]
+    init -->|载荷 >= 0| prepend[拼接上一块<br/>暂存的字节]
+    init -->|结束 == -2| release[释放该 StreamID 的<br/>全部状态]
+    release --> done
     prepend --> split{SSE 事件即使 JSON 已完整仍在等待<br/>空行分隔符，或块末尾有 token？}
     split -->|是| hold[将未完成 SSE 事件暂存到空行分隔符，<br/>或暂存 token 尾部]
     split -->|否| semantic[按协议限定的通道<br/>重组可见文本]
@@ -143,7 +145,7 @@ flowchart TB
     detok --> emit([还原后的数据块 → 客户端])
 ```
 
-1. 在流初始化调用（`ChunkIndex == -1`）时，插件会重置该流遗留的重组状态。同一 `StreamID` 的重复初始化会替换已放弃尝试中的 allowlist、原始 carry 和语义参数状态。现代 StreamID 主路径以宿主提供的稳定 `StreamID` 作为状态键，后续载荷 chunk 无需重复请求体；没有 `StreamID` 且每个 chunk 重发请求体的宿主使用 legacy 请求体哈希兼容路径。
+1. 每个流回调都必须携带宿主提供的非空 `StreamID`。初始化调用（`ChunkIndex == -1`）会重置该流遗留的重组状态，并从请求重字段构建 allowlist。同一 `StreamID` 的重复初始化会替换已放弃尝试中的 allowlist、原始 carry 和语义参数状态。载荷回调（`ChunkIndex >= 0`）要求初始化已成功，且不会读取或哈希请求体。结束回调（`ChunkIndex == -2`）释放全部保留状态，并可重复执行。
 2. 对每个数据块，插件先拼接上一宿主 chunk 留下的原始 carry，并复用最多 1024 个 token 的请求级 allowlist。每次还原都必须同时通过请求级 allowlist 与 live vault 两道 gate。
 3. 当响应 Content-Type 为 `text/event-stream` 时，JSON `data:` 行可能在 `data:` 前缀内部，或在 token 之前、内部、之后跨块切断。这个原始 chunk carry 层会从事件的第一个字段开始暂存整个未完成 SSE 事件，直到收到用于派发事件的空行；即使 JSON 行已经完整也同样如此。非 SSE 流不会暂存不含 token 的 `data:` 前缀；所有流类型仍使用有界的 token 尾部缓冲。原始 LF、CRLF 或 CR 分帧保持不变。
 4. 完成原始 chunk carry 后，协议适配器会为 OpenAI Chat Completions、OpenAI Responses、Claude 和 Gemini 跨语义可见文本事件重组可能的 token 前缀。待处理文本按协议以及 choice/item/block/candidate 通道隔离。Gemini 流既可能包含 SSE 分帧的 JSON 事件，也可能在 Content-Type 仍为 `text/event-stream` 时直接包含完整的裸 JSON 响应。
@@ -298,7 +300,7 @@ password: <REDACTED_1a2b3c4d5e6f7890>
 - **基于模式的检测。** 规则可能出现误报和漏报。电子邮件、电话号码、JWT、银行卡号和 IPv4 等宽泛规则因此默认关闭。编码、拆分、混淆或尚不支持的凭据格式可能无法命中。
 - **JSON 重新格式化。** 当请求体被改写时，它会被解码后重新编码，因此 map 的键顺序和空白可能与上游字节不同（语义等价）。这只对字节敏感的消费方（如请求体签名）有影响。没有规则命中的请求体会原样透传。
 - **非字符串敏感值。** 非字符串敏感值（如 `{"password": 123456}`）会以 JSON 字符串（`"123456"`）的形式还原；字符内容保留，但 JSON 类型发生变化。
-- **流式边界情况。** 现代 StreamID 主路径使用稳定 `StreamID` 隔离流；legacy 请求体哈希兼容路径中，请求体字节完全相同的并发流会共享状态。客户端取消、缺少协议 terminal、异常 end cleanup 或硬内存淘汰，可能丢弃每个活动可见文本或受支持参数通道保留的一个编码 token 短尾；end callback 只能清理状态，不能投递 flush 响应体。
+- **流式边界情况。** Schema 4 的稳定 `StreamID` 会隔离并发流。客户端取消、缺少协议 terminal、异常 end cleanup 或硬内存淘汰，可能丢弃每个活动可见文本或受支持参数通道保留的一个编码 token 短尾；end callback 只能清理状态，不能投递 flush 响应体。
 - **流式语义范围。** 跨事件还原覆盖助手可见文本，以及 OpenAI Chat 标准函数参数、OpenAI Responses 标准函数调用参数和 Claude 工具输入 JSON；不覆盖 OpenAI Responses custom tool input 或推理字段。Gemini `functionCall.args` 仍是结构化 JSON，只在单个事件内由通用 walker 处理。
 - **非流式空内容还原。** 宿主 ABI 用空响应 `Body` 表示“不替换”，因此无法表达“整个响应体只有一个映射到空字符串的 token”这一还原结果。流式 ABI 提供明确的 `DropChunk` 信号，可以安全处理对应情况。
 - **内容区域覆盖范围。** 只有已识别的请求格式和明确的运行时内容区域会被扫描。请求头、schema、URL、标识符、媒体/文件数据、加密内容、协议元数据和未访问字段中的匹配明文可能原样发往上游。不支持的源格式会被拒绝，但服务商 schema 漂移既可能触发校验拒绝，也可能引入一个被保留但未扫描的字段。
