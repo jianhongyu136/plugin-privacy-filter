@@ -761,6 +761,22 @@ func TestResponsesTypedMessageRequiresContent(t *testing.T) {
 	}
 }
 
+func TestResponsesAgentMessageAcceptedAndTextRedacted(t *testing.T) {
+	callRegister(t, pluginabi.MethodPluginRegister, "builtin_rules_enabled: false\ncustom_value_rules:\n  - name: marker\n    regex: '(TEXTSECRET|OPAQUESECRET)'\n")
+	body := []byte(`{"input":[{"type":"agent_message","id":"amsg_1","author":"/root","recipient":"/root/worker","content":[{"type":"input_text","text":"TEXTSECRET"},{"type":"encrypted_content","encrypted_content":"OPAQUESECRET"}],"internal_chat_message_metadata_passthrough":{"turn_id":"turn_1"}}]}`)
+
+	resp := requestIntercept(t, formatOpenAIResponse, body)
+	if resp.Reject || len(resp.Body) == 0 {
+		t.Fatalf("valid agent_message rejected or unchanged: reject=%v reason=%q", resp.Reject, resp.RejectReason)
+	}
+	if strings.Contains(string(resp.Body), "TEXTSECRET") {
+		t.Fatalf("agent message text was not redacted: %s", resp.Body)
+	}
+	if !strings.Contains(string(resp.Body), "OPAQUESECRET") || !strings.Contains(string(resp.Body), "turn_1") {
+		t.Fatalf("opaque agent message data was modified: %s", resp.Body)
+	}
+}
+
 func TestResponsesDiscriminatedInputsFailClosed(t *testing.T) {
 	callRegister(t, pluginabi.MethodPluginRegister, "")
 	tests := []string{

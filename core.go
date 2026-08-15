@@ -208,7 +208,11 @@ func handleRequestIntercept(request []byte) (out []byte, err error) {
 			fields["unsupported_content"] = sanitizeUnsupportedContent(scanErr.UnsupportedContent)
 		}
 		logrus.WithFields(fields).Warn("privacy-filter rejected unscannable request content")
-		return okEnvelope(terminateRequest("privacy-filter could not scan request content at " + scanErr.Path + ": " + scanErr.Detail))
+		msg := scanErr.Detail
+		if scanErr.HasUnsupportedType {
+			msg += " (unsupported type: " + sanitizeUnsupportedContent(scanErr.UnsupportedContent) + ")"
+		}
+		return okEnvelope(terminateRequest("privacy-filter could not scan request content at " + scanErr.Path + ": " + msg))
 	}
 	if !handled {
 		// A recognized format whose body could not be parsed into its content

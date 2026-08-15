@@ -173,6 +173,7 @@ type contentScanError struct {
 	Detail                string
 	UnsupportedContent    string
 	HasUnsupportedContent bool
+	HasUnsupportedType    bool
 }
 
 // scanContentValue scans one content region. A plain string is scanned with the
@@ -379,7 +380,7 @@ func scanOpenAIToolCallArguments(s *scanner, msg map[string]any, messagePath str
 			continue
 		}
 		if kind != "function" {
-			return &contentScanError{Path: toolCallPath + ".type", Detail: "unsupported tool call type", UnsupportedContent: kind, HasUnsupportedContent: true}
+			return &contentScanError{Path: toolCallPath + ".type", Detail: "unsupported tool call type", UnsupportedContent: kind, HasUnsupportedContent: true, HasUnsupportedType: true}
 		}
 		if err := validateAllowedKeys(toolCall, toolCallPath, "id", "index", "type", "function"); err != nil {
 			return err
@@ -625,7 +626,7 @@ func contentBlockType(block map[string]any, path string) (string, *contentScanEr
 }
 
 func unknownContentBlock(path, kind string) *contentScanError {
-	return &contentScanError{Path: path + ".type", Detail: "unsupported content block type", UnsupportedContent: kind, HasUnsupportedContent: true}
+	return &contentScanError{Path: path + ".type", Detail: "unsupported content block type", UnsupportedContent: kind, HasUnsupportedContent: true, HasUnsupportedType: true}
 }
 
 func scanStringMember(s *scanner, object map[string]any, key, path string, required bool) *contentScanError {
@@ -737,6 +738,16 @@ func scanResponsesInput(s *scanner, value any, path string) (any, *contentScanEr
 			if err := validateOptionalStringMember(item, "phase", itemPath); err != nil {
 				return nil, err
 			}
+			content, exists := item["content"]
+			if !exists {
+				return nil, &contentScanError{Path: itemPath + ".content", Detail: "content is required"}
+			}
+			walked, scanErr := scanResponsesContent(s, content, itemPath+".content")
+			if scanErr != nil {
+				return nil, scanErr
+			}
+			item["content"] = walked
+		case "agent_message":
 			content, exists := item["content"]
 			if !exists {
 				return nil, &contentScanError{Path: itemPath + ".content", Detail: "content is required"}
@@ -925,6 +936,8 @@ func validateResponsesItemKeys(item map[string]any, path, kind string) *contentS
 	switch kind {
 	case "message":
 		keys = []string{"type", "id", "role", "status", "content", "phase"}
+	case "agent_message":
+		keys = []string{"type", "id", "author", "recipient", "content", "internal_chat_message_metadata_passthrough"}
 	case "input_text":
 		keys = []string{"type", "text", "annotations", "logprobs", "prompt_cache_breakpoint"}
 	case "output_text":
@@ -1444,7 +1457,7 @@ func scanResponsesContent(s *scanner, value any, path string) (any, *contentScan
 			if err := scanStringMember(s, item, "refusal", itemPath, true); err != nil {
 				return nil, err
 			}
-		case "input_image", "input_file", "computer_screenshot":
+		case "input_image", "input_file", "computer_screenshot", "encrypted_content":
 		default:
 			return nil, unknownContentBlock(itemPath, kind)
 		}
@@ -1468,6 +1481,8 @@ func validateResponsesContentKeys(item map[string]any, path, kind string) *conte
 		return validateAllowedKeys(item, path, "type", "file_data", "file_id", "file_url", "filename", "prompt_cache_breakpoint")
 	case "computer_screenshot":
 		return validateAllowedKeys(item, path, "type", "file_id", "image_url")
+	case "encrypted_content":
+		return validateAllowedKeys(item, path, "type", "encrypted_content")
 	default:
 		return unknownContentBlock(path, kind)
 	}
@@ -1710,7 +1725,7 @@ func scanClaudeToolResultContent(s *scanner, value any, path string) (any, *cont
 		case "image", "pdf":
 			// Binary/media content remains opaque.
 		default:
-			return nil, &contentScanError{Path: path + ".file_type", Detail: "unsupported file_type", UnsupportedContent: fileType, HasUnsupportedContent: true}
+			return nil, &contentScanError{Path: path + ".file_type", Detail: "unsupported file_type", UnsupportedContent: fileType, HasUnsupportedContent: true, HasUnsupportedType: true}
 		}
 	case "text_editor_code_execution_str_replace_result":
 		if err := scanOptionalStringArrayMember(s, result, "lines", path); err != nil {

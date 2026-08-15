@@ -690,6 +690,28 @@ func TestRequestScanErrorLogsEmptyUnsupportedContent(t *testing.T) {
 	}
 }
 
+func TestRequestScanErrorIncludesUnsupportedResponsesType(t *testing.T) {
+	callRegister(t, pluginabi.MethodPluginRegister, "")
+	items := make([]any, 133)
+	for i := 0; i < 132; i++ {
+		items[i] = map[string]any{"id": "item-reference"}
+	}
+	items[132] = map[string]any{"type": "future_block"}
+	body, err := json.Marshal(map[string]any{"input": items})
+	if err != nil {
+		t.Fatalf("marshal body: %v", err)
+	}
+
+	resp := invokeRequestIntercept(t, pluginabi.MethodRequestInterceptBefore, formatOpenAIResponse, body)
+	if !resp.Reject {
+		t.Fatal("unsupported Responses input was not rejected")
+	}
+	want := "input[132].type: unsupported content block type (unsupported type: future_block)"
+	if !strings.Contains(resp.RejectReason, want) {
+		t.Fatalf("reject reason = %q, want substring %q", resp.RejectReason, want)
+	}
+}
+
 // bytesContains is a tiny helper local to the test.
 func bytesContains(haystack, needle []byte) bool {
 	return len(needle) == 0 || indexOfBytes(haystack, needle) >= 0
