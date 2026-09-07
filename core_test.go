@@ -12,18 +12,40 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-func TestPluginSchemaVersionIsStatefulStreamContract(t *testing.T) {
-	if pluginSchemaVersion != pluginabi.SchemaVersionStatefulStreamInterceptor {
-		t.Fatalf("plugin schema version = %d, want stateful stream schema %d", pluginSchemaVersion, pluginabi.SchemaVersionStatefulStreamInterceptor)
+func TestPluginRegistersMainSchema5Contract(t *testing.T) {
+	t.Cleanup(streamCarry.clear)
+	raw, err := handleMethod(pluginabi.MethodPluginRegister, []byte(`{"schema_version":5}`))
+	if err != nil {
+		t.Fatal(err)
 	}
-	if pluginabi.SchemaVersion < pluginSchemaVersion {
-		t.Fatalf("host SDK schema version = %d, below plugin requirement %d", pluginabi.SchemaVersion, pluginSchemaVersion)
+	var env envelope
+	if err := json.Unmarshal(raw, &env); err != nil || !env.OK {
+		t.Fatalf("registration failed: envelope=%+v err=%v", env, err)
+	}
+	var reg struct {
+		SchemaVersion uint32          `json:"schema_version"`
+		Capabilities  map[string]bool `json:"capabilities"`
+	}
+	if err := json.Unmarshal(env.Result, &reg); err != nil {
+		t.Fatal(err)
+	}
+	if reg.SchemaVersion != 5 {
+		t.Fatalf("schema version = %d, want main schema 5", reg.SchemaVersion)
+	}
+	for _, capability := range []string{"request_interceptor", "request_lifecycle_plugin", "response_interceptor", "response_stream_interceptor"} {
+		if !reg.Capabilities[capability] {
+			t.Errorf("missing capability %q", capability)
+		}
+	}
+	if _, present := reg.Capabilities["response_stream_interceptor_stateful"]; present {
+		t.Fatal("registration still advertises the branch-only stateful capability")
 	}
 }
 
 // callRegister invokes handleMethod for a lifecycle method with the given YAML config.
 func callRegister(t *testing.T, method, yamlText string) registration {
 	t.Helper()
+	t.Cleanup(streamCarry.clear)
 	req := lifecycleRequest(t, yamlText)
 	raw, err := handleMethod(method, req)
 	if err != nil {
@@ -48,7 +70,7 @@ func TestRegisterReturnsCapabilitiesAndMetadata(t *testing.T) {
 	if reg.SchemaVersion != pluginSchemaVersion {
 		t.Fatalf("schema version = %d, want %d", reg.SchemaVersion, pluginSchemaVersion)
 	}
-	if !reg.Capabilities.RequestInterceptor || !reg.Capabilities.ResponseInterceptor || !reg.Capabilities.StreamChunkInterceptor || !reg.Capabilities.StreamChunkInterceptorStateful {
+	if !reg.Capabilities.RequestInterceptor || !reg.Capabilities.ResponseInterceptor || !reg.Capabilities.StreamChunkInterceptor || !reg.Capabilities.RequestLifecyclePlugin {
 		t.Fatalf("expected all interceptor capabilities true, got %+v", reg.Capabilities)
 	}
 	if len(reg.Metadata.Name) == 0 || len(reg.Metadata.Version) == 0 || len(reg.Metadata.Author) == 0 || len(reg.Metadata.GitHubRepository) == 0 {
@@ -68,7 +90,7 @@ func TestLifecycleRejectsUnsupportedSchemaBeforeConfigParsing(t *testing.T) {
 	token := makeToken("STABLE", "in-flight")
 	before.vault.Put(token, "in-flight")
 
-	for _, schemaVersion := range []uint32{0, pluginSchemaVersion - 1} {
+	for _, schemaVersion := range []uint32{0, 1, 2, 3, 4} {
 		t.Run(fmt.Sprintf("schema_%d", schemaVersion), func(t *testing.T) {
 			raw, err := handleMethod(
 				pluginabi.MethodPluginReconfigure,
@@ -115,7 +137,7 @@ func TestLifecycleRejectsSchemaV3(t *testing.T) {
 	}
 }
 
-func TestLifecycleAcceptsFutureSchemaAndAdvertisesV4(t *testing.T) {
+func TestLifecycleAcceptsFutureSchemaAndAdvertisesV5(t *testing.T) {
 	raw, err := handleMethod(
 		pluginabi.MethodPluginReconfigure,
 		lifecycleRequestForSchema(t, "token_label: FUTURE\n", pluginSchemaVersion+7),
@@ -134,24 +156,23 @@ func TestLifecycleAcceptsFutureSchemaAndAdvertisesV4(t *testing.T) {
 	if err := json.Unmarshal(env.Result, &reg); err != nil {
 		t.Fatalf("unmarshal registration: %v", err)
 	}
-	if reg.SchemaVersion != pluginSchemaVersion {
-		t.Fatalf("schema version = %d, want implemented V4", reg.SchemaVersion)
+	if reg.SchemaVersion != 5 {
+		t.Fatalf("schema version = %d, want implemented V5", reg.SchemaVersion)
 	}
 	if _, label := activeRuleSet(); label != "FUTURE" {
 		t.Fatalf("future host config was not applied: label=%q", label)
 	}
 }
 
-func TestStreamChunkRequiresNonEmptyStreamID(t *testing.T) {
+func TestStreamChunkRequiresNonEmptyRequestID(t *testing.T) {
 	callRegister(t, pluginabi.MethodPluginRegister, "")
 	for _, chunkIndex := range []int{
 		pluginapi.StreamChunkHeaderInitIndex,
 		0,
-		pluginapi.StreamChunkEndIndex,
 	} {
 		t.Run(fmt.Sprintf("chunk_%d", chunkIndex), func(t *testing.T) {
 			request, err := json.Marshal(pluginapi.StreamChunkInterceptRequest{
-				StreamID:    " \t ",
+				RequestID:   " \t ",
 				RequestBody: []byte(`{"messages":[]}`),
 				Body:        []byte("data: [DONE]\n\n"),
 				ChunkIndex:  chunkIndex,
@@ -167,8 +188,8 @@ func TestStreamChunkRequiresNonEmptyStreamID(t *testing.T) {
 			if err := json.Unmarshal(raw, &env); err != nil {
 				t.Fatalf("unmarshal envelope: %v", err)
 			}
-			if env.OK || env.Error == nil || env.Error.Code != "invalid_request" || !strings.Contains(env.Error.Message, "stream ID") {
-				t.Fatalf("expected missing stream ID error, got %+v", env)
+			if env.OK || env.Error == nil || env.Error.Code != "invalid_request" || !strings.Contains(env.Error.Message, "request ID") {
+				t.Fatalf("expected missing request ID error, got %+v", env)
 			}
 		})
 	}
@@ -177,9 +198,9 @@ func TestStreamChunkRequiresNonEmptyStreamID(t *testing.T) {
 func TestStreamPayloadRequiresInitialization(t *testing.T) {
 	callRegister(t, pluginabi.MethodPluginRegister, "")
 	streamID := "not-initialized"
-	streamCarry.end(streamID)
+	streamCarry.reset(streamID)
 	request, err := json.Marshal(pluginapi.StreamChunkInterceptRequest{
-		StreamID:   streamID,
+		RequestID:  streamID,
 		Body:       []byte("data: [DONE]\n\n"),
 		ChunkIndex: 0,
 	})
@@ -203,8 +224,8 @@ func TestStreamChunkRejectsUnknownLifecycleIndex(t *testing.T) {
 	callRegister(t, pluginabi.MethodPluginRegister, "")
 	streamID := "unknown-lifecycle-index"
 	request, err := json.Marshal(pluginapi.StreamChunkInterceptRequest{
-		StreamID:   streamID,
-		ChunkIndex: -3,
+		RequestID:  streamID,
+		ChunkIndex: -2,
 	})
 	if err != nil {
 		t.Fatalf("marshal request: %v", err)

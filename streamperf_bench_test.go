@@ -39,7 +39,7 @@ func benchOpenAIChunk(token string) []byte {
 func benchInvokeStatefulChunk(b *testing.B, streamID string, chunk []byte, index int) {
 	b.Helper()
 	req, err := json.Marshal(pluginapi.StreamChunkInterceptRequest{
-		StreamID:        streamID,
+		RequestID:       streamID,
 		SourceFormat:    formatOpenAI,
 		ResponseHeaders: http.Header{"Content-Type": []string{"text/event-stream"}},
 		Body:            chunk,
@@ -48,34 +48,45 @@ func benchInvokeStatefulChunk(b *testing.B, streamID string, chunk []byte, index
 	if err != nil {
 		b.Fatalf("marshal: %v", err)
 	}
-	if _, err := handleMethod(pluginabi.MethodResponseInterceptStreamChunk, req); err != nil {
+	raw, err := handleMethod(pluginabi.MethodResponseInterceptStreamChunk, req)
+	if err != nil {
 		b.Fatalf("handleMethod: %v", err)
+	}
+	var env envelope
+	if err := json.Unmarshal(raw, &env); err != nil || !env.OK {
+		b.Fatalf("stream chunk failed: envelope=%+v err=%v", env, err)
 	}
 }
 
-// BenchmarkStreamChunkStateful measures the schema-v4 path: the 1 MiB request
+// BenchmarkStreamChunkStateful measures the schema-v5 path: the 1 MiB request
 // body is processed once at header init, then each payload chunk carries only a
-// stable StreamID and the small response body.
+// stable RequestID and the small response body.
 func BenchmarkStreamChunkStateful(b *testing.B) {
 	label, _ := detokTestSetup()
 	requestBody, token := benchStreamRequestBody(b, label, 1<<20)
 	chunk := benchOpenAIChunk(token)
 	streamID := "benchmark-stateful-stream"
+	streamCarry.reset(streamID)
 	initRequest, err := json.Marshal(pluginapi.StreamChunkInterceptRequest{
-		StreamID:    streamID,
+		RequestID:   streamID,
 		RequestBody: requestBody,
 		ChunkIndex:  pluginapi.StreamChunkHeaderInitIndex,
 	})
 	if err != nil {
 		b.Fatalf("marshal init: %v", err)
 	}
-	if _, err := handleMethod(pluginabi.MethodResponseInterceptStreamChunk, initRequest); err != nil {
+	raw, err := handleMethod(pluginabi.MethodResponseInterceptStreamChunk, initRequest)
+	if err != nil {
 		b.Fatalf("init stream: %v", err)
+	}
+	var env envelope
+	if err := json.Unmarshal(raw, &env); err != nil || !env.OK {
+		b.Fatalf("stream init failed: envelope=%+v err=%v", env, err)
 	}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		benchInvokeStatefulChunk(b, streamID, chunk, i)
 	}
 	b.StopTimer()
-	benchInvokeStatefulChunk(b, streamID, nil, pluginapi.StreamChunkEndIndex)
+	completeStream(b, streamID)
 }

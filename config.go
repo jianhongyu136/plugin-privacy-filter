@@ -39,8 +39,8 @@ type lifecycleRequestPayload struct {
 	SchemaVersion uint32 `json:"schema_version"`
 }
 
-// Schema 4 provides the stateful stream session lifecycle required by this plugin.
-const pluginSchemaVersion uint32 = pluginabi.SchemaVersionStatefulStreamInterceptor
+// Main schema 5 omits request bodies and history from payload chunk callbacks.
+const pluginSchemaVersion uint32 = pluginabi.SchemaVersionStreamChunkOmitHistory
 
 type unsupportedSchemaVersionError struct {
 	received uint32

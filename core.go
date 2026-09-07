@@ -102,6 +102,22 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 	case pluginabi.MethodRequestInterceptBefore, pluginabi.MethodRequestInterceptAfter:
 		return handleRequestIntercept(request)
 
+	case pluginabi.MethodRequestComplete:
+		var completion pluginapi.RequestCompletion
+		if err := json.Unmarshal(request, &completion); err != nil {
+			return errorEnvelope("invalid_request", err.Error()), nil
+		}
+		completion.RequestID = strings.TrimSpace(completion.RequestID)
+		if completion.RequestID == "" {
+			return errorEnvelope("invalid_request", "request ID is required"), nil
+		}
+		if completion.Stream {
+			unlock := streamCarry.lockRequest(completion.RequestID)
+			defer unlock()
+			streamCarry.end(completion.RequestID)
+		}
+		return okEnvelope(struct{}{})
+
 	case pluginabi.MethodResponseInterceptAfter:
 		return handleResponseIntercept(request)
 
@@ -125,10 +141,10 @@ type registration struct {
 
 // registrationCapability mirrors the host rpcCapabilities JSON names.
 type registrationCapability struct {
-	RequestInterceptor             bool `json:"request_interceptor"`
-	ResponseInterceptor            bool `json:"response_interceptor"`
-	StreamChunkInterceptor         bool `json:"response_stream_interceptor"`
-	StreamChunkInterceptorStateful bool `json:"response_stream_interceptor_stateful"`
+	RequestInterceptor     bool `json:"request_interceptor"`
+	RequestLifecyclePlugin bool `json:"request_lifecycle_plugin"`
+	ResponseInterceptor    bool `json:"response_interceptor"`
+	StreamChunkInterceptor bool `json:"response_stream_interceptor"`
 }
 
 func pluginRegistration() registration {
@@ -142,10 +158,10 @@ func pluginRegistration() registration {
 			ConfigFields:     configFields(),
 		},
 		Capabilities: registrationCapability{
-			RequestInterceptor:             true,
-			ResponseInterceptor:            true,
-			StreamChunkInterceptor:         true,
-			StreamChunkInterceptorStateful: true,
+			RequestInterceptor:     true,
+			RequestLifecyclePlugin: true,
+			ResponseInterceptor:    true,
+			StreamChunkInterceptor: true,
 		},
 	}
 }
@@ -294,22 +310,23 @@ func handleStreamChunkIntercept(request []byte) ([]byte, error) {
 	if err := json.Unmarshal(request, &req); err != nil {
 		return errorEnvelope("invalid_request", err.Error()), nil
 	}
-	req.StreamID = strings.TrimSpace(req.StreamID)
-	if req.StreamID == "" {
-		return errorEnvelope("invalid_request", "stream ID is required"), nil
+	req.RequestID = strings.TrimSpace(req.RequestID)
+	if req.RequestID == "" {
+		return errorEnvelope("invalid_request", "request ID is required"), nil
 	}
+	unlock := streamCarry.lockRequest(req.RequestID)
+	defer unlock()
 	st := activeSnapshot()
 	switch req.ChunkIndex {
-	case pluginapi.StreamChunkEndIndex:
-		streamCarry.end(req.StreamID)
-		return okEnvelope(pluginapi.StreamChunkInterceptResponse{})
 	case pluginapi.StreamChunkHeaderInitIndex:
-		// Schema v4 sends heavy request fields only on init. A repeated init for
-		// the same StreamID replaces state from an abandoned bootstrap attempt.
-		streamCarry.begin(req.StreamID)
+		// Schema v5 sends heavy fields only on init. A repeated init for the
+		// same RequestID replaces state from an abandoned bootstrap attempt.
+		if !streamCarry.begin(req.RequestID) {
+			return errorEnvelope("invalid_request", "request already completed"), nil
+		}
 		if st != nil {
 			tokenRe := st.restoreTokenRe
-			streamCarry.allowlist(req.StreamID, func() map[string]struct{} {
+			streamCarry.allowlist(req.RequestID, func() map[string]struct{} {
 				return collectTokens(req.RequestBody, tokenRe, st.vault)
 			})
 		}
@@ -319,9 +336,9 @@ func handleStreamChunkIntercept(request []byte) ([]byte, error) {
 			return errorEnvelope("invalid_request", fmt.Sprintf("unsupported stream chunk index %d", req.ChunkIndex)), nil
 		}
 	}
-	allowed, initialized := streamCarry.activeAllowlist(req.StreamID)
+	allowed, initialized := streamCarry.activeAllowlist(req.RequestID)
 	if !initialized {
-		return errorEnvelope("invalid_request", fmt.Sprintf("stream %q was not initialized", req.StreamID)), nil
+		return errorEnvelope("invalid_request", fmt.Sprintf("request %q was not initialized", req.RequestID)), nil
 	}
 	if st == nil {
 		return okEnvelope(pluginapi.StreamChunkInterceptResponse{})
@@ -333,7 +350,7 @@ func handleStreamChunkIntercept(request []byte) ([]byte, error) {
 	contentType := req.ResponseHeaders.Get("Content-Type")
 	mediaType := strings.TrimSpace(strings.SplitN(contentType, ";", 2)[0])
 	out, drop := detokenizeStreamChunkForMediaType(
-		req.StreamID,
+		req.RequestID,
 		req.Body,
 		tokenRe,
 		tokenLabels(allowed),

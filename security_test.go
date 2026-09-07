@@ -403,7 +403,7 @@ func TestSSEPrefixCarryRequiresEventStreamContentType(t *testing.T) {
 	invoke := func(index int, body []byte, contentType string) pluginapi.StreamChunkInterceptResponse {
 		t.Helper()
 		req, _ := json.Marshal(pluginapi.StreamChunkInterceptRequest{
-			StreamID:        streamID,
+			RequestID:       streamID,
 			Body:            body,
 			ChunkIndex:      index,
 			ResponseHeaders: http.Header{"Content-Type": []string{contentType}},
@@ -471,7 +471,7 @@ func TestStreamRestorationToEmptyDropsChunk(t *testing.T) {
 	streamID := streamKey(requestBody)
 	initStreamWithID(t, formatOpenAIResponse, streamID, requestBody)
 	req, err := json.Marshal(pluginapi.StreamChunkInterceptRequest{
-		StreamID:   streamID,
+		RequestID:  streamID,
 		Body:       []byte(token),
 		ChunkIndex: 0,
 	})
@@ -507,7 +507,7 @@ func TestEscapedRequestTokenAllowsStreamRestoration(t *testing.T) {
 	initStreamWithID(t, formatOpenAIResponse, streamID, requestBody)
 
 	req, err := json.Marshal(pluginapi.StreamChunkInterceptRequest{
-		StreamID:   streamID,
+		RequestID:  streamID,
 		Body:       []byte(token),
 		ChunkIndex: 0,
 	})
@@ -3474,7 +3474,7 @@ func invokeStreamBody(t *testing.T, sourceFormat string, requestBody []byte, ind
 		initStreamWithID(t, sourceFormat, streamID, requestBody)
 	}
 	wireRequest := pluginapi.StreamChunkInterceptRequest{
-		StreamID:        streamID,
+		RequestID:       streamID,
 		SourceFormat:    sourceFormat,
 		ResponseHeaders: http.Header{"Content-Type": []string{"text/event-stream"}},
 		Body:            body,
@@ -3494,6 +3494,9 @@ func invokeStreamBody(t *testing.T, sourceFormat string, requestBody []byte, ind
 	var env envelope
 	if err := json.Unmarshal(raw, &env); err != nil {
 		t.Fatalf("unmarshal envelope: %v", err)
+	}
+	if !env.OK {
+		t.Fatalf("stream intercept failed: %+v", env.Error)
 	}
 	var response pluginapi.StreamChunkInterceptResponse
 	if err := json.Unmarshal(env.Result, &response); err != nil {
@@ -3563,7 +3566,7 @@ func TestUnchangedResponseAndChunkReturnNoBody(t *testing.T) {
 	streamID := streamKey(requestBody)
 	initStreamWithID(t, formatOpenAI, streamID, requestBody)
 	chunkReq, _ := json.Marshal(pluginapi.StreamChunkInterceptRequest{
-		StreamID:   streamID,
+		RequestID:  streamID,
 		Body:       responseBody,
 		ChunkIndex: 0,
 	})
@@ -3646,7 +3649,7 @@ func TestStreamChunkInterceptDropSignaled(t *testing.T) {
 
 	// Header-init resets carry.
 	initReq, _ := json.Marshal(pluginapi.StreamChunkInterceptRequest{
-		StreamID:    streamID,
+		RequestID:   streamID,
 		ChunkIndex:  pluginapi.StreamChunkHeaderInitIndex,
 		RequestBody: requestBody,
 	})
@@ -3655,7 +3658,7 @@ func TestStreamChunkInterceptDropSignaled(t *testing.T) {
 	}
 
 	chunkReq, _ := json.Marshal(pluginapi.StreamChunkInterceptRequest{
-		StreamID:   streamID,
+		RequestID:  streamID,
 		ChunkIndex: 0,
 		Body:       []byte("<REDACTED_1a2b"),
 	})
@@ -3677,12 +3680,11 @@ func TestStreamChunkInterceptDropSignaled(t *testing.T) {
 }
 
 // invokeStreamBodyWithID marshals a stream chunk request with an explicit
-// StreamID and no per-chunk RequestBody, mirroring a stateful host that sends
-// heavy fields only on the header-init call.
+// RequestID and no per-chunk RequestBody, matching main's schema-5 contract.
 func invokeStreamBodyWithID(t *testing.T, sourceFormat, streamID string, index int, body []byte) pluginapi.StreamChunkInterceptResponse {
 	t.Helper()
 	req, err := json.Marshal(pluginapi.StreamChunkInterceptRequest{
-		StreamID:        streamID,
+		RequestID:       streamID,
 		SourceFormat:    sourceFormat,
 		ResponseHeaders: http.Header{"Content-Type": []string{"text/event-stream"}},
 		Body:            body,
@@ -3699,6 +3701,9 @@ func invokeStreamBodyWithID(t *testing.T, sourceFormat, streamID string, index i
 	if err := json.Unmarshal(raw, &env); err != nil {
 		t.Fatalf("unmarshal envelope: %v", err)
 	}
+	if !env.OK {
+		t.Fatalf("stream intercept failed: %+v", env.Error)
+	}
 	var response pluginapi.StreamChunkInterceptResponse
 	if err := json.Unmarshal(env.Result, &response); err != nil {
 		t.Fatalf("unmarshal response: %v", err)
@@ -3709,13 +3714,18 @@ func invokeStreamBodyWithID(t *testing.T, sourceFormat, streamID string, index i
 func initStreamWithID(t *testing.T, sourceFormat, streamID string, requestBody []byte) {
 	t.Helper()
 	req := mustJSONMarshal(t, pluginapi.StreamChunkInterceptRequest{
-		StreamID:     streamID,
+		RequestID:    streamID,
 		SourceFormat: sourceFormat,
 		RequestBody:  requestBody,
 		ChunkIndex:   pluginapi.StreamChunkHeaderInitIndex,
 	})
-	if _, err := handleMethod(pluginabi.MethodResponseInterceptStreamChunk, req); err != nil {
+	raw, err := handleMethod(pluginabi.MethodResponseInterceptStreamChunk, req)
+	if err != nil {
 		t.Fatalf("stream init: %v", err)
+	}
+	var env envelope
+	if err := json.Unmarshal(raw, &env); err != nil || !env.OK {
+		t.Fatalf("stream init failed: envelope=%+v err=%v", env, err)
 	}
 }
 
@@ -3743,7 +3753,7 @@ func TestStreamStatefulChatArgumentRestoration(t *testing.T) {
 	requestBody := []byte(`{"messages":[{"content":"` + token + `"}]}`)
 	streamID := "stateful-chat-argument"
 	initStreamWithID(t, formatOpenAI, streamID, requestBody)
-	t.Cleanup(func() { invokeStreamBodyWithID(t, formatOpenAI, streamID, pluginapi.StreamChunkEndIndex, nil) })
+	t.Cleanup(func() { completeStream(t, streamID) })
 	split := len(token) / 2
 
 	firstBody := openAIChatToolArgumentSSEBody(t, 0, 1, `{"value":"`+token[:split], nil)
@@ -3760,9 +3770,9 @@ func TestStreamStatefulChatArgumentRestoration(t *testing.T) {
 	finishBody := openAIChatToolArgumentSSEBody(t, 0, 1, "", "stop")
 	_ = invokeStreamBodyWithID(t, formatOpenAI, streamID, 2, finishBody)
 	assertNoArgumentState(t, streamID, "argument:openai:")
-	end := invokeStreamBodyWithID(t, formatOpenAI, streamID, pluginapi.StreamChunkEndIndex, nil)
-	if end.DropChunk || len(end.Body) != 0 || streamCarry.has(streamID) {
-		t.Fatalf("stateful end did not cleanly release state: response=%+v retained=%v", end, streamCarry.has(streamID))
+	end := completeStream(t, streamID)
+	if string(end) != "{}" || streamCarry.has(streamID) {
+		t.Fatalf("request completion did not cleanly release state: response=%s retained=%v", end, streamCarry.has(streamID))
 	}
 }
 
@@ -3775,7 +3785,7 @@ func TestStreamChatArgumentRestorationForNonzeroChoice(t *testing.T) {
 	requestBody := []byte(`{"messages":[{"content":"` + token + `"}]}`)
 	streamID := "nonzero-choice-chat-argument"
 	initStreamWithID(t, formatOpenAI, streamID, requestBody)
-	t.Cleanup(func() { invokeStreamBodyWithID(t, formatOpenAI, streamID, pluginapi.StreamChunkEndIndex, nil) })
+	t.Cleanup(func() { completeStream(t, streamID) })
 	split := len(token) / 2
 
 	firstBody := openAIChatToolArgumentSSEBody(t, 2, 3, `{"value":"`+token[:split], nil)
@@ -3802,7 +3812,7 @@ func TestToolArgumentRestoresAcrossReconfig(t *testing.T) {
 	requestBody := []byte(`{"messages":[{"content":"` + token + `"}]}`)
 	streamID := "tool-argument-hot-switch"
 	initStreamWithID(t, formatOpenAI, streamID, requestBody)
-	t.Cleanup(func() { invokeStreamBodyWithID(t, formatOpenAI, streamID, pluginapi.StreamChunkEndIndex, nil) })
+	t.Cleanup(func() { completeStream(t, streamID) })
 	split := len(token) / 2
 
 	firstBody := openAIChatToolArgumentSSEBody(t, 0, 0, `{"value":"`+token[:split], nil)
@@ -3889,9 +3899,9 @@ func TestArgumentEndWithoutProtocolTerminalCleansState(t *testing.T) {
 	if !streamCarry.has(streamID) {
 		t.Fatal("argument state was not retained before abnormal end")
 	}
-	end := invokeStreamBodyWithID(t, formatOpenAI, streamID, pluginapi.StreamChunkEndIndex, nil)
-	if end.DropChunk || len(end.Body) != 0 {
-		t.Fatalf("end callback attempted to deliver withheld bytes: %+v", end)
+	end := completeStream(t, streamID)
+	if string(end) != "{}" {
+		t.Fatalf("request completion attempted to deliver withheld bytes: %s", end)
 	}
 	if streamCarry.has(streamID) {
 		t.Fatal("abnormal end did not remove stream entry")
@@ -4019,12 +4029,12 @@ func TestArgumentProtocolsRemainOnePass(t *testing.T) {
 	}
 }
 
-// TestStreamStatefulRestoresByStreamID covers the streaming-performance fix: a
+// TestStreamRestoresByRequestID covers the streaming-performance fix: a
 // stateful stream caches its per-request token allowlist at the header-init call
-// (keyed by StreamID) so payload chunks that carry only StreamID and no
+// (keyed by RequestID) so payload chunks that carry only RequestID and no
 // RequestBody still restore tokens. This lets the host stop re-sending and the
 // plugin stop re-hashing/re-scanning the full request body on every chunk.
-func TestStreamStatefulRestoresByStreamID(t *testing.T) {
+func TestStreamRestoresByRequestID(t *testing.T) {
 	callRegister(t, pluginabi.MethodPluginRegister, "")
 	secret := "sk-streamid-secret-value"
 	token := makeToken("REDACTED", secret)
@@ -4034,7 +4044,7 @@ func TestStreamStatefulRestoresByStreamID(t *testing.T) {
 
 	// Header-init carries the heavy RequestBody once; subsequent chunks do not.
 	initReq, _ := json.Marshal(pluginapi.StreamChunkInterceptRequest{
-		StreamID:    streamID,
+		RequestID:   streamID,
 		ChunkIndex:  pluginapi.StreamChunkHeaderInitIndex,
 		RequestBody: requestBody,
 	})
@@ -4042,7 +4052,7 @@ func TestStreamStatefulRestoresByStreamID(t *testing.T) {
 		t.Fatalf("stream init error: %v", err)
 	}
 	t.Cleanup(func() {
-		invokeStreamBodyWithID(t, formatOpenAI, streamID, pluginapi.StreamChunkEndIndex, nil)
+		completeStream(t, streamID)
 		if streamCarry.has(streamID) {
 			t.Errorf("stream cleanup did not release state for %q", streamID)
 		}
@@ -4052,18 +4062,18 @@ func TestStreamStatefulRestoresByStreamID(t *testing.T) {
 	resp := invokeStreamBodyWithID(t, formatOpenAI, streamID, 0, chunk)
 	delivered := deliveredStreamBody(resp, chunk)
 	if !bytes.Contains(delivered, []byte(secret)) {
-		t.Fatalf("stateful stream chunk must restore the secret from StreamID-cached state; got %q", delivered)
+		t.Fatalf("stream chunk must restore the secret from RequestID-cached state; got %q", delivered)
 	}
 	if bytes.Contains(delivered, []byte(token)) {
 		t.Fatalf("delivered chunk still contains the token, restoration did not run: %q", delivered)
 	}
 }
 
-func TestStreamStatefulEndReleasesState(t *testing.T) {
+func TestStreamRequestCompletionReleasesState(t *testing.T) {
 	callRegister(t, pluginabi.MethodPluginRegister, "")
 	streamID := "stream-stateful-end"
 	initReq, _ := json.Marshal(pluginapi.StreamChunkInterceptRequest{
-		StreamID:    streamID,
+		RequestID:   streamID,
 		ChunkIndex:  pluginapi.StreamChunkHeaderInitIndex,
 		RequestBody: []byte(`{"messages":[]}`),
 	})
@@ -4074,13 +4084,7 @@ func TestStreamStatefulEndReleasesState(t *testing.T) {
 		t.Fatal("stream init did not retain state")
 	}
 
-	endReq, _ := json.Marshal(pluginapi.StreamChunkInterceptRequest{
-		StreamID:   streamID,
-		ChunkIndex: pluginapi.StreamChunkEndIndex,
-	})
-	if _, err := handleMethod(pluginabi.MethodResponseInterceptStreamChunk, endReq); err != nil {
-		t.Fatalf("stream end error: %v", err)
-	}
+	completeStream(t, streamID)
 	if streamCarry.has(streamID) {
 		t.Fatal("stream end did not release state")
 	}
@@ -4138,7 +4142,7 @@ func TestStreamStatefulRepeatedInitReplacesAbandonedAttempt(t *testing.T) {
 	}
 }
 
-func TestStreamStatefulEndIsIdempotentAndDropsRetainedSuffix(t *testing.T) {
+func TestStreamRequestCompletionIsIdempotentAndDropsRetainedSuffix(t *testing.T) {
 	callRegister(t, pluginabi.MethodPluginRegister, "")
 	streamID := "stream-stateful-repeated-end"
 	initStreamWithID(t, formatOpenAI, streamID, []byte(`{"messages":[]}`))
@@ -4147,9 +4151,9 @@ func TestStreamStatefulEndIsIdempotentAndDropsRetainedSuffix(t *testing.T) {
 	}
 
 	for i := 0; i < 2; i++ {
-		response := invokeStreamBodyWithID(t, formatOpenAI, streamID, pluginapi.StreamChunkEndIndex, nil)
-		if response.DropChunk || len(response.Body) != 0 {
-			t.Fatalf("end call %d emitted retained state: %+v", i+1, response)
+		response := completeStream(t, streamID)
+		if string(response) != "{}" {
+			t.Fatalf("completion call %d emitted retained state: %s", i+1, response)
 		}
 		if streamCarry.has(streamID) {
 			t.Fatalf("end call %d retained stream state", i+1)
@@ -4246,7 +4250,7 @@ func TestReconfigureOldLabelSplitStreamRestores(t *testing.T) {
 
 	half := len(token) / 2
 	firstReq, _ := json.Marshal(pluginapi.StreamChunkInterceptRequest{
-		StreamID:   streamID,
+		RequestID:  streamID,
 		Body:       []byte(token[:half]),
 		ChunkIndex: 0,
 	})
@@ -4267,7 +4271,7 @@ func TestReconfigureOldLabelSplitStreamRestores(t *testing.T) {
 	}
 
 	secondReq, _ := json.Marshal(pluginapi.StreamChunkInterceptRequest{
-		StreamID:   streamID,
+		RequestID:  streamID,
 		Body:       []byte(token[half:]),
 		ChunkIndex: 1,
 	})

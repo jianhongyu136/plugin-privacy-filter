@@ -611,20 +611,62 @@ func TestStreamStoreCleanupRemovesIdleState(t *testing.T) {
 	t.Fatal("idle stream state was not proactively removed")
 }
 
-func TestStreamStoreActiveStateSurvivesTTLUntilEnd(t *testing.T) {
-	store := newStreamStoreWithLimits(20*time.Millisecond, streamStoreMaxBytes)
+func TestStreamStoreExpiresAbandonedActiveState(t *testing.T) {
+	store := newStreamStoreWithLimits(time.Minute, streamStoreMaxBytes)
 	store.begin("active")
 	store.allowlist("active", func() map[string]struct{} {
 		return map[string]struct{}{"<REDACTED_0123456789abcdef>": {}}
 	})
-	time.Sleep(30 * time.Millisecond)
-
-	if !store.has("active") {
-		t.Fatal("active stream state was removed by idle TTL cleanup")
-	}
-	store.end("active")
+	store.mu.Lock()
+	now := time.Now()
+	store.entries["active"].touchedAt = now.Add(-2 * time.Minute)
+	store.purgeLocked(now)
+	store.mu.Unlock()
 	if store.has("active") {
-		t.Fatal("ended stream state was not released")
+		t.Fatal("request with no completion notification survived idle TTL cleanup")
+	}
+	if _, initialized := store.activeAllowlist("active"); initialized {
+		t.Fatal("expired request retained an initialized allowlist")
+	}
+}
+
+func TestStreamStoreCompletionMarkerRetainsNoPayloadAndExpires(t *testing.T) {
+	store := newStreamStoreWithLimits(time.Minute, streamStoreMaxBytes)
+	store.begin("completed")
+	store.allowlist("completed", func() map[string]struct{} {
+		return map[string]struct{}{"<REDACTED_0123456789abcdef>": {}}
+	})
+	store.setCarry("completed", []byte("withheld"))
+	store.end("completed")
+	if store.has("completed") || store.begin("completed") {
+		t.Fatal("completed request retained live state or accepted late initialization")
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	entry := store.entries["completed"]
+	if entry == nil || !entry.completed || entry.active || entry.hasAllow || entry.allowed != nil || entry.carry != nil || entry.content != nil || entry.arguments != nil || entry.argumentOverflow {
+		t.Fatalf("completion retained payload state: %+v", entry)
+	}
+	if store.totalBytes != len("completed") {
+		t.Fatalf("completion retained %d bytes, want only the request ID", store.totalBytes)
+	}
+	now := time.Now()
+	entry.touchedAt = now.Add(-2 * time.Minute)
+	store.purgeLocked(now)
+	if len(store.entries) != 0 || store.totalBytes != 0 {
+		t.Fatal("completion marker did not expire")
+	}
+}
+
+func TestStreamStoreCompletionMarkersStayBounded(t *testing.T) {
+	for _, budget := range []int{128, streamStoreMaxBytes} {
+		store := newStreamStoreWithLimits(time.Minute, budget)
+		for i := 0; i < streamCarryMaxEntries+10; i++ {
+			store.end("completed-" + itoa(i))
+		}
+		if len(store.entries) > streamCarryMaxEntries || store.totalBytes > budget {
+			t.Fatalf("unbounded completion markers: entries=%d bytes=%d budget=%d", len(store.entries), store.totalBytes, budget)
+		}
 	}
 }
 

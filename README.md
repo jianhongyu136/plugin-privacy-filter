@@ -49,10 +49,11 @@ flowchart LR
 
 The host loads the shared library and drives it over a small C ABI (`cliproxy_plugin_init` / `call` / `free_buffer` / `shutdown`). Every call carries a method name and a JSON request and returns a JSON envelope (`{ok, result, error}`). The methods the plugin implements are:
 
-Protocol compatibility uses two independent version numbers. The native C ABI remains `pluginabi.ABIVersion == 1`. Lifecycle JSON RPC requests require `schema_version >= 4`; a missing version, V1, V2, or V3 is rejected before configuration parsing or runtime mutation. Schema 4 is required for stateful stream-session negotiation, stable `StreamID` delivery, and init/end lifecycle callbacks. The plugin always advertises its implemented schema 4 contract, including when a later host schema version is received. Accepting that later lifecycle version does not claim support for unknown future schema features.
+Protocol compatibility uses two independent version numbers. The native C ABI remains `pluginabi.ABIVersion == 1`. Lifecycle JSON RPC requests require upstream CLIProxyAPI `schema_version >= 5`; missing versions and V1-V4 are rejected before configuration parsing or runtime mutation. Schema 5 omits request bodies and history from payload chunks. The plugin uses the host's model-execution `RequestID`, header initialization, and `request.complete`, not the private branch's `StreamID` or end-chunk extension. It always advertises its implemented schema 5 contract, even when a later host version is received; this does not claim support for unknown future features.
 
 - `plugin.register` / `plugin.reconfigure` — parse and validate the config, compile the active rule set, reconfigure the shared vault in place, and publish mode, rules, label, patterns, and vault together as one atomic runtime snapshot. Sharing the vault preserves in-flight mappings and late writes from handlers using an older snapshot.
 - `request.intercept_before` / `request.intercept_after` — redact the outbound request body.
+- `request.complete`: release streaming payload state for the completed `RequestID`, regardless of success, failure, rejection, or cancellation. Non-streaming completions require no stream cleanup.
 - `response.intercept_after` — restore a non-streaming response body.
 - `response.intercept_stream_chunk` — restore a streaming response chunk by chunk.
 - `plugin.shutdown` — stop cleanup workers and clear both the vault and streaming state, dropping the stores' retained references.
@@ -129,11 +130,11 @@ flowchart TB
 
 ```mermaid
 flowchart TB
-    chunk([Incoming chunk with<br/>required StreamID]) --> init{ChunkIndex?}
+    chunk([Incoming chunk with<br/>required RequestID]) --> init{ChunkIndex?}
     init -->|init == -1| reset[Reset reassembly<br/>buffer for this stream]
     reset --> done([Return empty response])
     init -->|payload >= 0| prepend[Prepend any withheld<br/>bytes from previous chunk]
-    init -->|end == -2| release[Release all state<br/>for this StreamID]
+    complete([request.complete]) --> release[Release payload state<br/>and retain a completion marker]
     release --> done
     prepend --> split{SSE event, even JSON-complete, still awaiting<br/>its blank separator, or token at chunk end?}
     split -->|yes| hold[Withhold the unfinished SSE event through<br/>its blank separator, or the token tail]
@@ -145,27 +146,36 @@ flowchart TB
     detok --> emit([Restored chunk → client])
 ```
 
-1. Every stream callback must carry a non-empty host-provided `StreamID`. On the init call (`ChunkIndex == -1`) the plugin resets any leftover reassembly state and builds the request allowlist from the heavy request fields. A repeated init for the same `StreamID` replaces the abandoned attempt's allowlist, raw carry, and semantic argument state. Payload callbacks (`ChunkIndex >= 0`) require a successful init and do not read or hash the request body. The end callback (`ChunkIndex == -2`) releases all retained state and is idempotent.
+1. Every stream callback must carry a non-empty host-provided `RequestID`, unique to one model execution rather than an inbound HTTP trace or conversation. On init (`ChunkIndex == -1`), the plugin resets reassembly state and builds the allowlist from the request body. A repeated init for the same unfinished request replaces an abandoned bootstrap attempt's allowlist, raw carry, and semantic argument state. Payload callbacks (`ChunkIndex >= 0`) require a successful init and neither read nor hash the request body. Completion is a separate `request.complete` method; negative chunk indexes other than `-1` are rejected.
 2. For each data chunk it prepends raw carry from the previous host chunk and uses the same vault-verified, 1,024-token per-request allowlist. Restoration always requires both membership in that allowlist and a live vault mapping.
 3. For responses whose Content-Type is `text/event-stream`, a JSON `data:` line can be split inside the `data:` prefix or before, inside, or after a token. This raw chunk-carry layer withholds the whole unfinished SSE event from its first field through the blank dispatch separator, even when its JSON line is already complete. Non-SSE streams never buffer a token-free `data:` prefix; all stream types retain bounded partial-token buffering. Original LF, CRLF, or CR framing is preserved.
 4. After raw chunk carry, protocol adapters reassemble possible token prefixes across semantic visible-text events for OpenAI Chat Completions, OpenAI Responses, Claude, and Gemini. Pending text is isolated by protocol and choice/item/block/candidate channel. Gemini streams may contain SSE-framed JSON events or complete bare JSON responses even while the Content-Type remains `text/event-stream`.
 5. OpenAI Chat standard function arguments, OpenAI Responses standard function-call argument deltas, and Claude `input_json_delta.partial_json` support cross-event placeholder restoration in independent tool-argument channels. The scanner tracks only constant lexical state plus a possible encoded-token suffix, never complete arguments. JSON string-content escaping preserves valid reconstructed JSON. OpenAI Responses custom-tool input is outside this channel support, while Gemini `functionCall.args` remains a structured object restored by the ordinary JSON walker.
-6. Normal Chat finish, Responses done/completed, and Claude block/message terminals flush a matching retained suffix before the terminal event and release that argument state. Client cancellation, a missing protocol terminal, an end callback, or hard memory eviction performs cleanup without response delivery; because the host ignores end-callback response bodies, at most one possible encoded-token suffix per active argument channel can be lost. End cleanup is idempotent and never emits retained state.
+6. Normal Chat finish, Responses done/completed, and Claude block/message terminals flush a matching retained suffix before the terminal event and release that argument state. `request.complete` cleanup is idempotent and never emits retained raw or semantic buffers. Cancellation, missing protocol terminals, idle expiry, or hard memory eviction can therefore lose withheld bytes rather than delivering a final flush.
 7. If a whole chunk is withheld by the raw carry layer, the plugin returns `DropChunk` so the host does not deliver a still-tokenized fragment.
 8. Raw withheld data is capped at 1 MiB per stream. An oversized unfinished event or over-limit semantic prefix is emitted unchanged rather than retained or restored unsafely.
 9. If restoration turns an entire stream chunk into zero bytes, the plugin returns `DropChunk` so the original placeholder is not delivered.
+10. The plugin serializes stream callbacks and completion for each `RequestID`, including a callback still running after host-side cancellation. Completion drops the allowlist and reassembly buffers but keeps a payload-free marker to reject late initialization. Markers expire after five minutes and share the bounded entry/byte budgets; capacity eviction can shorten this protection window.
+11. All stream state expires after five minutes without activity, even if `request.complete` was never delivered. A genuinely long-idle stream loses its allowlist and buffers, so later chunks remain unrestored unless the host initializes another attempt. This is a state-retention limit, not a network timeout.
 
 ### Principles
 
 - **Vault-backed token mappings.** A token is `<LABEL_ + HMAC-SHA256(key, original)[:16 hex] + >`. The key is 256 random bits drawn from a CSPRNG at process start; the plugin does not export it, and every restart generates a new key. The visible tag is 64 bits and deterministic for the same plaintext and process key; the full token also uses the current label. A candidate is used for idempotency or restoration only after an exact vault lookup.
 - **Request-derived restoration.** The vault is process-wide, while restoration is gated by the bounded, vault-verified allowlist derived from the request body sent upstream. This prevents arbitrary unknown placeholders in a response from being restored and bounds stream state. It is not tenant isolation: a live token acts as a bearer capability if another caller learns and reuses it.
 - **Fail closed on the way out, fail safe on the way back.** The request path rejects errors encountered during interception. The response path, by contrast, prefers to leave a token in place rather than risk emitting the wrong value.
-- **Atomic hot-reload.** Mode, rules, label, patterns, and vault are published together as one immutable snapshot behind an atomic pointer, so a request in flight during a reconfigure always sees a consistent state.
-- **Bounded, in-memory, ephemeral.** The vault is TTL- and size-bounded with LRU eviction and proactive expiry purging. Streaming state has a 4,096-entry limit, a 32 MiB tracked-payload budget, a five-minute TTL with proactive cleanup, a 1 MiB carry limit and 1,024 allowlisted tokens per stream. The plugin does not persist either store, and shutdown drops their retained references.
+- **Atomic configuration reload.** Within one loaded library, mode, rules, label, patterns, and vault are published together as one immutable snapshot behind an atomic pointer, so an in-flight request sees a consistent state during reconfigure. This does not transfer state between DLL/shared-library versions.
+- **Bounded, in-memory, ephemeral.** The vault is TTL- and size-bounded with LRU eviction and proactive expiry purging. Streaming state and completion markers share a 4,096-entry limit, a 32 MiB tracked-payload budget, and a five-minute idle TTL with proactive cleanup. Each stream has a 1 MiB carry limit and 1,024 allowlisted tokens. The plugin does not persist either store, and shutdown drops their retained references.
+
+### Main compatibility and upgrades
+
+- Use upstream CLIProxyAPI schema 5 or newer. The private branch's schema 4 stateful-session contract is no longer supported.
+- Drain in-flight requests before replacing the shared library, disabling the plugin, or changing the active interceptor chain. Main does not pin a stream to one plugin generation; a replacement cannot inherit the old vault, allowlist, or reassembly buffers. Use drained or rolling instance upgrades instead of replacing a DLL during active streams.
+- Rule/configuration reloads within the same loaded plugin still preserve the shared vault. They are distinct from library replacement.
+- Ensure this plugin receives header initialization. An earlier stream interceptor returning `DropChunk` during init can prevent that callback on main; arbitrary interceptor combinations are not guaranteed. Missing initialization leaves response chunks unchanged rather than restoring outside a request allowlist.
 
 ## Building
 
-Requires Go 1.26+ and a C toolchain (CGO). The plugin is built as a C shared library. The checked-in `go.mod` replaces `github.com/router-for-me/CLIProxyAPI/v7` with `../CLIProxyAPI`, so a source build also needs a compatible CLIProxyAPI checkout at that sibling path, or an updated replacement such as `go mod edit -replace=github.com/router-for-me/CLIProxyAPI/v7=/path/to/CLIProxyAPI`.
+Requires Go 1.26+ and a C toolchain (CGO). The plugin is built as a C shared library. `go.mod` pins the official `github.com/router-for-me/CLIProxyAPI/v7` SDK to `v7.2.153`, matching main commit `934fb7928c42a8dd0aeaf39a321bef6601b55eb6`. Builds and releases use that dependency directly; a sibling checkout or private `jhy` branch is not required. A local Go workspace can include a schema-5 CLIProxyAPI checkout when developing the SDK itself.
 
 ```bash
 # Linux x64
@@ -300,7 +310,7 @@ These are intentional tradeoffs, not bugs:
 - **Pattern-based detection.** Rules can produce false positives and false negatives. Broad rules such as email, phone number, JWT, card number, and IPv4 detection are default-off for this reason. Encoded, split, obfuscated, or unsupported credential formats may not match.
 - **JSON reformatting.** When a body is rewritten, it is decoded and re-encoded, so map key order and whitespace may differ from the upstream bytes (semantically equivalent). This only matters for byte-sensitive consumers such as body signing. Bodies with no rule matches pass through untouched.
 - **Non-string secret values.** A non-string secret value (e.g. `{"password": 123456}`) is restored as a JSON string (`"123456"`); the characters are preserved but the JSON kind changes.
-- **Streaming edge cases.** Schema 4's stable `StreamID` isolates concurrent streams. Client cancellation, a missing protocol terminal, an end callback, or hard memory eviction can discard the one possible encoded-token suffix retained for each active visible-text or supported argument channel; end callbacks clean state but cannot deliver a flush body.
+- **Streaming edge cases.** Model-execution `RequestID` values isolate concurrent streams. Cancellation, missing protocol terminals, five-minute idle expiry, or hard memory eviction can discard withheld raw or semantic bytes. Completion cleans state but cannot deliver a flush body. Library upgrades require draining requests; there is no cross-generation state pinning.
 - **Streaming semantic scope.** Cross-event restoration covers visible assistant text plus OpenAI Chat standard function arguments, OpenAI Responses standard function-call arguments, and Claude tool input JSON. It does not cover OpenAI Responses custom-tool input or reasoning fields. Gemini `functionCall.args` remains structured JSON restored event by event through the generic walker.
 - **Empty non-streaming restoration.** The host ABI uses an empty response `Body` to mean "no replacement," so it cannot represent restoring a response body that consists solely of a token mapped to the empty string. Streaming has an explicit `DropChunk` signal and handles the equivalent case safely.
 - **Content-region coverage.** Only recognized request formats and explicit runtime content regions are scanned. Headers, schemas, URLs, identifiers, media/file data, encrypted content, protocol metadata, and unvisited fields can carry matching plaintext upstream unchanged. Unsupported source formats are rejected, but provider schema drift can either trigger validation rejection or introduce an unvisited field that is preserved unscanned.

@@ -5,6 +5,7 @@ import (
 	"container/list"
 	"encoding/json"
 	"errors"
+	"hash/maphash"
 	"io"
 	"regexp"
 	"strings"
@@ -13,9 +14,7 @@ import (
 )
 
 const (
-	// streamCarryMaxEntries bounds the number of per-stream states. End markers
-	// normally release active state; the hard cap still bounds memory if markers
-	// are missed or concurrency is excessive.
+	// streamCarryMaxEntries bounds stream states and completion-only markers.
 	streamCarryMaxEntries = 4096
 	// streamCarryMaxBytes bounds withheld bytes per stream. A larger incomplete
 	// SSE line is emitted unchanged rather than retained and repeatedly copied.
@@ -28,9 +27,9 @@ const (
 	// stream. Requests beyond this limit remain safe: excess placeholders are
 	// left unrestored rather than growing persistent state or per-chunk work.
 	streamAllowlistMaxTokens = 1024
-	// streamCarryTTL bounds how long inactive state may live before it is
-	// considered abandoned and eligible for eviction. Active streams remain
-	// retained until their end callback unless a hard memory cap is reached.
+	// streamCarryTTL bounds idle request state even if request.complete is lost
+	// after plugin disable/replacement. Streams silent beyond it lose restoration
+	// state; this is not an upstream network timeout.
 	streamCarryTTL = 5 * time.Minute
 )
 
@@ -43,6 +42,7 @@ type streamEntry struct {
 	allowed          map[string]struct{}
 	hasAllow         bool
 	active           bool
+	completed        bool
 	carry            []byte
 	content          map[string]string
 	arguments        map[string]jsonArgumentState
@@ -52,11 +52,12 @@ type streamEntry struct {
 	bytes            int
 }
 
-// streamStore is a bounded map of per-stream state. Active state is retained
-// until an end callback, while inactive state is TTL-evicted. Hard entry
-// and byte caps keep memory bounded if lifecycle markers are missed.
+// streamStore holds bounded request state and payload-free completion markers.
+// request.complete releases payloads; idle TTL and hard caps bound both kinds.
 type streamStore struct {
 	mu             sync.Mutex
+	callLocks      [256]sync.Mutex
+	callHash       maphash.Seed
 	entries        map[string]*streamEntry
 	lru            *list.List
 	totalBytes     int
@@ -69,16 +70,24 @@ type streamStore struct {
 
 func newStreamStore() *streamStore {
 	return newStreamStoreWithLimits(streamCarryTTL, streamStoreMaxBytes)
-
 }
 
 func newStreamStoreWithLimits(ttl time.Duration, maxBytes int) *streamStore {
 	return &streamStore{
+		callHash: maphash.MakeSeed(),
 		entries:  make(map[string]*streamEntry),
 		lru:      list.New(),
 		ttl:      ttl,
 		maxBytes: maxBytes,
 	}
+}
+
+// Fixed lock stripes serialize callbacks for a RequestID without retaining an
+// unbounded map of locks when completion arrives before initialization.
+func (s *streamStore) lockRequest(key string) func() {
+	lock := &s.callLocks[maphash.String(s.callHash, key)%uint64(len(s.callLocks))]
+	lock.Lock()
+	return lock.Unlock
 }
 
 // allowlist returns the cached per-request token allowlist for key, computing
@@ -106,7 +115,7 @@ func (s *streamStore) allowlist(key string, build func() map[string]struct{}) ma
 	now = time.Now()
 	s.purgeLocked(now)
 	e := s.getOrCreateLocked(key, now)
-	// Stateful lifecycle calls are serialized per StreamID. Preserve the active
+	// Plugin callbacks are serialized per RequestID. Preserve the active
 	// marker if hard-cap pressure evicted the entry during the unlocked scan.
 	e.active = e.active || active
 	if !e.hasAllow {
@@ -123,7 +132,7 @@ func (s *streamStore) allowlist(key string, build func() map[string]struct{}) ma
 	return e.allowed
 }
 
-// activeAllowlist returns state initialized by a schema-v4 header callback.
+// activeAllowlist returns state initialized by a schema-v5 header callback.
 // Payload callbacks never rebuild it because heavy request fields are init-only.
 func (s *streamStore) activeAllowlist(key string) (map[string]struct{}, bool) {
 	s.mu.Lock()
@@ -131,7 +140,7 @@ func (s *streamStore) activeAllowlist(key string) (map[string]struct{}, bool) {
 	now := time.Now()
 	s.purgeLocked(now)
 	e, ok := s.entries[key]
-	if !ok || !e.active {
+	if !ok || !e.active || e.completed {
 		return nil, false
 	}
 	s.touchLocked(e, now)
@@ -185,24 +194,43 @@ func (s *streamStore) reset(key string) {
 	}
 }
 
-// begin replaces any stale state for key and marks the stream active so normal
-// idle cleanup and capacity pressure prefer abandoned or completed entries.
-func (s *streamStore) begin(key string) {
+// begin resets a bootstrap attempt unless request.complete already arrived.
+func (s *streamStore) begin(key string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := time.Now()
+	s.purgeLocked(now)
 	if e, ok := s.entries[key]; ok {
+		if e.completed {
+			return false
+		}
 		s.removeLocked(e)
 	}
 	e := s.getOrCreateLocked(key, now)
 	e.active = true
 	s.resizeEntryLocked(e)
 	s.touchLocked(e, now)
+	return true
 }
 
-// end releases all state retained for a completed stream.
+// end drops payload state and retains only a bounded, TTL-expiring completion
+// marker so a delayed callback cannot immediately recreate the request.
 func (s *streamStore) end(key string) {
-	s.reset(key)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	s.purgeLocked(now)
+	if e, ok := s.entries[key]; ok {
+		s.removeLocked(e)
+	}
+	e := s.getOrCreateLocked(key, now)
+	e.completed = true
+	s.resizeEntryLocked(e)
+	if e.bytes > s.maxBytes {
+		s.removeLocked(e)
+		return
+	}
+	s.evictBytesLocked(e)
 }
 
 func (s *streamStore) clear() {
@@ -265,13 +293,13 @@ func (s *streamStore) cleanupLoop(stop <-chan struct{}, done chan<- struct{}, tt
 	}
 }
 
-// has reports whether any state exists for key without consuming it.
+// has reports retained stream state, excluding completion-only markers.
 func (s *streamStore) has(key string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.purgeLocked(time.Now())
-	_, ok := s.entries[key]
-	return ok
+	e, ok := s.entries[key]
+	return ok && !e.completed
 }
 
 // getOrCreateLocked returns the entry for key, creating it (after enforcing the
@@ -293,10 +321,6 @@ func (s *streamStore) purgeLocked(now time.Time) {
 	for element := s.lru.Back(); element != nil; {
 		e := element.Value.(*streamEntry)
 		previous := element.Prev()
-		if e.active {
-			element = previous
-			continue
-		}
 		if now.Sub(e.touchedAt) <= s.ttl {
 			return
 		}
@@ -379,7 +403,7 @@ func (s *streamStore) removeLocked(e *streamEntry) {
 	s.totalBytes -= e.bytes
 }
 
-// streamCarry holds per-stream state keyed by the schema-v4 StreamID.
+// streamCarry holds per-stream state keyed by main's model-execution RequestID.
 var streamCarry = newStreamStore()
 
 func init() {
