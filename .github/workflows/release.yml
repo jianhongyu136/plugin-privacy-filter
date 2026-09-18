@@ -35,7 +35,8 @@ jobs:
           GOARCH: amd64
         run: |
           mkdir -p dist
-          go build -trimpath -ldflags="-s -w" -buildmode=c-shared -o dist/privacy-filter-linux-amd64.so .
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then VERSION="${GITHUB_REF_NAME#v}"; else VERSION=dev; fi
+          go build -trimpath -ldflags="-s -w -X main.pluginVersion=${VERSION}" -buildmode=c-shared -o dist/privacy-filter-linux-amd64.so .
 
       - uses: actions/upload-artifact@v4
         with:
@@ -75,7 +76,8 @@ jobs:
           CC: gcc
         run: |
           mkdir -p dist
-          go build -trimpath -ldflags="-s -w" -buildmode=c-shared -o dist/privacy-filter-windows-amd64.dll .
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then VERSION="${GITHUB_REF_NAME#v}"; else VERSION=dev; fi
+          go build -trimpath -ldflags="-s -w -X main.pluginVersion=${VERSION}" -buildmode=c-shared -o dist/privacy-filter-windows-amd64.dll .
 
       - uses: actions/upload-artifact@v4
         with:

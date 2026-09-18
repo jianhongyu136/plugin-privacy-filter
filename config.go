@@ -21,6 +21,7 @@ type pluginConfig struct {
 	Enabled              bool              `yaml:"enabled"`
 	Priority             int               `yaml:"priority"`
 	Mode                 string            `yaml:"mode"`
+	UnknownFieldBehavior string            `yaml:"unknown_field_behavior"`
 	BlockReturnOriginal  bool              `yaml:"block_return_original"`
 	TokenLabel           string            `yaml:"token_label"`
 	VaultTTLSeconds      int               `yaml:"vault_ttl_seconds"`
@@ -55,19 +56,20 @@ func (e *unsupportedSchemaVersionError) Error() string {
 }
 
 // runtimeState is the immutable set of runtime values that must change together
-// on (re)configure: the compiled rules, the token label, the compiled token
-// pattern for that label, the all-label restoration pattern, and the vault that
-// holds token->secret mappings. Publishing them as one atomic snapshot ensures
-// a request never observes a mismatched rules/label/vault pairing. Patterns are
-// compiled once on reconfigure rather than on request and response hot paths.
+// on (re)configure: the compiled rules, unknown-field behavior, token label,
+// compiled token patterns, and the vault that holds token->secret mappings.
+// Publishing them as one atomic snapshot ensures a request never observes a
+// mismatched rules/configuration/label/vault pairing. Patterns are compiled
+// once on reconfigure rather than on request and response hot paths.
 type runtimeState struct {
-	rules               ruleSet
-	mode                string
-	blockReturnOriginal bool
-	label               string
-	tokenRe             *regexp.Regexp
-	restoreTokenRe      *regexp.Regexp
-	vault               *vault
+	rules                ruleSet
+	mode                 string
+	unknownFieldBehavior string
+	blockReturnOriginal  bool
+	label                string
+	tokenRe              *regexp.Regexp
+	restoreTokenRe       *regexp.Regexp
+	vault                *vault
 }
 
 // activeState holds the current *runtimeState. It is swapped atomically so
@@ -79,17 +81,21 @@ var tokenLabelPattern = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_-]{0,63}$`)
 const (
 	modeFilter = "filter"
 	modeBlock  = "block"
+
+	unknownFieldBehaviorBlock  = "block"
+	unknownFieldBehaviorIgnore = "ignore"
 )
 
 // defaultConfig returns a config populated with the documented defaults.
 func defaultConfig() pluginConfig {
 	return pluginConfig{
-		Mode:                modeFilter,
-		BlockReturnOriginal: false,
-		TokenLabel:          "REDACTED",
-		VaultTTLSeconds:     3600,
-		VaultMaxEntries:     1000,
-		BuiltinRulesEnabled: true,
+		Mode:                 modeFilter,
+		UnknownFieldBehavior: unknownFieldBehaviorBlock,
+		BlockReturnOriginal:  false,
+		TokenLabel:           "REDACTED",
+		VaultTTLSeconds:      3600,
+		VaultMaxEntries:      1000,
+		BuiltinRulesEnabled:  true,
 	}
 }
 
@@ -128,6 +134,9 @@ func parseLifecycleConfig(request []byte) (pluginConfig, error) {
 func applyConfig(cfg pluginConfig) error {
 	if cfg.Mode != modeFilter && cfg.Mode != modeBlock {
 		return errors.New("mode must be filter or block")
+	}
+	if cfg.UnknownFieldBehavior != unknownFieldBehaviorBlock && cfg.UnknownFieldBehavior != unknownFieldBehaviorIgnore {
+		return errors.New("unknown_field_behavior must be block or ignore")
 	}
 	if !tokenLabelPattern.MatchString(cfg.TokenLabel) {
 		return errors.New("token_label must match [A-Za-z][A-Za-z0-9_-]{0,63}")
@@ -168,13 +177,14 @@ func applyConfig(cfg pluginConfig) error {
 	streamCarry.startCleanup()
 
 	activeState.Store(&runtimeState{
-		rules:               rules,
-		mode:                cfg.Mode,
-		blockReturnOriginal: cfg.BlockReturnOriginal,
-		label:               cfg.TokenLabel,
-		tokenRe:             tokenPattern(cfg.TokenLabel),
-		restoreTokenRe:      restoreTokenPattern(),
-		vault:               v,
+		rules:                rules,
+		mode:                 cfg.Mode,
+		unknownFieldBehavior: cfg.UnknownFieldBehavior,
+		blockReturnOriginal:  cfg.BlockReturnOriginal,
+		label:                cfg.TokenLabel,
+		tokenRe:              tokenPattern(cfg.TokenLabel),
+		restoreTokenRe:       restoreTokenPattern(),
+		vault:                v,
 	})
 	return nil
 }
@@ -199,6 +209,7 @@ func activeRuleSet() (ruleSet, string) {
 func configFields() []pluginapi.ConfigField {
 	return []pluginapi.ConfigField{
 		{Name: "mode", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{modeFilter, modeBlock}, Description: "Request handling mode: filter replaces privacy values; block rejects with redacted context unless block_return_original is enabled."},
+		{Name: "unknown_field_behavior", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{unknownFieldBehaviorBlock, unknownFieldBehaviorIgnore}, Description: "How to handle unknown members in explicitly validated request objects: block rejects; ignore forwards the unknown member unchanged."},
 		{Name: "block_return_original", Type: pluginapi.ConfigFieldTypeBoolean, Description: "In block mode, include the matched original value in the rejection reason, bounded to 160 Unicode characters."},
 		{Name: "token_label", Type: pluginapi.ConfigFieldTypeString, Description: "Label inside <LABEL_hash>; must match [A-Za-z][A-Za-z0-9_-]{0,63}."},
 		{Name: "vault_ttl_seconds", Type: pluginapi.ConfigFieldTypeInteger, Description: "How long a token->value mapping is retained for restore."},

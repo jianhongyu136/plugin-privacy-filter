@@ -21,8 +21,9 @@ type scanMatch struct {
 
 // scanResult is the outcome of scanning a request body.
 type scanResult struct {
-	Body    []byte
-	Matches []scanMatch
+	Body          []byte
+	Matches       []scanMatch
+	UnknownFields []unknownField
 }
 
 // redactFunc returns the replacement token for an original secret and is
@@ -39,12 +40,15 @@ type tokenMatcher interface {
 }
 
 type scanner struct {
-	rules          ruleSet
-	tokenRe        tokenMatcher
-	redact         redactFunc
-	stopAfterFirst bool
-	returnOriginal bool
-	matches        []scanMatch
+	rules                ruleSet
+	tokenRe              tokenMatcher
+	redact               redactFunc
+	stopAfterFirst       bool
+	returnOriginal       bool
+	unknownFieldBehavior string
+	recordUnknownFields  bool
+	unknownFields        []unknownField
+	matches              []scanMatch
 }
 
 type blockScanStopped struct{}

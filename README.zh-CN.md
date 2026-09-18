@@ -17,9 +17,9 @@
 - **仅扫描内容。** 规则只在已识别请求格式的明确内容区域内运行。工具/函数 JSON schema、模型名、路由/采样参数、请求头、媒体、标识符、URL、加密内容以及其他不透明或未访问字段都不会被扫描。这能保护协议结构，但这些区域内的匹配明文不会被过滤。
 - **带密钥的 token 标识符。** token 使用进程启动时由 CSPRNG 生成的 256 位随机密钥执行 HMAC-SHA256，但只公开 16 位十六进制字符，即 64 位标签。仅凭标签无法推导明文；幂等处理和还原还要求 vault 中存在精确且未过期的映射。在扫描区域内，没有此类映射的 token 形状文本仍按普通文本扫描。
 - **由请求导出的还原范围。** 还原受一份从脱敏后请求体构建的白名单约束。只有在 vault 中存在精确且未过期映射的 token 候选才会进入白名单，并且每个请求/流最多保留 1024 个 token。这能限制还原工作并把未知 token 形状输入排除在还原范围外，但不会把已知的有效 token 绑定到其来源请求或租户。
-- **请求处理失败即拒绝。** 请求拦截器 panic、hook 载荷格式错误、不支持的源格式、不是严格单一 JSON 对象的请求体，以及未通过明确校验的已识别运行时结构都会导致拒绝。服务商访问器会在实施校验的位置拒绝未知成员和类型；这些校验之外的顶层字段及不透明嵌套字段可能保持未扫描状态。
+- **请求处理失败即拒绝。** 请求拦截器 panic、hook 载荷格式错误、不支持的源格式、不是严格单一 JSON 对象的请求体，以及未通过明确校验的已识别运行时结构都会导致拒绝。服务商访问器默认拒绝实施校验位置的未知成员和类型；配置 `unknown_field_behavior: ignore` 后，未知成员会原样转发。这些校验之外的顶层字段及不透明嵌套字段可能保持未扫描状态。
 - **内存 vault。** 插件不会主动把 token 映射持久化到磁盘。TTL/LRU 上限限制其存活时间和数量；清空 vault 会移除其引用，但无法保证仍可能存在于 Go 堆或操作系统内存中的副本被清零。
-- **安全的拦截诊断。** 拦截原因只报告首个发现：固定规则元数据、把请求动态键替换为 `.*` 的结构路径，以及用 JSON 引用的确定性替换 token；不会包含请求中的前后文。命中明文绝不会进入拒绝原因或写入 vault。
+- **拦截诊断。** 阻断原因仍只报告安全的结构元数据，不包含请求值。未知字段告警日志会按要求直接记录字段名、路径和原始 JSON 值；相同字段在一分钟内重复出现时会抑制日志，下一次输出会附带被抑制次数。
 
 ## 处理流程
 
@@ -178,14 +178,17 @@ flowchart TB
 需要 Go 1.26+ 和 C 工具链（CGO）。插件被构建为 C 共享库。`go.mod` 固定依赖官方 `github.com/router-for-me/CLIProxyAPI/v7` SDK 的 `v7.2.153`，对应主线提交 `934fb7928c42a8dd0aeaf39a321bef6601b55eb6`。本地构建和发布直接使用该依赖，不再要求相邻 checkout 或私有 `jhy` 分支。开发 SDK 本身时，可以用本地 Go workspace 引入支持 schema 5 的 CLIProxyAPI checkout。
 
 ```bash
+# 发布构建会从 v* Git 标签注入版本号；本地构建可以使用 dev。
+VERSION=dev
+
 # Linux x64
 CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
-  go build -trimpath -ldflags="-s -w" -buildmode=c-shared \
+  go build -trimpath -ldflags="-s -w -X main.pluginVersion=${VERSION}" -buildmode=c-shared \
   -o dist/privacy-filter-linux-amd64.so .
 
 # Windows x64（需 mingw-w64 gcc 工具链）
 CGO_ENABLED=1 GOOS=windows GOARCH=amd64 CC=gcc \
-  go build -trimpath -ldflags="-s -w" -buildmode=c-shared \
+  go build -trimpath -ldflags="-s -w -X main.pluginVersion=${VERSION}" -buildmode=c-shared \
   -o dist/privacy-filter-windows-amd64.dll .
 ```
 
@@ -200,6 +203,7 @@ CGO_ENABLED=1 GOOS=windows GOARCH=amd64 CC=gcc \
 | `enabled` | bool | `false` | 启用插件。 |
 | `priority` | int | `0` | 相对其他插件的拦截器排序。 |
 | `mode` | string | `filter` | `filter` 改写请求并还原响应；`block` 在完整结构校验后于规则首次命中时早停，并返回经过净化的元数据、路径和 token 后拒绝。值必须是精确的小写形式。 |
+| `unknown_field_behavior` | string | `block` | 明确校验的请求对象遇到未知成员时的处理方式。`block` 阻断请求；`ignore` 原样保留该成员并继续扫描已知内容。值必须是精确的小写形式。 |
 | `token_label` | string | `REDACTED` | `<LABEL_hash>` 中的标签；必须匹配 `[A-Za-z][A-Za-z0-9_-]{0,63}`。 |
 | `vault_ttl_seconds` | 正整数 | `3600` | `token -> 值` 映射保留多久以供还原；必须能由 Go 的 `time.Duration` 表示。 |
 | `vault_max_entries` | 正整数 | `1000` | 内存中保留的映射数量上限。 |
@@ -218,7 +222,8 @@ plugins:
   configs:
     privacy-filter:
       enabled: true
-      mode: filter
+       mode: filter
+       unknown_field_behavior: block
       token_label: REDACTED
       vault_ttl_seconds: 3600
       vault_max_entries: 1000
@@ -251,7 +256,7 @@ plugins:
 插件根据请求的源格式分派，且只在内容区域内应用规则：
 
 - **扫描** —— `openai`（消息内容、拒绝/推理文本，以及新旧函数或 custom tool 的运行时输入）、`openai-response`（已识别消息/instructions、电脑输入、shell、补丁、MCP、程序、代码解释器、搜索和运行时工具数据）、`claude`（已识别文本/文档/system 块与运行时/服务端工具结果）、`gemini`（已知 content part 文本/代码、新旧函数/工具调用与响应数据，以及 system instruction）、`openai-image` 与 `openai-video`（仅顶层 prompt）。`filter` 模式对命中内容脱敏；`block` 模式在首个命中时拒绝请求并停止后续规则扫描。各服务商专用访问器不会把工具 schema、模型名、URL、Base64/文件数据、MIME/类型元数据、加密内容、Gemini `inlineData.data` 和采样参数送入扫描器。
-- **拒绝（失败即拒绝）** —— 不支持的源格式、不是严格单一 JSON 对象的请求体、格式错误的必需内容，以及明确校验的运行时内容对象中不支持的成员或类型。插件通过宿主终止请求并返回 HTTP 403 JSON 错误响应。插件不会校验所有顶层协议字段，也不会校验每个不透明嵌套对象的所有成员。
+- **拒绝（失败即拒绝）** —— 不支持的源格式、不是严格单一 JSON 对象的请求体、格式错误的必需内容，以及明确校验的运行时内容对象中不支持的类型。除非配置 `unknown_field_behavior: ignore`，否则明确校验位置的不支持成员也会阻断；忽略时该成员原样转发。插件通过宿主终止被拒绝的请求并返回 HTTP 403 JSON 错误响应。插件不会校验所有顶层协议字段，也不会校验每个不透明嵌套对象的所有成员。
 
 ### 内置字段规则（默认全部开启）
 

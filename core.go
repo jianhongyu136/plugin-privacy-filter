@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 	"unicode"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
@@ -139,6 +141,11 @@ type registration struct {
 	Capabilities  registrationCapability `json:"capabilities"`
 }
 
+// pluginVersion is injected by release builds from the Git tag. Local builds
+// deliberately identify themselves as dev rather than pretending to be a
+// released version.
+var pluginVersion = "dev"
+
 // registrationCapability mirrors the host rpcCapabilities JSON names.
 type registrationCapability struct {
 	RequestInterceptor     bool `json:"request_interceptor"`
@@ -152,7 +159,7 @@ func pluginRegistration() registration {
 		SchemaVersion: pluginSchemaVersion,
 		Metadata: pluginapi.Metadata{
 			Name:             "Privacy Filter",
-			Version:          "0.0.4",
+			Version:          pluginVersion,
 			Author:           "jhy",
 			GitHubRepository: "https://github.com/jianhongyu136/plugin-privacy-filter",
 			ConfigFields:     configFields(),
@@ -209,18 +216,24 @@ func handleRequestIntercept(request []byte) (out []byte, err error) {
 	var handled bool
 	var scanErr *contentScanError
 	if st.mode == modeBlock {
-		result, handled, scanErr = scanRequestContentForBlock(req.Body, req.SourceFormat, st.rules, requestTokens, redact, st.blockReturnOriginal)
+		result, handled, scanErr = scanRequestContentWithUnknownFieldBehavior(req.Body, req.SourceFormat, st.rules, requestTokens, redact, true, st.blockReturnOriginal, st.unknownFieldBehavior)
 	} else {
-		result, handled, scanErr = scanRequestContent(req.Body, req.SourceFormat, st.rules, requestTokens, redact)
+		result, handled, scanErr = scanRequestContentWithUnknownFieldBehavior(req.Body, req.SourceFormat, st.rules, requestTokens, redact, false, false, st.unknownFieldBehavior)
 	}
 	if scanErr != nil {
+		logUnknownFields("request", req.SourceFormat, result.UnknownFields, st.unknownFieldBehavior)
+		logUnknownFields("request", req.SourceFormat, unknownFieldsFromScanError(scanErr), st.unknownFieldBehavior)
+		if scanErr.HasUnsupportedValue {
+			msg := scanErr.Detail
+			return okEnvelope(terminateRequest("privacy-filter could not scan request content at " + scanErr.Path + ": " + msg))
+		}
 		fields := logrus.Fields{
 			"stage":         "request",
 			"source_format": req.SourceFormat,
 			"path":          scanErr.Path,
 			"error":         scanErr.Detail,
 		}
-		if scanErr.HasUnsupportedContent {
+		if scanErr.HasUnsupportedContent && !scanErr.HasUnsupportedValue {
 			fields["unsupported_content"] = sanitizeUnsupportedContent(scanErr.UnsupportedContent)
 		}
 		logrus.WithFields(fields).Warn("privacy-filter rejected unscannable request content")
@@ -230,6 +243,7 @@ func handleRequestIntercept(request []byte) (out []byte, err error) {
 		}
 		return okEnvelope(terminateRequest("privacy-filter could not scan request content at " + scanErr.Path + ": " + msg))
 	}
+	logUnknownFields("request", req.SourceFormat, result.UnknownFields, st.unknownFieldBehavior)
 	if !handled {
 		// A recognized format whose body could not be parsed into its content
 		// regions: reject rather than forward a body we could not scan.
@@ -378,6 +392,97 @@ func handleStreamChunkIntercept(request []byte) ([]byte, error) {
 const scanLogMaxPaths = 8
 
 const unsupportedContentLogMaxRunes = 160
+
+const unknownFieldLogSuppression = time.Minute
+
+const unknownFieldLogMaxEntries = 4096
+
+type unknownFieldLogKey struct {
+	stage        string
+	sourceFormat string
+	behavior     string
+	path         string
+	name         string
+}
+
+type unknownFieldLogState struct {
+	lastLogged time.Time
+	suppressed int
+}
+
+var unknownFieldLogs = struct {
+	sync.Mutex
+	entries map[unknownFieldLogKey]unknownFieldLogState
+}{entries: make(map[unknownFieldLogKey]unknownFieldLogState)}
+
+func unknownFieldsFromScanError(scanErr *contentScanError) []unknownField {
+	if scanErr == nil || !scanErr.HasUnsupportedValue {
+		return nil
+	}
+	return []unknownField{{Path: scanErr.Path, Name: scanErr.UnsupportedContent, Value: scanErr.UnsupportedValue}}
+}
+
+func logUnknownFields(stage, sourceFormat string, fields []unknownField, behavior string) {
+	for _, field := range fields {
+		key := unknownFieldLogKey{stage: stage, sourceFormat: sourceFormat, behavior: behavior, path: field.Path, name: field.Name}
+		now := time.Now()
+
+		unknownFieldLogs.Lock()
+		state := unknownFieldLogs.entries[key]
+		if !state.lastLogged.IsZero() && now.Sub(state.lastLogged) < unknownFieldLogSuppression {
+			state.suppressed++
+			unknownFieldLogs.entries[key] = state
+			unknownFieldLogs.Unlock()
+			continue
+		}
+		if _, exists := unknownFieldLogs.entries[key]; !exists && len(unknownFieldLogs.entries) >= unknownFieldLogMaxEntries {
+			var oldestKey unknownFieldLogKey
+			var oldest time.Time
+			for existingKey, existingState := range unknownFieldLogs.entries {
+				if oldest.IsZero() || existingState.lastLogged.Before(oldest) {
+					oldestKey = existingKey
+					oldest = existingState.lastLogged
+				}
+			}
+			delete(unknownFieldLogs.entries, oldestKey)
+		}
+		unknownFieldLogs.entries[key] = unknownFieldLogState{lastLogged: now}
+		unknownFieldLogs.Unlock()
+
+		logFields := logrus.Fields{
+			"stage":                  stage,
+			"source_format":          sourceFormat,
+			"unknown_field_behavior": behavior,
+			"unknown_field":          field.Name,
+			"unknown_field_path":     joinMemberPath(field.Path, field.Name),
+			"unknown_field_value":    jsonValueForLog(field.Value),
+		}
+		if state.suppressed > 0 {
+			logFields["suppressed_repeats"] = state.suppressed
+		}
+		logrus.WithFields(logFields).Warn("privacy-filter encountered unknown request field")
+	}
+}
+
+func joinMemberPath(path, name string) string {
+	if path == "" {
+		return name
+	}
+	if name == "" {
+		return path
+	}
+	return path + "." + name
+}
+
+func jsonValueForLog(value any) string {
+	var raw bytes.Buffer
+	encoder := json.NewEncoder(&raw)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(value); err != nil {
+		return fmt.Sprintf("%v", value)
+	}
+	return strings.TrimSuffix(raw.String(), "\n")
+}
 
 func sanitizeUnsupportedContent(value string) string {
 	runes := make([]rune, 0, unsupportedContentLogMaxRunes)

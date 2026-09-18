@@ -17,9 +17,9 @@ The plugin runs as a native C shared library loaded by the host over its plugin 
 - **Content-only scanning.** Rules run only over explicit content regions of a recognized request format. Tool/function JSON schemas, model names, routing/sampling parameters, headers, media, identifiers, URLs, encrypted content, and other opaque or unvisited fields are not scanned. This protects protocol structure but means matching plaintext in those regions is not filtered.
 - **Keyed token identifiers.** Tokens use HMAC-SHA256 with a 256-bit random process key, but expose only a 16-hex-character (64-bit) tag. The tag alone does not reveal the plaintext; idempotency and restoration additionally require an exact, unexpired vault mapping. Inside a scanned region, token-shaped request text without such a mapping is scanned as ordinary text.
 - **Request-derived restoration.** Restoration is gated by an allowlist built from the redacted request body. Only token candidates with an exact, unexpired vault mapping enter it, and at most 1,024 tokens are retained per request/stream. This bounds restoration work and excludes unknown token-shaped input from restoration, but it does not bind a known live token to its originating request or tenant.
-- **Fail-closed request handling.** The plugin rejects request-interceptor panics, malformed hook payloads, unsupported source formats, bodies that are not exactly one JSON object, and recognized runtime structures that fail explicit validation. Unknown members and types are rejected where a provider visitor validates them; top-level and opaque nested fields outside those validators can remain unscanned.
+- **Fail-closed request handling.** The plugin rejects request-interceptor panics, malformed hook payloads, unsupported source formats, bodies that are not exactly one JSON object, and recognized runtime structures that fail explicit validation. Unknown members and types are rejected where a provider visitor validates them by default; `unknown_field_behavior: ignore` can forward unknown members unchanged. Top-level and opaque nested fields outside those validators can remain unscanned.
 - **In-memory vault.** The plugin does not persist token mappings to disk. TTL/LRU bounds limit their lifetime and count; clearing the vault removes its references but does not guarantee zeroing copies that may remain in the Go heap or operating-system memory.
-- **Safe block diagnostics.** Block reasons report only the first finding: fixed rule metadata, a schema path with request-controlled keys replaced by `.*`, and the JSON-quoted deterministic replacement token. They do not include surrounding request text. The matched plaintext is never included in the reason or stored in the vault.
+- **Diagnostics.** Block reasons remain sanitized and do not include request values. Unknown-field warning logs include the full field name, path, and original JSON value as requested; repeated identical fields are suppressed for one minute and the next emitted log reports the suppressed count.
 
 ## Processing flow
 
@@ -178,14 +178,17 @@ flowchart TB
 Requires Go 1.26+ and a C toolchain (CGO). The plugin is built as a C shared library. `go.mod` pins the official `github.com/router-for-me/CLIProxyAPI/v7` SDK to `v7.2.153`, matching main commit `934fb7928c42a8dd0aeaf39a321bef6601b55eb6`. Builds and releases use that dependency directly; a sibling checkout or private `jhy` branch is not required. A local Go workspace can include a schema-5 CLIProxyAPI checkout when developing the SDK itself.
 
 ```bash
+# Release builds inject the version from the v* Git tag; local builds can use dev.
+VERSION=dev
+
 # Linux x64
 CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
-  go build -trimpath -ldflags="-s -w" -buildmode=c-shared \
+  go build -trimpath -ldflags="-s -w -X main.pluginVersion=${VERSION}" -buildmode=c-shared \
   -o dist/privacy-filter-linux-amd64.so .
 
 # Windows x64 (mingw-w64 gcc toolchain required)
 CGO_ENABLED=1 GOOS=windows GOARCH=amd64 CC=gcc \
-  go build -trimpath -ldflags="-s -w" -buildmode=c-shared \
+  go build -trimpath -ldflags="-s -w -X main.pluginVersion=${VERSION}" -buildmode=c-shared \
   -o dist/privacy-filter-windows-amd64.dll .
 ```
 
@@ -200,6 +203,7 @@ Configuration lives under the `privacy-filter` plugin subtree in the host config
 | `enabled` | bool | `false` | Enable the plugin. |
 | `priority` | int | `0` | Interceptor ordering relative to other plugins. |
 | `mode` | string | `filter` | `filter` rewrites requests and restores responses; after full structural validation, `block` stops rule scanning at the first match and rejects with sanitized metadata, path, and token. Values are exact lowercase. |
+| `unknown_field_behavior` | string | `block` | Handling for unknown members in explicitly validated request objects. `block` rejects the request; `ignore` leaves the member unchanged and continues scanning known content. Values are exact lowercase. |
 | `token_label` | string | `REDACTED` | Label inside `<LABEL_hash>`; must match `[A-Za-z][A-Za-z0-9_-]{0,63}`. |
 | `vault_ttl_seconds` | positive int | `3600` | How long a `token -> value` mapping is retained for restore; it must fit in Go's `time.Duration`. |
 | `vault_max_entries` | positive int | `1000` | Maximum number of mappings kept in memory. |
@@ -218,7 +222,8 @@ plugins:
   configs:
     privacy-filter:
       enabled: true
-      mode: filter
+       mode: filter
+       unknown_field_behavior: block
       token_label: REDACTED
       vault_ttl_seconds: 3600
       vault_max_entries: 1000
@@ -251,7 +256,7 @@ Builtin rules are defined in [`builtin_rules.json`](./builtin_rules.json) and em
 The plugin dispatches on the request's source format and only ever applies rules inside content regions:
 
 - **Scanned** — `openai` (message content, refusal/reasoning text, and legacy/current function or custom-tool runtime input), `openai-response` (recognized message/instructions, computer typing, shell, patch, MCP, program, code-interpreter, search, and runtime tool data), `claude` (recognized text/document/system blocks and runtime/server-tool results), `gemini` (known content-part text/code, legacy/current function/tool call and response data, and system instruction), `openai-image` and `openai-video` (top-level prompt only). In `filter` mode matches are redacted; in `block` mode the first match rejects the request and stops further rule scanning. Provider-specific visitors leave tool schemas, model names, URLs, Base64/file data, MIME/discriminator metadata, encrypted content, Gemini `inlineData.data`, and sampling parameters outside the scanner.
-- **Rejected (fail-closed)** — any unsupported source format, any body that is not exactly one JSON object, malformed required content, and unsupported members or types inside explicitly validated runtime content objects. The plugin terminates the request through the host with an HTTP 403 JSON error response. The plugin does not validate every top-level protocol field or every member of an opaque nested object.
+- **Rejected (fail-closed)** — any unsupported source format, any body that is not exactly one JSON object, malformed required content, and unsupported types inside explicitly validated runtime content objects. Unsupported members inside those objects are also rejected unless `unknown_field_behavior` is `ignore`, in which case they are forwarded unchanged. The plugin terminates rejected requests through the host with an HTTP 403 JSON error response. The plugin does not validate every top-level protocol field or every member of an opaque nested object.
 
 ### Builtin field rules (all default-on)
 

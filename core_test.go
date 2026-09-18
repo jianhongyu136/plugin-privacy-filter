@@ -79,8 +79,8 @@ func TestRegisterReturnsCapabilitiesAndMetadata(t *testing.T) {
 	if len(reg.Metadata.ConfigFields) == 0 {
 		t.Fatalf("expected config fields declared")
 	}
-	if reg.Metadata.Version != "0.0.4" {
-		t.Fatalf("metadata version = %q, want 0.0.4", reg.Metadata.Version)
+	if reg.Metadata.Version != pluginVersion {
+		t.Fatalf("metadata version = %q, want %q", reg.Metadata.Version, pluginVersion)
 	}
 }
 
@@ -639,6 +639,76 @@ func TestRequestScanErrorLogsUnsupportedContent(t *testing.T) {
 	}
 }
 
+func TestRequestScanErrorLogsUnknownFieldValueVerbatimAndSuppressesRepeats(t *testing.T) {
+	callRegister(t, pluginabi.MethodPluginRegister, "")
+	logger := logrus.StandardLogger()
+	previousOutput := logger.Out
+	previousHooks := logger.ReplaceHooks(make(logrus.LevelHooks))
+	hook := &scanLogCapture{}
+	logger.AddHook(hook)
+	logger.SetOutput(io.Discard)
+	t.Cleanup(func() {
+		logger.SetOutput(previousOutput)
+		logger.ReplaceHooks(previousHooks)
+	})
+
+	body := []byte(`{"messages":[{"role":"user","content":"ok","future_debug_field":{"raw":"PLAINTEXT-UNKNOWN-FIELD"}}]}`)
+	for i := 0; i < 3; i++ {
+		resp := invokeRequestIntercept(t, pluginabi.MethodRequestInterceptBefore, formatOpenAI, body)
+		if !resp.Reject {
+			t.Fatal("unknown field request was not rejected")
+		}
+	}
+	if len(hook.entries) != 1 {
+		t.Fatalf("warning log entries = %d, want one due to suppression: %#v", len(hook.entries), hook.entries)
+	}
+	entry := hook.entries[0]
+	if entry["unknown_field"] != "future_debug_field" {
+		t.Fatalf("unknown_field = %#v", entry["unknown_field"])
+	}
+	if entry["unknown_field_path"] != "messages[0].future_debug_field" {
+		t.Fatalf("unknown_field_path = %#v", entry["unknown_field_path"])
+	}
+	if entry["unknown_field_value"] != `{"raw":"PLAINTEXT-UNKNOWN-FIELD"}` {
+		t.Fatalf("unknown_field_value = %#v", entry["unknown_field_value"])
+	}
+	unknownFieldLogs.Lock()
+	state := unknownFieldLogs.entries[unknownFieldLogKey{stage: "request", sourceFormat: formatOpenAI, behavior: unknownFieldBehaviorBlock, path: "messages[0]", name: "future_debug_field"}]
+	unknownFieldLogs.Unlock()
+	if state.suppressed != 2 {
+		t.Fatalf("suppressed repeats = %d, want 2", state.suppressed)
+	}
+}
+
+func TestIgnoredUnknownFieldLogsRawValue(t *testing.T) {
+	callRegister(t, pluginabi.MethodPluginRegister, "unknown_field_behavior: ignore\n")
+	logger := logrus.StandardLogger()
+	previousOutput := logger.Out
+	previousHooks := logger.ReplaceHooks(make(logrus.LevelHooks))
+	hook := &scanLogCapture{}
+	logger.AddHook(hook)
+	logger.SetOutput(io.Discard)
+	t.Cleanup(func() {
+		logger.SetOutput(previousOutput)
+		logger.ReplaceHooks(previousHooks)
+	})
+
+	resp := invokeRequestIntercept(t, pluginabi.MethodRequestInterceptBefore, formatOpenAI,
+		[]byte(`{"messages":[{"role":"user","content":"ok","future_debug_field":{"raw":"PLAINTEXT-UNKNOWN-FIELD"}}]}`))
+	if resp.Reject {
+		t.Fatalf("unknown field was not ignored: %q", resp.RejectReason)
+	}
+	if len(hook.entries) != 1 {
+		t.Fatalf("warning log entries = %d, want 1: %#v", len(hook.entries), hook.entries)
+	}
+	if hook.entries[0]["unknown_field_behavior"] != unknownFieldBehaviorIgnore {
+		t.Fatalf("unknown_field_behavior = %#v", hook.entries[0]["unknown_field_behavior"])
+	}
+	if hook.entries[0]["unknown_field_value"] != `{"raw":"PLAINTEXT-UNKNOWN-FIELD"}` {
+		t.Fatalf("unknown_field_value = %#v", hook.entries[0]["unknown_field_value"])
+	}
+}
+
 func TestRequestScanErrorBoundsUnsupportedContentLog(t *testing.T) {
 	callRegister(t, pluginabi.MethodPluginRegister, "")
 	logger := logrus.StandardLogger()
@@ -702,12 +772,14 @@ func TestRequestScanErrorLogsEmptyUnsupportedContent(t *testing.T) {
 	if len(hook.entries) != 1 {
 		t.Fatalf("warning log entries = %d, want 1: %#v", len(hook.entries), hook.entries)
 	}
-	logged, exists := hook.entries[0]["unsupported_content"]
-	if !exists {
-		t.Fatalf("unsupported_content field is missing: %#v", hook.entries[0])
+	if hook.entries[0]["unknown_field"] != "" {
+		t.Fatalf("unknown_field = %#v, want empty string", hook.entries[0]["unknown_field"])
 	}
-	if logged != "" {
-		t.Fatalf("unsupported_content = %#v, want empty string", logged)
+	if hook.entries[0]["unknown_field_path"] != "input[0]" {
+		t.Fatalf("unknown_field_path = %#v, want input[0]", hook.entries[0]["unknown_field_path"])
+	}
+	if hook.entries[0]["unknown_field_value"] != "1" {
+		t.Fatalf("unknown_field_value = %#v, want 1", hook.entries[0]["unknown_field_value"])
 	}
 }
 

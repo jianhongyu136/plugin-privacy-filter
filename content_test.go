@@ -1172,6 +1172,21 @@ func TestRecognizedProviderObjectsRejectUnknownMembers(t *testing.T) {
 	}
 }
 
+func TestUnknownFieldIgnoreForwardsUnknownValueAndScansKnownContent(t *testing.T) {
+	callRegister(t, pluginabi.MethodPluginRegister, "unknown_field_behavior: ignore\nbuiltin_rules_enabled: false\ncustom_value_rules:\n  - name: marker\n    regex: KNOWN-SECRET\n")
+	body := []byte(`{"messages":[{"role":"user","content":"KNOWN-SECRET","future":{"password":"UNKNOWNSECRET"}}]}`)
+	resp := requestIntercept(t, formatOpenAI, body)
+	if resp.Reject || len(resp.Body) == 0 {
+		t.Fatalf("unknown field was not ignored or known content was not scanned: reject=%v reason=%q", resp.Reject, resp.RejectReason)
+	}
+	if strings.Contains(string(resp.Body), "KNOWN-SECRET") {
+		t.Fatalf("known content was not redacted: %s", resp.Body)
+	}
+	if !strings.Contains(string(resp.Body), "UNKNOWNSECRET") {
+		t.Fatalf("ignored unknown field was not forwarded unchanged: %s", resp.Body)
+	}
+}
+
 func TestCurrentProviderRuntimeFieldsRedacted(t *testing.T) {
 	callRegister(t, pluginabi.MethodPluginRegister, "builtin_rules_enabled: false\ncustom_value_rules:\n  - name: marker\n    regex: TEXTSECRET\n")
 	tests := []struct {
