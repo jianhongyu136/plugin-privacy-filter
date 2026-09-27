@@ -21,9 +21,9 @@ type scanMatch struct {
 
 // scanResult is the outcome of scanning a request body.
 type scanResult struct {
-	Body          []byte
-	Matches       []scanMatch
-	UnknownFields []unknownField
+	Body            []byte
+	Matches         []scanMatch
+	ReadOnlyMatches []scanMatch
 }
 
 // redactFunc returns the replacement token for an original secret and is
@@ -45,10 +45,9 @@ type scanner struct {
 	redact               redactFunc
 	stopAfterFirst       bool
 	returnOriginal       bool
-	unknownFieldBehavior string
-	recordUnknownFields  bool
-	unknownFields        []unknownField
 	matches              []scanMatch
+	readOnlyMatches      []scanMatch
+	warnInvalidArguments func(path, detail string, matches []scanMatch)
 }
 
 type blockScanStopped struct{}
@@ -208,6 +207,60 @@ func (s *scanner) scanText(text, path string) string {
 	return out.String()
 }
 
+// valueRuleSpan applies the same capture-group and validator semantics to both
+// replacement and read-only detection. Group 1 selects the sensitive fragment;
+// an unmatched optional group falls back to the whole match.
+func valueRuleSpan(r valueRule, text string, match []int) (start, end int, valid bool) {
+	start, end = match[0], match[1]
+	if r.re.NumSubexp() >= 1 && match[2] >= 0 {
+		start, end = match[2], match[3]
+	}
+	return start, end, end > start && (r.validate == nil || r.validate(text[start:end]))
+}
+
+// detectText runs value rules without replacements or token creation. Invalid
+// JSON has no reliable field-name structure, so field rules do not apply. One
+// finding is recorded per matching rule; block mode stops at the first finding.
+func (s *scanner) detectText(text, path string) []scanMatch {
+	if len(s.rules.valueRules) == 0 {
+		return nil
+	}
+	var segments []string
+	last := 0
+	if s.tokenRe != nil {
+		for _, span := range s.tokenRe.FindAllStringIndex(text, -1) {
+			if span[0] > last {
+				segments = append(segments, text[last:span[0]])
+			}
+			last = span[1]
+		}
+	}
+	if last < len(text) {
+		segments = append(segments, text[last:])
+	}
+	var findings []scanMatch
+nextRule:
+	for _, rule := range s.rules.valueRules {
+		for _, segment := range segments {
+			for _, match := range rule.re.FindAllStringSubmatchIndex(segment, -1) {
+				start, end, valid := valueRuleSpan(rule, segment, match)
+				if !valid {
+					continue
+				}
+				findings = append(findings, scanMatch{
+					Rule: rule.name, RuleType: "value", Path: path,
+					Context: s.blockContext(segment[start:end], "[redacted]"),
+				})
+				if s.stopAfterFirst {
+					return findings
+				}
+				continue nextRule
+			}
+		}
+	}
+	return findings
+}
+
 // applyValueRules runs every value rule over a token-free text segment.
 func (s *scanner) applyValueRules(text, path string) string {
 	type textSegment struct {
@@ -234,24 +287,16 @@ func (s *scanner) applyValueRules(text, path string) string {
 				next = append(next, segment)
 				continue
 			}
-			// When a value rule declares capture group 1, only that
-			// submatch is tokenized and the surrounding match text
-			// (e.g. a "password:" prefix) is preserved verbatim. Rules
-			// without a capture group replace the whole match.
-			useGroup := r.re.NumSubexp() >= 1
 			last := 0
 			for _, match := range matches {
 				if match[0] > last {
 					next = append(next, textSegment{value: segment.value[last:match[0]]})
 				}
 				last = match[1]
-				rs, re := match[0], match[1]
-				if useGroup && match[2] >= 0 {
-					rs, re = match[2], match[3]
-				}
+				rs, re, valid := valueRuleSpan(r, segment.value, match)
 				whole := segment.value[match[0]:match[1]]
 				fragment := segment.value[rs:re]
-				if re <= rs || (r.validate != nil && !r.validate(fragment)) {
+				if !valid {
 					next = append(next, textSegment{value: whole})
 					continue
 				}

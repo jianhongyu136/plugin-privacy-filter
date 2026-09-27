@@ -241,11 +241,10 @@ func getSharedVault() *vault {
 // preserving the active rules and label. It exists for tests and internal setup;
 // the normal path publishes a full snapshot via applyConfig.
 func setSharedVault(v *vault) {
-	ns := &runtimeState{mode: modeFilter, unknownFieldBehavior: unknownFieldBehaviorBlock, vault: v}
+	ns := &runtimeState{mode: modeFilter, vault: v}
 	if prev := activeState.Load(); prev != nil {
 		ns.rules = prev.rules
 		ns.mode = prev.mode
-		ns.unknownFieldBehavior = prev.unknownFieldBehavior
 		ns.blockReturnOriginal = prev.blockReturnOriginal
 		ns.label = prev.label
 		ns.tokenRe = prev.tokenRe

@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -123,6 +124,48 @@ func TestToolSchemaNotCollapsed(t *testing.T) {
 	}
 	if _, ok := props["password"].(map[string]any); !ok {
 		t.Fatalf("password schema was collapsed: %v", props["password"])
+	}
+}
+
+func TestClaudeMessageMetadataSkippedAndContentScanned(t *testing.T) {
+	callRegister(t, pluginabi.MethodPluginRegister, "builtin_rules_enabled: false\ncustom_field_rules:\n  - name: password\n    keys: [password]\ncustom_value_rules:\n  - name: marker\n    regex: '(TEXTSECRET|OUTERSECRET|max)'\n")
+	body := []byte(`{"messages":[{"role":"user","content":"TEXTSECRET","future_option":"OUTERSECRET"},{"role":"assistant","content":[{"type":"text","text":"TEXTSECRET"}],"output_config":{"effort":"max"},"future_metadata":{"password":"OUTERSECRET"}}],"system":"TEXTSECRET","output_config":{"effort":"max"},"future_option":"OUTERSECRET"}`)
+	logger := logrus.StandardLogger()
+	previousOutput := logger.Out
+	var logs bytes.Buffer
+	logger.SetOutput(&logs)
+	t.Cleanup(func() { logger.SetOutput(previousOutput) })
+
+	resp := requestIntercept(t, formatClaude, body)
+	if resp.Reject {
+		t.Fatalf("Claude message metadata was rejected: %s", resp.RejectReason)
+	}
+	var original, out map[string]any
+	if err := json.Unmarshal(body, &original); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(resp.Body, &out); err != nil {
+		t.Fatalf("expected redacted JSON body: %v", err)
+	}
+	if strings.Contains(string(resp.Body), "TEXTSECRET") {
+		t.Fatal("Claude message content or system prompt was not redacted")
+	}
+	for i, rawMessage := range out["messages"].([]any) {
+		message := rawMessage.(map[string]any)
+		originalMessage := original["messages"].([]any)[i].(map[string]any)
+		delete(message, "content")
+		delete(originalMessage, "content")
+		if !reflect.DeepEqual(message, originalMessage) {
+			t.Fatalf("message metadata changed: got %v, want %v", message, originalMessage)
+		}
+	}
+	delete(out, "system")
+	delete(original, "system")
+	if !reflect.DeepEqual(out, original) {
+		t.Fatalf("outer metadata changed: got %v, want %v", out, original)
+	}
+	if strings.Contains(logs.String(), "unknown request field") || strings.Contains(logs.String(), "OUTERSECRET") {
+		t.Fatalf("outer metadata was reported as unknown or logged: %s", logs.String())
 	}
 }
 
@@ -478,8 +521,8 @@ func TestOpenAIToolCallArgumentsValidation(t *testing.T) {
 		{name: "empty", arguments: "", reject: false},
 		{name: "whitespace", arguments: " \t\n", reject: false},
 		{name: "valid", arguments: `{}`, reject: false},
-		{name: "malformed", arguments: `{"password":"argument-secret-marker"`, reject: true},
-		{name: "trailing value", arguments: `{} {}`, reject: true},
+		{name: "malformed", arguments: `{"password":"argument-secret-marker"`, reject: false},
+		{name: "trailing value", arguments: `{} {}`, reject: false},
 		{name: "non-string", arguments: map[string]any{"password": "argument-secret-marker"}, reject: true},
 	}
 	for _, tt := range tests {
@@ -512,6 +555,9 @@ func TestOpenAIToolCallArgumentsValidation(t *testing.T) {
 			if strings.Contains(resp.RejectReason, "argument-secret-marker") {
 				t.Fatalf("reject reason leaked argument content: %q", resp.RejectReason)
 			}
+			if !tt.reject && len(resp.Body) != 0 {
+				t.Fatalf("request without scannable secrets was rewritten: %s", resp.Body)
+			}
 		})
 	}
 }
@@ -533,7 +579,7 @@ func TestOpenAILegacyFunctionCallArgumentsRedactedAndValidated(t *testing.T) {
 		reject    bool
 	}{
 		{name: "valid", arguments: `{"password":"legacy-secret"}`, reject: false},
-		{name: "malformed", arguments: `{"password":"legacy-secret"`, reject: true},
+		{name: "malformed", arguments: `{"password":"legacy-secret"`, reject: false},
 		{name: "non-string", arguments: map[string]any{"password": "legacy-secret"}, reject: true},
 	}
 	for _, tt := range tests {
@@ -559,6 +605,12 @@ func TestOpenAILegacyFunctionCallArgumentsRedactedAndValidated(t *testing.T) {
 				t.Fatalf("reject reason leaked arguments: %q", resp.RejectReason)
 			}
 			if tt.reject {
+				return
+			}
+			if tt.name == "malformed" {
+				if len(resp.Body) != 0 {
+					t.Fatalf("malformed legacy arguments were rewritten: %s", resp.Body)
+				}
 				return
 			}
 			if len(resp.Body) == 0 || strings.Contains(string(resp.Body), "legacy-secret") {
@@ -780,7 +832,6 @@ func TestResponsesAgentMessageAcceptedAndTextRedacted(t *testing.T) {
 func TestResponsesDiscriminatedInputsFailClosed(t *testing.T) {
 	callRegister(t, pluginabi.MethodPluginRegister, "")
 	tests := []string{
-		`{"input":[{"id":"ref","payload":"unscanned"}]}`,
 		`{"input":[{"type":"computer_call","action":{"type":"paste","text":"unscanned"}}]}`,
 		`{"input":[{"type":"local_shell_call","action":{"type":"future","command":"unscanned"}}]}`,
 	}
@@ -850,26 +901,23 @@ func TestResponsesAdditionalToolsRoleAccepted(t *testing.T) {
 	}
 }
 
-func TestResponsesAdditionalToolsRoleMustBeString(t *testing.T) {
+func TestResponsesAdditionalToolsRolePassedUnchanged(t *testing.T) {
 	callRegister(t, pluginabi.MethodPluginRegister, "")
 	for _, role := range []string{`{"secret":"MUST-NOT-PASS"}`, "null", `""`, `"   "`} {
 		body := []byte(`{"input":[{"type":"additional_tools","role":` + role + `,"tools":[]}]}`)
 		resp := requestIntercept(t, formatOpenAIResponse, body)
-		if !resp.Reject {
-			t.Fatalf("additional_tools with invalid role %s was accepted", role)
-		}
-		if strings.Contains(resp.RejectReason, "MUST-NOT-PASS") {
-			t.Fatalf("reject reason leaked role content: %q", resp.RejectReason)
+		if resp.Reject || len(resp.Body) != 0 {
+			t.Fatalf("additional_tools protocol role was not passed unchanged: role=%s reason=%q", role, resp.RejectReason)
 		}
 	}
 }
 
-func TestResponsesToolSearchOutputDoesNotAcceptAdditionalToolsRole(t *testing.T) {
+func TestResponsesToolSearchOutputSkipsProtocolRole(t *testing.T) {
 	callRegister(t, pluginabi.MethodPluginRegister, "")
 	body := []byte(`{"input":[{"type":"tool_search_output","role":"developer","tools":[]}]}`)
 
-	if resp := requestIntercept(t, formatOpenAIResponse, body); !resp.Reject {
-		t.Fatal("tool_search_output with additional_tools-only role was accepted")
+	if resp := requestIntercept(t, formatOpenAIResponse, body); resp.Reject || len(resp.Body) != 0 {
+		t.Fatalf("tool_search_output protocol role was not passed unchanged: %s", resp.RejectReason)
 	}
 }
 
@@ -879,7 +927,6 @@ func TestResponsesCurrentRuntimeUnionsFailClosed(t *testing.T) {
 		`{"input":[{"type":"computer_call","actions":[{"type":"future","payload":"unscanned"}]}]}`,
 		`{"input":[{"type":"shell_call","action":{"commands":[42]}}]}`,
 		`{"input":[{"type":"apply_patch_call","operation":{"type":"future","diff":"unscanned"}}]}`,
-		`{"input":[{"type":"shell_call_output","output":[{"stdout":"ok","stderr":"","outcome":{"type":"future"}}]}]}`,
 	}
 	for _, body := range tests {
 		resp := requestIntercept(t, formatOpenAIResponse, []byte(body))
@@ -1092,9 +1139,9 @@ func TestClaudeNestedOnlyAndUnknownResultKindsReject(t *testing.T) {
 	}
 }
 
-func TestGeminiPartUnionFailsClosed(t *testing.T) {
+func TestGeminiPartsSkipProtocolFields(t *testing.T) {
 	callRegister(t, pluginabi.MethodPluginRegister, "")
-	invalid := []struct {
+	tests := []struct {
 		name string
 		body string
 	}{
@@ -1102,14 +1149,11 @@ func TestGeminiPartUnionFailsClosed(t *testing.T) {
 		{name: "unknown member", body: `{"contents":[{"parts":[{"text":"hello","unknown":"unscanned"}]}]}`},
 		{name: "metadata only", body: `{"contents":[{"parts":[{"mediaResolution":{"level":"high"},"partMetadata":{}}]}]}`},
 	}
-	for _, tt := range invalid {
+	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			resp := requestIntercept(t, formatGemini, []byte(tt.body))
-			if !resp.Reject {
-				t.Fatalf("invalid Gemini part structure was accepted: %s", tt.body)
-			}
-			if strings.Contains(resp.RejectReason, "unscanned") {
-				t.Fatalf("reject reason leaked Gemini content: %q", resp.RejectReason)
+			if resp.Reject || len(resp.Body) != 0 {
+				t.Fatalf("Gemini protocol fields were not passed unchanged: reason=%q body=%s", resp.RejectReason, resp.Body)
 			}
 		})
 	}
@@ -1136,7 +1180,7 @@ func TestGeminiCurrentToolPartsAcceptedAndRedacted(t *testing.T) {
 	}
 }
 
-func TestRecognizedProviderObjectsRejectUnknownMembers(t *testing.T) {
+func TestRecognizedProviderObjectsSkipProtocolMembers(t *testing.T) {
 	callRegister(t, pluginabi.MethodPluginRegister, "")
 	tests := []struct {
 		name   string
@@ -1162,22 +1206,19 @@ func TestRecognizedProviderObjectsRejectUnknownMembers(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			resp := requestIntercept(t, tt.format, []byte(tt.body))
-			if !resp.Reject {
-				t.Fatalf("recognized object with unknown member was accepted: %s", tt.body)
-			}
-			if strings.Contains(resp.RejectReason, "unscanned") || strings.Contains(resp.RejectReason, "future") {
-				t.Fatalf("reject reason leaked member name or content: %q", resp.RejectReason)
+			if resp.Reject || len(resp.Body) != 0 {
+				t.Fatalf("protocol member was not passed unchanged: reason=%q body=%s", resp.RejectReason, resp.Body)
 			}
 		})
 	}
 }
 
-func TestUnknownFieldIgnoreForwardsUnknownValueAndScansKnownContent(t *testing.T) {
-	callRegister(t, pluginabi.MethodPluginRegister, "unknown_field_behavior: ignore\nbuiltin_rules_enabled: false\ncustom_value_rules:\n  - name: marker\n    regex: KNOWN-SECRET\n")
+func TestProtocolMetadataPreservedWhileScanningContent(t *testing.T) {
+	callRegister(t, pluginabi.MethodPluginRegister, "builtin_rules_enabled: false\ncustom_value_rules:\n  - name: marker\n    regex: KNOWN-SECRET\n")
 	body := []byte(`{"messages":[{"role":"user","content":"KNOWN-SECRET","future":{"password":"UNKNOWNSECRET"}}]}`)
 	resp := requestIntercept(t, formatOpenAI, body)
 	if resp.Reject || len(resp.Body) == 0 {
-		t.Fatalf("unknown field was not ignored or known content was not scanned: reject=%v reason=%q", resp.Reject, resp.RejectReason)
+		t.Fatalf("protocol metadata was not skipped or known content was not scanned: reject=%v reason=%q", resp.Reject, resp.RejectReason)
 	}
 	if strings.Contains(string(resp.Body), "KNOWN-SECRET") {
 		t.Fatalf("known content was not redacted: %s", resp.Body)
@@ -1268,7 +1309,7 @@ func TestUnknownProviderContentBlockRejected(t *testing.T) {
 	}
 }
 
-func TestResponsesNestedUnknownMembersRejected(t *testing.T) {
+func TestResponsesNestedProtocolMembersPassedUnchanged(t *testing.T) {
 	callRegister(t, pluginabi.MethodPluginRegister, "")
 	tests := []string{
 		`{"input":[{"type":"shell_call","action":{"commands":["echo ok"],"future":{"password":"plaintext-secret"}}}]}`,
@@ -1280,11 +1321,8 @@ func TestResponsesNestedUnknownMembersRejected(t *testing.T) {
 	}
 	for _, body := range tests {
 		resp := requestIntercept(t, formatOpenAIResponse, []byte(body))
-		if !resp.Reject {
-			t.Fatalf("nested unknown member was accepted: %s", body)
-		}
-		if strings.Contains(resp.RejectReason, "plaintext-secret") || strings.Contains(resp.RejectReason, "future") {
-			t.Fatalf("reject reason leaked nested input: %q", resp.RejectReason)
+		if resp.Reject || len(resp.Body) != 0 {
+			t.Fatalf("nested protocol member was not passed unchanged: reason=%q body=%s", resp.RejectReason, resp.Body)
 		}
 	}
 }
@@ -1318,8 +1356,7 @@ func TestCurrentOpenAISchemaFieldsAccepted(t *testing.T) {
 
 // TestResponsesRealisticRequestsNotRejected feeds realistic full OpenAI
 // Responses request bodies (as clients and the Codex translator actually
-// produce them) through the fail-closed request interceptor. If any is
-// rejected, the strict allow-list scanner is the empty-response root cause.
+// produce them) through the content-only request interceptor.
 func TestResponsesRealisticRequestsNotRejected(t *testing.T) {
 	callRegister(t, pluginabi.MethodPluginRegister, "")
 

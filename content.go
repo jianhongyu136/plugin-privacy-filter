@@ -7,6 +7,8 @@ import (
 	"io"
 	"strconv"
 	"strings"
+
+	"github.com/sirupsen/logrus"
 )
 
 // Source-format identifiers as reported by the host in
@@ -49,34 +51,36 @@ func classifyFormat(sourceFormat string) formatDisposition {
 // object whose key happens to match a field rule (for example a tool parameter
 // named "api_key"), which corrupts the request. Restricting redaction to
 // content regions keeps the request structurally intact.
+// Protocol siblings are neither scanned nor validated; visitors only select
+// known content fields and validate the structure needed to traverse them.
 //
 // It returns handled=false when the body is not a single JSON object (so the
 // content regions cannot be located) or the format is unrecognized; the caller
 // treats that as a reason to reject the request.
 func scanRequestContent(body []byte, sourceFormat string, rules ruleSet, tokenRe tokenMatcher, redact redactFunc) (scanResult, bool, *contentScanError) {
-	return scanRequestContentWithUnknownFieldBehavior(body, sourceFormat, rules, tokenRe, redact, false, false, unknownFieldBehaviorBlock)
+	return scanRequestContentWithOptions(body, sourceFormat, rules, tokenRe, redact, false, false)
 }
 
-// scanRequestContentForBlock validates the complete request, then stops rule
+// scanRequestContentForBlock validates all selected content regions, then stops rule
 // scanning after the first finding. Blocked bodies are never sent upstream, so
 // the mutated document is deliberately not re-encoded.
 func scanRequestContentForBlock(body []byte, sourceFormat string, rules ruleSet, tokenRe tokenMatcher, redact redactFunc, returnOriginal bool) (scanResult, bool, *contentScanError) {
-	return scanRequestContentWithUnknownFieldBehavior(body, sourceFormat, rules, tokenRe, redact, true, returnOriginal, unknownFieldBehaviorBlock)
+	return scanRequestContentWithOptions(body, sourceFormat, rules, tokenRe, redact, true, returnOriginal)
 }
 
-func scanRequestContentWithUnknownFieldBehavior(body []byte, sourceFormat string, rules ruleSet, tokenRe tokenMatcher, redact redactFunc, stopAfterFirst, returnOriginal bool, unknownFieldBehavior string) (scanResult, bool, *contentScanError) {
+func scanRequestContentWithOptions(body []byte, sourceFormat string, rules ruleSet, tokenRe tokenMatcher, redact redactFunc, stopAfterFirst, returnOriginal bool) (scanResult, bool, *contentScanError) {
 	doc, ok := decodeJSONObject(body)
 	if !ok {
 		return scanResult{}, false, nil
 	}
 
-	// Validate the complete structure before any real scanner can write a
+	// Validate the selected content regions before any real scanner can write a
 	// token mapping. A rejected request must not retain plaintext or evict an
 	// unrelated in-flight mapping from the bounded vault.
 	// Validation deliberately has neither rules nor a token matcher, so even
 	// checking an existing token cannot change vault LRU state for a request that
 	// will later be rejected.
-	validate := &scanner{unknownFieldBehavior: unknownFieldBehavior, recordUnknownFields: true}
+	validate := &scanner{}
 	if handled, err := scanFormatContent(validate, doc, sourceFormat); !handled {
 		return scanResult{}, false, nil
 	} else if err != nil {
@@ -84,12 +88,32 @@ func scanRequestContentWithUnknownFieldBehavior(body []byte, sourceFormat string
 	}
 
 	s := &scanner{
-		rules:                rules,
-		tokenRe:              tokenRe,
-		redact:               redact,
-		stopAfterFirst:       stopAfterFirst,
-		returnOriginal:       returnOriginal,
-		unknownFieldBehavior: unknownFieldBehavior,
+		rules:          rules,
+		tokenRe:        tokenRe,
+		redact:         redact,
+		stopAfterFirst: stopAfterFirst,
+		returnOriginal: returnOriginal,
+		// Log only during the rule scan, after read-only detection, not during
+		// prevalidation. Neither argument text nor match contexts enter the log.
+		warnInvalidArguments: func(path, detail string, matches []scanMatch) {
+			mode := modeFilter
+			if stopAfterFirst {
+				mode = modeBlock
+			}
+			fields := logrus.Fields{
+				"stage": "request", "source_format": sourceFormat,
+				"path": path, "error": detail, "mode": mode,
+				"scan_mode": "read_only", "matched_rules": len(matches),
+			}
+			if len(matches) > 0 {
+				rules := make([]string, 0, min(len(matches), scanLogMaxPaths))
+				for _, match := range matches[:min(len(matches), scanLogMaxPaths)] {
+					rules = append(rules, match.Rule)
+				}
+				fields["rules"] = rules
+			}
+			logrus.WithFields(fields).Warn("privacy-filter scanned invalid JSON arguments without replacement")
+		},
 	}
 	var scanErr *contentScanError
 	if stopAfterFirst {
@@ -98,18 +122,21 @@ func scanRequestContentWithUnknownFieldBehavior(body []byte, sourceFormat string
 		_, scanErr = scanFormatContent(s, doc, sourceFormat)
 	}
 	if scanErr != nil {
-		return scanResult{UnknownFields: validate.unknownFields}, true, scanErr
+		return scanResult{}, true, scanErr
 	}
 
+	result := scanResult{Matches: s.matches, ReadOnlyMatches: s.readOnlyMatches}
+	if stopAfterFirst && len(s.matches)+len(s.readOnlyMatches) > 0 {
+		return result, true, nil
+	}
 	if len(s.matches) == 0 {
 		// Nothing redacted: return the original bytes so token-free bodies are
 		// not reformatted.
-		return scanResult{Body: body, Matches: nil, UnknownFields: validate.unknownFields}, true, nil
+		result.Body = body
+	} else {
+		result.Body = reencodeJSON(doc, body)
 	}
-	if stopAfterFirst {
-		return scanResult{Matches: s.matches, UnknownFields: validate.unknownFields}, true, nil
-	}
-	return scanResult{Body: reencodeJSON(doc, body), Matches: s.matches, UnknownFields: validate.unknownFields}, true, nil
+	return result, true, nil
 }
 
 func scanFormatContentUntilBlockMatch(s *scanner, doc map[string]any, sourceFormat string) (scanErr *contentScanError) {
@@ -173,22 +200,13 @@ func scanImageVideoContent(s *scanner, doc map[string]any) *contentScanError {
 }
 
 // contentScanError describes content that cannot be scanned safely. Detail is
-// deliberately sanitized for the termination response; UnsupportedValue is
-// retained only for the dedicated raw unknown-field diagnostic log.
+// deliberately sanitized for the termination response and diagnostic log.
 type contentScanError struct {
 	Path                  string
 	Detail                string
 	UnsupportedContent    string
-	UnsupportedValue      any
 	HasUnsupportedContent bool
-	HasUnsupportedValue   bool
 	HasUnsupportedType    bool
-}
-
-type unknownField struct {
-	Path  string
-	Name  string
-	Value any
 }
 
 // scanContentValue scans one content region. A plain string is scanned with the
@@ -219,11 +237,6 @@ func scanOpenAIContent(s *scanner, doc map[string]any) *contentScanError {
 		msg, ok := m.(map[string]any)
 		if !ok {
 			return &contentScanError{Path: messagePath, Detail: "message must be an object"}
-		}
-		if err := s.validateAllowedKeys(msg, messagePath,
-			"role", "content", "name", "refusal", "reasoning_content", "tool_calls",
-			"function_call", "tool_call_id", "audio"); err != nil {
-			return err
 		}
 		if c, ok := msg["content"]; ok {
 			walked, err := scanOpenAIMessageContent(s, c, messagePath+".content", true)
@@ -260,9 +273,6 @@ func scanOpenAIAudio(s *scanner, msg map[string]any, path string) *contentScanEr
 	if !ok {
 		return &contentScanError{Path: path + ".audio", Detail: "audio must be an object or null"}
 	}
-	if err := s.validateAllowedKeys(audio, path+".audio", "id", "data", "expires_at", "transcript"); err != nil {
-		return err
-	}
 	return scanNullableStringMember(s, audio, "transcript", path+".audio")
 }
 
@@ -276,26 +286,7 @@ func scanOpenAILegacyFunctionCallArguments(s *scanner, msg map[string]any, messa
 	if !ok {
 		return &contentScanError{Path: functionPath, Detail: "function_call must be an object"}
 	}
-	if err := s.validateAllowedKeys(functionCall, functionPath, "name", "arguments"); err != nil {
-		return err
-	}
-	rawArguments, exists := functionCall["arguments"]
-	if !exists {
-		return nil
-	}
-	argumentsPath := functionPath + ".arguments"
-	arguments, ok := rawArguments.(string)
-	if !ok {
-		return &contentScanError{Path: argumentsPath, Detail: "arguments must be a string"}
-	}
-	redacted, changed, err := scanFunctionArgumentsJSONString(s, arguments, argumentsPath)
-	if err != nil {
-		return err
-	}
-	if changed {
-		functionCall["arguments"] = redacted
-	}
-	return nil
+	return scanFunctionArgumentsMember(s, functionCall, functionPath, false)
 }
 
 func scanOpenAIMessageContent(s *scanner, value any, path string, allowNull bool) (any, *contentScanError) {
@@ -322,15 +313,6 @@ func scanOpenAIMessageContent(s *scanner, value any, path string, allowNull bool
 		if err != nil {
 			return nil, err
 		}
-		if err := s.validateOpenAIContentBlockKeys(block, blockPath, kind); err != nil {
-			return nil, err
-		}
-		switch kind {
-		case "text", "input_text", "image_url", "input_audio", "file":
-			if err := s.validatePromptCacheBreakpoint(block, blockPath); err != nil {
-				return nil, err
-			}
-		}
 		switch kind {
 		case "text", "input_text", "output_text":
 			if err := scanStringMember(s, block, "text", blockPath, true); err != nil {
@@ -342,9 +324,6 @@ func scanOpenAIMessageContent(s *scanner, value any, path string, allowNull bool
 			}
 		case "image_url", "input_audio", "file", "image_file":
 			// Media and file payloads are deliberately outside the text scanner.
-			if err := s.validateOpenAIMediaBlock(block, blockPath, kind); err != nil {
-				return nil, err
-			}
 		default:
 			return nil, unknownContentBlock(blockPath, kind)
 		}
@@ -378,16 +357,10 @@ func scanOpenAIToolCallArguments(s *scanner, msg map[string]any, messagePath str
 			}
 		}
 		if kind == "custom" {
-			if err := s.validateAllowedKeys(toolCall, toolCallPath, "id", "index", "type", "custom"); err != nil {
-				return err
-			}
 			customPath := toolCallPath + ".custom"
 			custom, ok := toolCall["custom"].(map[string]any)
 			if !ok {
 				return &contentScanError{Path: customPath, Detail: "custom is required and must be an object"}
-			}
-			if err := s.validateAllowedKeys(custom, customPath, "name", "input"); err != nil {
-				return err
 			}
 			if err := scanStringMember(s, custom, "input", customPath, true); err != nil {
 				return err
@@ -396,9 +369,6 @@ func scanOpenAIToolCallArguments(s *scanner, msg map[string]any, messagePath str
 		}
 		if kind != "function" {
 			return &contentScanError{Path: toolCallPath + ".type", Detail: "unsupported tool call type", UnsupportedContent: kind, HasUnsupportedContent: true, HasUnsupportedType: true}
-		}
-		if err := s.validateAllowedKeys(toolCall, toolCallPath, "id", "index", "type", "function"); err != nil {
-			return err
 		}
 		rawFunction, exists := toolCall["function"]
 		if !exists {
@@ -409,28 +379,8 @@ func scanOpenAIToolCallArguments(s *scanner, msg map[string]any, messagePath str
 		if !ok {
 			return &contentScanError{Path: functionPath, Detail: "function must be an object"}
 		}
-		if err := s.validateAllowedKeys(function, functionPath, "name", "arguments"); err != nil {
+		if err := scanFunctionArgumentsMember(s, function, functionPath, true); err != nil {
 			return err
-		}
-		rawArguments, exists := function["arguments"]
-		if !exists {
-			return &contentScanError{Path: functionPath + ".arguments", Detail: "arguments is required"}
-		}
-		argumentsPath := functionPath + ".arguments"
-		arguments, ok := rawArguments.(string)
-		if !ok {
-			return &contentScanError{Path: argumentsPath, Detail: "arguments must be a string"}
-		}
-		if strings.TrimSpace(arguments) == "" {
-			continue
-		}
-
-		redacted, changed, err := scanFunctionArgumentsJSONString(s, arguments, argumentsPath)
-		if err != nil {
-			return err
-		}
-		if changed {
-			function["arguments"] = redacted
 		}
 	}
 	return nil
@@ -464,11 +414,37 @@ func safeArgumentJSONError(err error) string {
 	return "arguments contain invalid JSON"
 }
 
-func scanFunctionArgumentsJSONString(s *scanner, value, path string) (string, bool, *contentScanError) {
-	if strings.TrimSpace(value) == "" {
-		return value, false, nil
+// scanFunctionArgumentsMember preserves malformed inner JSON verbatim while
+// applying read-only text detection. Such findings never create token mappings.
+func scanFunctionArgumentsMember(s *scanner, object map[string]any, path string, required bool) *contentScanError {
+	argumentsPath := path + ".arguments"
+	raw, exists := object["arguments"]
+	if !exists {
+		if required {
+			return &contentScanError{Path: argumentsPath, Detail: "arguments is required"}
+		}
+		return nil
 	}
-	return scanStrictJSONString(s, value, path)
+	value, ok := raw.(string)
+	if !ok {
+		return &contentScanError{Path: argumentsPath, Detail: "arguments must be a string"}
+	}
+	redacted, changed, err := scanStrictJSONString(s, value, argumentsPath)
+	if err != nil {
+		matches := s.detectText(value, argumentsPath)
+		s.readOnlyMatches = append(s.readOnlyMatches, matches...)
+		if s.warnInvalidArguments != nil {
+			s.warnInvalidArguments(argumentsPath, err.Detail, matches)
+		}
+		if s.stopAfterFirst && len(matches) > 0 {
+			panic(blockScanStopped{})
+		}
+		return nil
+	}
+	if changed {
+		object["arguments"] = redacted
+	}
+	return nil
 }
 
 func scanStrictJSONString(s *scanner, value, path string) (string, bool, *contentScanError) {
@@ -482,163 +458,6 @@ func scanStrictJSONString(s *scanner, value, path string) (string, bool, *conten
 		return value, false, nil
 	}
 	return string(reencodeJSON(doc, []byte(value))), true, nil
-}
-
-func (s *scanner) validateAllowedKeys(object map[string]any, path string, keys ...string) *contentScanError {
-	allowed := make(map[string]struct{}, len(keys))
-	for _, key := range keys {
-		allowed[key] = struct{}{}
-	}
-	for key := range object {
-		if _, ok := allowed[key]; !ok {
-			if s.unknownFieldBehavior == unknownFieldBehaviorIgnore {
-				if s.recordUnknownFields {
-					s.unknownFields = append(s.unknownFields, unknownField{Path: path, Name: key, Value: object[key]})
-				}
-				continue
-			}
-			return &contentScanError{
-				Path:                  path,
-				Detail:                "unsupported object member",
-				UnsupportedContent:    key,
-				UnsupportedValue:      object[key],
-				HasUnsupportedContent: true,
-				HasUnsupportedValue:   true,
-			}
-		}
-	}
-	return nil
-}
-
-func validateOptionalStringMember(object map[string]any, key, path string) *contentScanError {
-	raw, exists := object[key]
-	if !exists || raw == nil {
-		return nil
-	}
-	if _, ok := raw.(string); !ok {
-		return &contentScanError{Path: path + "." + key, Detail: key + " must be a string or null"}
-	}
-	return nil
-}
-
-func (s *scanner) validatePromptCacheBreakpoint(object map[string]any, path string) *contentScanError {
-	raw, exists := object["prompt_cache_breakpoint"]
-	if !exists || raw == nil {
-		return nil
-	}
-	breakpoint, ok := raw.(map[string]any)
-	if !ok {
-		return &contentScanError{Path: path + ".prompt_cache_breakpoint", Detail: "prompt_cache_breakpoint must be an object or null"}
-	}
-	breakpointPath := path + ".prompt_cache_breakpoint"
-	if err := s.validateAllowedKeys(breakpoint, breakpointPath, "mode"); err != nil {
-		return err
-	}
-	return validateOptionalStringMember(breakpoint, "mode", breakpointPath)
-}
-
-func (s *scanner) validateResponsesCaller(item map[string]any, path string) *contentScanError {
-	raw, exists := item["caller"]
-	if !exists || raw == nil {
-		return nil
-	}
-	caller, ok := raw.(map[string]any)
-	if !ok {
-		return &contentScanError{Path: path + ".caller", Detail: "caller must be an object or null"}
-	}
-	callerPath := path + ".caller"
-	kind, err := contentBlockType(caller, callerPath)
-	if err != nil {
-		return err
-	}
-	switch kind {
-	case "direct":
-		return s.validateAllowedKeys(caller, callerPath, "type")
-	case "program":
-		if err := s.validateAllowedKeys(caller, callerPath, "type", "caller_id"); err != nil {
-			return err
-		}
-		if _, exists := caller["caller_id"]; !exists {
-			return &contentScanError{Path: callerPath + ".caller_id", Detail: "caller_id is required"}
-		}
-		return validateOptionalStringMember(caller, "caller_id", callerPath)
-	default:
-		return unknownContentBlock(callerPath, kind)
-	}
-}
-
-func (s *scanner) validateShellEnvironment(item map[string]any, path string) *contentScanError {
-	raw, exists := item["environment"]
-	if !exists || raw == nil {
-		return nil
-	}
-	environment, ok := raw.(map[string]any)
-	if !ok {
-		return &contentScanError{Path: path + ".environment", Detail: "environment must be an object or null"}
-	}
-	environmentPath := path + ".environment"
-	kind, err := contentBlockType(environment, environmentPath)
-	if err != nil {
-		return err
-	}
-	switch kind {
-	case "local":
-		return s.validateAllowedKeys(environment, environmentPath, "type")
-	case "container_reference":
-		if err := s.validateAllowedKeys(environment, environmentPath, "type", "container_id"); err != nil {
-			return err
-		}
-		return validateOptionalStringMember(environment, "container_id", environmentPath)
-	default:
-		return unknownContentBlock(environmentPath, kind)
-	}
-}
-
-func (s *scanner) validateOpenAIContentBlockKeys(block map[string]any, path, kind string) *contentScanError {
-	switch kind {
-	case "text", "input_text":
-		return s.validateAllowedKeys(block, path, "type", "text", "prompt_cache_breakpoint")
-	case "output_text":
-		return s.validateAllowedKeys(block, path, "type", "text")
-	case "refusal":
-		return s.validateAllowedKeys(block, path, "type", "refusal")
-	case "image_url":
-		return s.validateAllowedKeys(block, path, "type", "image_url", "prompt_cache_breakpoint")
-	case "input_audio":
-		return s.validateAllowedKeys(block, path, "type", "input_audio", "prompt_cache_breakpoint")
-	case "file":
-		return s.validateAllowedKeys(block, path, "type", "file", "prompt_cache_breakpoint")
-	case "image_file":
-		return s.validateAllowedKeys(block, path, "type", "image_file")
-	default:
-		return unknownContentBlock(path, kind)
-	}
-}
-
-func (s *scanner) validateOpenAIMediaBlock(block map[string]any, path, kind string) *contentScanError {
-	var member string
-	var keys []string
-	switch kind {
-	case "image_url":
-		member, keys = "image_url", []string{"url", "detail"}
-	case "input_audio":
-		member, keys = "input_audio", []string{"data", "format"}
-	case "file":
-		member, keys = "file", []string{"file_data", "file_id", "filename"}
-	case "image_file":
-		member, keys = "image_file", []string{"file_id", "detail"}
-	default:
-		return nil
-	}
-	raw, exists := block[member]
-	if !exists {
-		return &contentScanError{Path: path + "." + member, Detail: member + " is required"}
-	}
-	value, ok := raw.(map[string]any)
-	if !ok {
-		return &contentScanError{Path: path + "." + member, Detail: member + " must be an object"}
-	}
-	return s.validateAllowedKeys(value, path+"."+member, keys...)
 }
 
 func contentBlockType(block map[string]any, path string) (string, *contentScanError) {
@@ -717,24 +536,12 @@ func scanResponsesInput(s *scanner, value any, path string) (any, *contentScanEr
 			if id, hasID := item["id"].(string); hasID && id != "" {
 				if _, hasRole := item["role"]; !hasRole {
 					if _, hasContent := item["content"]; !hasContent {
-						if len(item) == 1 {
-							continue
-						}
-						return nil, &contentScanError{Path: itemPath, Detail: "item reference must contain only id"}
+						continue
 					}
 				}
 			}
 			if _, hasRole := item["role"]; !hasRole {
 				return nil, &contentScanError{Path: itemPath + ".type", Detail: "input item type or role is required"}
-			}
-			if _, ok := item["role"].(string); !ok {
-				return nil, &contentScanError{Path: itemPath + ".role", Detail: "role must be a string"}
-			}
-			if err := s.validateAllowedKeys(item, itemPath, "role", "content", "phase"); err != nil {
-				return nil, err
-			}
-			if err := validateOptionalStringMember(item, "phase", itemPath); err != nil {
-				return nil, err
 			}
 			content, exists := item["content"]
 			if !exists {
@@ -751,21 +558,8 @@ func scanResponsesInput(s *scanner, value any, path string) (any, *contentScanEr
 		if err != nil {
 			return nil, err
 		}
-		if err := s.validateResponsesItemKeys(item, itemPath, kind); err != nil {
-			return nil, err
-		}
-		switch kind {
-		case "function_call", "function_call_output", "custom_tool_call", "custom_tool_call_output",
-			"shell_call", "shell_call_output", "apply_patch_call", "apply_patch_call_output":
-			if err := s.validateResponsesCaller(item, itemPath); err != nil {
-				return nil, err
-			}
-		}
 		switch kind {
 		case "message":
-			if err := validateOptionalStringMember(item, "phase", itemPath); err != nil {
-				return nil, err
-			}
 			content, exists := item["content"]
 			if !exists {
 				return nil, &contentScanError{Path: itemPath + ".content", Detail: "content is required"}
@@ -786,11 +580,6 @@ func scanResponsesInput(s *scanner, value any, path string) (any, *contentScanEr
 			}
 			item["content"] = walked
 		case "input_text", "output_text":
-			if kind == "input_text" {
-				if err := s.validatePromptCacheBreakpoint(item, itemPath); err != nil {
-					return nil, err
-				}
-			}
 			if err := scanStringMember(s, item, "text", itemPath, true); err != nil {
 				return nil, err
 			}
@@ -799,23 +588,8 @@ func scanResponsesInput(s *scanner, value any, path string) (any, *contentScanEr
 				return nil, err
 			}
 		case "function_call":
-			if err := validateOptionalStringMember(item, "namespace", itemPath); err != nil {
+			if err := scanFunctionArgumentsMember(s, item, itemPath, true); err != nil {
 				return nil, err
-			}
-			rawArguments, exists := item["arguments"]
-			if !exists {
-				return nil, &contentScanError{Path: itemPath + ".arguments", Detail: "arguments is required"}
-			}
-			arguments, ok := rawArguments.(string)
-			if !ok {
-				return nil, &contentScanError{Path: itemPath + ".arguments", Detail: "arguments must be a string"}
-			}
-			redacted, changed, scanErr := scanFunctionArgumentsJSONString(s, arguments, itemPath+".arguments")
-			if scanErr != nil {
-				return nil, scanErr
-			}
-			if changed {
-				item["arguments"] = redacted
 			}
 		case "function_call_output":
 			rawOutput, exists := item["output"]
@@ -828,9 +602,6 @@ func scanResponsesInput(s *scanner, value any, path string) (any, *contentScanEr
 			}
 			item["output"] = walked
 		case "custom_tool_call":
-			if err := validateOptionalStringMember(item, "namespace", itemPath); err != nil {
-				return nil, err
-			}
 			if err := scanStringMember(s, item, "input", itemPath, true); err != nil {
 				return nil, err
 			}
@@ -892,7 +663,7 @@ func scanResponsesInput(s *scanner, value any, path string) (any, *contentScanEr
 				return nil, err
 			}
 		case "mcp_approval_request":
-			if err := scanStrictJSONStringMember(s, item, "arguments", itemPath, true); err != nil {
+			if err := scanFunctionArgumentsMember(s, item, itemPath, true); err != nil {
 				return nil, err
 			}
 		case "mcp_approval_response":
@@ -900,7 +671,7 @@ func scanResponsesInput(s *scanner, value any, path string) (any, *contentScanEr
 				return nil, err
 			}
 		case "mcp_call":
-			if err := scanStrictJSONStringMember(s, item, "arguments", itemPath, true); err != nil {
+			if err := scanFunctionArgumentsMember(s, item, itemPath, true); err != nil {
 				return nil, err
 			}
 			if err := scanNullableStringMember(s, item, "error", itemPath); err != nil {
@@ -935,20 +706,10 @@ func scanResponsesInput(s *scanner, value any, path string) (any, *contentScanEr
 				return nil, &contentScanError{Path: itemPath + ".arguments", Detail: "arguments is required"}
 			}
 			item["arguments"] = s.scanContentValue(rawArguments, itemPath+".arguments")
-		case "tool_search_output":
-			// Tool definitions and their schemas are configuration, not runtime text.
-		case "additional_tools":
-			if rawRole, exists := item["role"]; exists {
-				role, ok := rawRole.(string)
-				if !ok || strings.TrimSpace(role) == "" {
-					return nil, &contentScanError{Path: itemPath + ".role", Detail: "role must be a non-empty string"}
-				}
-			}
+		case "tool_search_output", "additional_tools":
 			// Tool definitions and their schemas are configuration, not runtime text.
 		case "input_image", "input_file":
-			if err := s.validatePromptCacheBreakpoint(item, itemPath); err != nil {
-				return nil, err
-			}
+			// Image and file payloads remain opaque.
 		case "computer_screenshot", "item_reference",
 			"computer_call_output", "compaction", "compaction_trigger", "image_generation_call":
 			// Media, file data, and identifiers remain byte-equivalent values.
@@ -957,89 +718,6 @@ func scanResponsesInput(s *scanner, value any, path string) (any, *contentScanEr
 		}
 	}
 	return items, nil
-}
-
-func (s *scanner) validateResponsesItemKeys(item map[string]any, path, kind string) *contentScanError {
-	var keys []string
-	switch kind {
-	case "message":
-		keys = []string{"type", "id", "role", "status", "content", "phase"}
-	case "agent_message":
-		keys = []string{"type", "id", "author", "recipient", "content", "internal_chat_message_metadata_passthrough"}
-	case "input_text":
-		keys = []string{"type", "text", "annotations", "logprobs", "prompt_cache_breakpoint"}
-	case "output_text":
-		keys = []string{"type", "text", "annotations", "logprobs"}
-	case "refusal":
-		keys = []string{"type", "refusal"}
-	case "function_call":
-		keys = []string{"type", "id", "call_id", "name", "arguments", "status", "caller", "namespace"}
-	case "function_call_output":
-		keys = []string{"type", "id", "call_id", "output", "status", "caller"}
-	case "custom_tool_call":
-		keys = []string{"type", "id", "call_id", "name", "input", "status", "caller", "namespace"}
-	case "custom_tool_call_output":
-		keys = []string{"type", "id", "call_id", "output", "status", "caller"}
-	case "reasoning":
-		keys = []string{"type", "id", "summary", "content", "encrypted_content", "status"}
-	case "computer_call":
-		keys = []string{"type", "id", "call_id", "action", "actions", "pending_safety_checks", "status"}
-	case "local_shell_call":
-		keys = []string{"type", "id", "call_id", "action", "status"}
-	case "local_shell_call_output":
-		keys = []string{"type", "id", "output", "status"}
-	case "shell_call":
-		keys = []string{"type", "id", "call_id", "action", "status", "caller", "environment"}
-	case "shell_call_output":
-		keys = []string{"type", "id", "call_id", "output", "status", "caller"}
-	case "apply_patch_call":
-		keys = []string{"type", "id", "call_id", "operation", "status", "caller"}
-	case "apply_patch_call_output":
-		keys = []string{"type", "id", "call_id", "output", "status", "caller"}
-	case "mcp_list_tools":
-		keys = []string{"type", "id", "server_label", "tools", "error"}
-	case "mcp_approval_request":
-		keys = []string{"type", "id", "server_label", "name", "arguments"}
-	case "mcp_approval_response":
-		keys = []string{"type", "id", "approval_request_id", "approve", "reason"}
-	case "mcp_call":
-		keys = []string{"type", "id", "server_label", "name", "arguments", "approval_request_id", "error", "output", "status"}
-	case "program":
-		keys = []string{"type", "id", "code", "fingerprint"}
-	case "program_output":
-		keys = []string{"type", "id", "result"}
-	case "code_interpreter_call":
-		keys = []string{"type", "id", "container_id", "code", "outputs", "status"}
-	case "web_search_call":
-		keys = []string{"type", "id", "action", "status"}
-	case "file_search_call":
-		keys = []string{"type", "id", "queries", "results", "status"}
-	case "tool_search_call":
-		keys = []string{"type", "id", "arguments", "status"}
-	case "tool_search_output":
-		keys = []string{"type", "id", "tools", "status"}
-	case "additional_tools":
-		keys = []string{"type", "id", "role", "tools", "status"}
-	case "input_image":
-		keys = []string{"type", "detail", "file_id", "image_url", "prompt_cache_breakpoint"}
-	case "input_file":
-		keys = []string{"type", "file_data", "file_id", "file_url", "filename", "prompt_cache_breakpoint"}
-	case "computer_screenshot":
-		keys = []string{"type", "file_id", "image_url"}
-	case "item_reference":
-		keys = []string{"type", "id"}
-	case "computer_call_output":
-		keys = []string{"type", "id", "call_id", "output", "acknowledged_safety_checks", "status"}
-	case "compaction":
-		keys = []string{"type", "id", "encrypted_content"}
-	case "compaction_trigger":
-		keys = []string{"type"}
-	case "image_generation_call":
-		keys = []string{"type", "id", "result", "status"}
-	default:
-		return unknownContentBlock(path, kind)
-	}
-	return s.validateAllowedKeys(item, path, keys...)
 }
 
 func scanComputerSafetyChecks(s *scanner, item map[string]any, path string) *contentScanError {
@@ -1056,9 +734,6 @@ func scanComputerSafetyChecks(s *scanner, item map[string]any, path string) *con
 		check, ok := rawCheck.(map[string]any)
 		if !ok {
 			return &contentScanError{Path: checkPath, Detail: "safety check must be an object"}
-		}
-		if err := s.validateAllowedKeys(check, checkPath, "id", "code", "message"); err != nil {
-			return err
 		}
 		if err := scanNullableStringMember(s, check, "message", checkPath); err != nil {
 			return err
@@ -1104,22 +779,9 @@ func scanComputerAction(s *scanner, action map[string]any, path string) *content
 	}
 	switch kind {
 	case "type":
-		if err := s.validateAllowedKeys(action, path, "type", "text"); err != nil {
-			return err
-		}
 		return scanStringMember(s, action, "text", path, true)
-	case "click", "double_click":
-		return s.validateAllowedKeys(action, path, "type", "button", "x", "y")
-	case "drag":
-		return s.validateAllowedKeys(action, path, "type", "path")
-	case "keypress":
-		return s.validateAllowedKeys(action, path, "type", "keys")
-	case "move":
-		return s.validateAllowedKeys(action, path, "type", "x", "y")
-	case "scroll":
-		return s.validateAllowedKeys(action, path, "type", "scroll_x", "scroll_y", "x", "y")
-	case "screenshot", "wait":
-		return s.validateAllowedKeys(action, path, "type")
+	case "click", "double_click", "drag", "keypress", "move", "scroll", "screenshot", "wait":
+		return nil
 	default:
 		return unknownContentBlock(path, kind)
 	}
@@ -1140,9 +802,6 @@ func scanLocalShellCall(s *scanner, item map[string]any, path string) *contentSc
 	}
 	if kind != "exec" {
 		return unknownContentBlock(path+".action", kind)
-	}
-	if err := s.validateAllowedKeys(action, path+".action", "type", "command", "env", "timeout_ms", "user", "working_directory"); err != nil {
-		return err
 	}
 	if err := scanStringOrStringArrayMember(s, action, "command", path+".action", true); err != nil {
 		return err
@@ -1241,12 +900,6 @@ func scanShellCall(s *scanner, item map[string]any, path string) *contentScanErr
 	if !ok {
 		return &contentScanError{Path: path + ".action", Detail: "action is required and must be an object"}
 	}
-	if err := s.validateAllowedKeys(action, path+".action", "commands", "timeout_ms", "max_output_chars"); err != nil {
-		return err
-	}
-	if err := s.validateShellEnvironment(item, path); err != nil {
-		return err
-	}
 	return scanRequiredStringArrayMember(s, action, "commands", path+".action")
 }
 
@@ -1265,34 +918,10 @@ func scanShellCallOutput(s *scanner, item map[string]any, path string) *contentS
 		if !ok {
 			return &contentScanError{Path: entryPath, Detail: "output item must be an object"}
 		}
-		if err := s.validateAllowedKeys(entry, entryPath, "stdout", "stderr", "outcome"); err != nil {
-			return err
-		}
 		if err := scanStringMember(s, entry, "stdout", entryPath, true); err != nil {
 			return err
 		}
 		if err := scanStringMember(s, entry, "stderr", entryPath, true); err != nil {
-			return err
-		}
-		outcome, ok := entry["outcome"].(map[string]any)
-		if !ok {
-			return &contentScanError{Path: entryPath + ".outcome", Detail: "outcome is required and must be an object"}
-		}
-		kind, err := contentBlockType(outcome, entryPath+".outcome")
-		if err != nil {
-			return err
-		}
-		if kind != "timeout" && kind != "exit" {
-			return unknownContentBlock(entryPath+".outcome", kind)
-		}
-		if kind == "exit" {
-			if err := s.validateAllowedKeys(outcome, entryPath+".outcome", "type", "exit_code"); err != nil {
-				return err
-			}
-			if _, exists := outcome["exit_code"]; !exists {
-				return &contentScanError{Path: entryPath + ".outcome.exit_code", Detail: "exit_code is required"}
-			}
-		} else if err := s.validateAllowedKeys(outcome, entryPath+".outcome", "type"); err != nil {
 			return err
 		}
 	}
@@ -1310,17 +939,11 @@ func scanApplyPatchCall(s *scanner, item map[string]any, path string) *contentSc
 	}
 	switch kind {
 	case "create_file", "update_file":
-		if err := s.validateAllowedKeys(operation, path+".operation", "type", "path", "diff"); err != nil {
-			return err
-		}
 		if err := scanStringMember(s, operation, "path", path+".operation", true); err != nil {
 			return err
 		}
 		return scanStringMember(s, operation, "diff", path+".operation", true)
 	case "delete_file":
-		if err := s.validateAllowedKeys(operation, path+".operation", "type", "path"); err != nil {
-			return err
-		}
 		return scanStringMember(s, operation, "path", path+".operation", true)
 	default:
 		return unknownContentBlock(path+".operation", kind)
@@ -1351,16 +974,11 @@ func scanCodeInterpreterCall(s *scanner, item map[string]any, path string) *cont
 		}
 		switch kind {
 		case "logs":
-			if err := s.validateAllowedKeys(output, outputPath, "type", "logs"); err != nil {
-				return err
-			}
 			if err := scanStringMember(s, output, "logs", outputPath, true); err != nil {
 				return err
 			}
 		case "image":
-			if err := s.validateAllowedKeys(output, outputPath, "type", "url", "image_url"); err != nil {
-				return err
-			}
+			// Images remain opaque.
 		default:
 			return unknownContentBlock(outputPath, kind)
 		}
@@ -1379,36 +997,14 @@ func scanWebSearchCall(s *scanner, item map[string]any, path string) *contentSca
 	}
 	switch kind {
 	case "search":
-		if err := s.validateAllowedKeys(action, path+".action", "type", "query", "queries", "sources"); err != nil {
-			return err
-		}
 		if err := scanOptionalStringArrayMember(s, action, "queries", path+".action"); err != nil {
 			return err
 		}
-		if rawSources, exists := action["sources"]; exists && rawSources != nil {
-			sources, ok := rawSources.([]any)
-			if !ok {
-				return &contentScanError{Path: path + ".action.sources", Detail: "sources must be an array or null"}
-			}
-			for i, rawSource := range sources {
-				sourcePath := path + ".action.sources[" + strconv.Itoa(i) + "]"
-				source, ok := rawSource.(map[string]any)
-				if !ok {
-					return &contentScanError{Path: sourcePath, Detail: "source must be an object"}
-				}
-				if err := s.validateAllowedKeys(source, sourcePath, "type", "url"); err != nil {
-					return err
-				}
-			}
-		}
 		return scanNullableStringMember(s, action, "query", path+".action")
 	case "find_in_page":
-		if err := s.validateAllowedKeys(action, path+".action", "type", "pattern", "url"); err != nil {
-			return err
-		}
 		return scanStringMember(s, action, "pattern", path+".action", true)
 	case "open_page":
-		return s.validateAllowedKeys(action, path+".action", "type", "url")
+		return nil
 	default:
 		return unknownContentBlock(path+".action", kind)
 	}
@@ -1431,16 +1027,6 @@ func scanFileSearchCall(s *scanner, item map[string]any, path string) *contentSc
 		result, ok := rawResult.(map[string]any)
 		if !ok {
 			return &contentScanError{Path: resultPath, Detail: "result must be an object"}
-		}
-		if err := s.validateAllowedKeys(result, resultPath, "attributes", "file_id", "filename", "score", "text"); err != nil {
-			return err
-		}
-		if rawAttributes, exists := result["attributes"]; exists && rawAttributes != nil {
-			attributes, ok := rawAttributes.(map[string]any)
-			if !ok {
-				return &contentScanError{Path: resultPath + ".attributes", Detail: "attributes must be an object or null"}
-			}
-			result["attributes"] = s.scanContentValue(attributes, resultPath+".attributes")
 		}
 		if err := scanNullableStringMember(s, result, "text", resultPath); err != nil {
 			return err
@@ -1467,15 +1053,6 @@ func scanResponsesContent(s *scanner, value any, path string) (any, *contentScan
 		if err != nil {
 			return nil, err
 		}
-		if err := s.validateResponsesContentKeys(item, itemPath, kind); err != nil {
-			return nil, err
-		}
-		switch kind {
-		case "input_text", "input_image", "input_file":
-			if err := s.validatePromptCacheBreakpoint(item, itemPath); err != nil {
-				return nil, err
-			}
-		}
 		switch kind {
 		case "input_text", "output_text", "text", "summary_text", "reasoning_text":
 			if err := scanStringMember(s, item, "text", itemPath, true); err != nil {
@@ -1491,29 +1068,6 @@ func scanResponsesContent(s *scanner, value any, path string) (any, *contentScan
 		}
 	}
 	return items, nil
-}
-
-func (s *scanner) validateResponsesContentKeys(item map[string]any, path, kind string) *contentScanError {
-	switch kind {
-	case "input_text":
-		return s.validateAllowedKeys(item, path, "type", "text", "prompt_cache_breakpoint")
-	case "output_text":
-		return s.validateAllowedKeys(item, path, "type", "text", "annotations", "logprobs")
-	case "text", "summary_text", "reasoning_text":
-		return s.validateAllowedKeys(item, path, "type", "text")
-	case "refusal":
-		return s.validateAllowedKeys(item, path, "type", "refusal")
-	case "input_image":
-		return s.validateAllowedKeys(item, path, "type", "detail", "file_id", "image_url", "prompt_cache_breakpoint")
-	case "input_file":
-		return s.validateAllowedKeys(item, path, "type", "file_data", "file_id", "file_url", "filename", "prompt_cache_breakpoint")
-	case "computer_screenshot":
-		return s.validateAllowedKeys(item, path, "type", "file_id", "image_url")
-	case "encrypted_content":
-		return s.validateAllowedKeys(item, path, "type", "encrypted_content")
-	default:
-		return unknownContentBlock(path, kind)
-	}
 }
 
 // scanClaudeContent scans Anthropic messages[].content and the system prompt.
@@ -1533,9 +1087,8 @@ func scanClaudeContent(s *scanner, doc map[string]any) *contentScanError {
 		if !ok {
 			return &contentScanError{Path: messagePath, Detail: "message must be an object"}
 		}
-		if err := s.validateAllowedKeys(msg, messagePath, "role", "content"); err != nil {
-			return err
-		}
+		// Only content is a scan region. All sibling fields are protocol
+		// metadata and pass through without validation or unknown-field logs.
 		c, exists := msg["content"]
 		if !exists {
 			return &contentScanError{Path: messagePath + ".content", Detail: "content is required"}
@@ -1578,9 +1131,6 @@ func scanClaudeBlocks(s *scanner, value any, path string, allowNull bool) (any, 
 		}
 		kind, err := contentBlockType(block, blockPath)
 		if err != nil {
-			return nil, err
-		}
-		if err := s.validateClaudeBlockKeys(block, blockPath, kind); err != nil {
 			return nil, err
 		}
 		switch kind {
@@ -1665,42 +1215,6 @@ func scanClaudeBlocks(s *scanner, value any, path string, allowNull bool) (any, 
 		}
 	}
 	return blocks, nil
-}
-
-func (s *scanner) validateClaudeBlockKeys(block map[string]any, path, kind string) *contentScanError {
-	switch kind {
-	case "text":
-		return s.validateAllowedKeys(block, path, "type", "text", "citations", "cache_control")
-	case "thinking":
-		return s.validateAllowedKeys(block, path, "type", "thinking", "signature", "cache_control")
-	case "tool_use", "server_tool_use":
-		return s.validateAllowedKeys(block, path, "type", "id", "name", "input", "caller", "cache_control")
-	case "tool_result", "mcp_tool_result", "web_search_tool_result", "web_fetch_tool_result",
-		"code_execution_tool_result", "bash_code_execution_tool_result", "text_editor_code_execution_tool_result":
-		return s.validateAllowedKeys(block, path, "type", "tool_use_id", "content", "is_error", "cache_control")
-	case "search_result":
-		return s.validateAllowedKeys(block, path, "type", "source", "title", "content", "citations", "cache_control")
-	case "web_search_result":
-		return s.validateAllowedKeys(block, path, "type", "url", "title", "text", "page_age", "encrypted_content")
-	case "web_fetch_result":
-		return s.validateAllowedKeys(block, path, "type", "url", "title", "text", "content", "retrieved_at")
-	case "document":
-		return s.validateAllowedKeys(block, path, "type", "source", "title", "context", "citations", "cache_control")
-	case "tool_search_tool_result":
-		return s.validateAllowedKeys(block, path, "type", "tool_use_id", "content", "cache_control")
-	case "mid_conv_system":
-		return s.validateAllowedKeys(block, path, "type", "content")
-	case "tool_reference":
-		return s.validateAllowedKeys(block, path, "type", "tool_name")
-	case "container_upload":
-		return s.validateAllowedKeys(block, path, "type", "file_id")
-	case "image":
-		return s.validateAllowedKeys(block, path, "type", "source", "cache_control")
-	case "redacted_thinking":
-		return s.validateAllowedKeys(block, path, "type", "data")
-	default:
-		return unknownContentBlock(path, kind)
-	}
 }
 
 func scanClaudeToolResultContent(s *scanner, value any, path string) (any, *contentScanError) {
@@ -1904,28 +1418,7 @@ func scanClaudeToolSearchResult(s *scanner, value any, path string) (any, *conte
 			return nil, err
 		}
 	case "tool_search_tool_search_result":
-		rawReferences, exists := result["tool_references"]
-		if !exists {
-			return nil, &contentScanError{Path: path + ".tool_references", Detail: "tool_references is required"}
-		}
-		references, ok := rawReferences.([]any)
-		if !ok {
-			return nil, &contentScanError{Path: path + ".tool_references", Detail: "tool_references must be an array"}
-		}
-		for i, rawReference := range references {
-			referencePath := path + ".tool_references[" + strconv.Itoa(i) + "]"
-			reference, ok := rawReference.(map[string]any)
-			if !ok {
-				return nil, &contentScanError{Path: referencePath, Detail: "tool reference must be an object"}
-			}
-			referenceType, typeErr := contentBlockType(reference, referencePath)
-			if typeErr != nil {
-				return nil, typeErr
-			}
-			if referenceType != "tool_reference" {
-				return nil, unknownContentBlock(referencePath, referenceType)
-			}
-		}
+		// Tool references are protocol metadata, not message content.
 	default:
 		return nil, unknownContentBlock(path, kind)
 	}
@@ -1982,9 +1475,6 @@ func scanGeminiContent(s *scanner, doc map[string]any) *contentScanError {
 		if !ok {
 			return &contentScanError{Path: path, Detail: "content must be an object"}
 		}
-		if err := s.validateAllowedKeys(content, path, "role", "parts"); err != nil {
-			return err
-		}
 		if err := scanGeminiParts(s, content, path); err != nil {
 			return err
 		}
@@ -1997,9 +1487,6 @@ func scanGeminiContent(s *scanner, doc map[string]any) *contentScanError {
 		si, ok := rawInstruction.(map[string]any)
 		if !ok {
 			return &contentScanError{Path: key, Detail: "system instruction must be an object"}
-		}
-		if err := s.validateAllowedKeys(si, key, "role", "parts"); err != nil {
-			return err
 		}
 		if err := scanGeminiParts(s, si, key); err != nil {
 			return err
@@ -2026,16 +1513,7 @@ func scanGeminiParts(s *scanner, content map[string]any, contentPath string) *co
 		if !ok {
 			return &contentScanError{Path: partPath, Detail: "part must be an object"}
 		}
-		if err := s.validateAllowedKeys(part, partPath,
-			"text", "inlineData", "fileData", "functionCall", "functionResponse",
-			"executableCode", "codeExecutionResult", "toolCall", "toolResponse",
-			"thought", "thoughtSignature", "videoMetadata", "mediaResolution", "partMetadata",
-		); err != nil {
-			return err
-		}
-		contentFields := 0
 		if rawText, exists := part["text"]; exists {
-			contentFields++
 			t, ok := rawText.(string)
 			if !ok {
 				return &contentScanError{Path: partPath + ".text", Detail: "text must be a string"}
@@ -2043,15 +1521,11 @@ func scanGeminiParts(s *scanner, content map[string]any, contentPath string) *co
 			part["text"] = s.scanText(t, partPath+".text")
 		}
 		if rawCall, exists := part["functionCall"]; exists {
-			contentFields++
 			call, ok := rawCall.(map[string]any)
 			if !ok {
 				return &contentScanError{Path: partPath + ".functionCall", Detail: "functionCall must be an object"}
 			}
 			callPath := partPath + ".functionCall"
-			if err := s.validateAllowedKeys(call, callPath, "id", "args", "name", "partialArgs", "willContinue"); err != nil {
-				return err
-			}
 			if args, exists := call["args"]; exists {
 				call["args"] = s.scanContentValue(args, callPath+".args")
 			}
@@ -2066,9 +1540,6 @@ func scanGeminiParts(s *scanner, content map[string]any, contentPath string) *co
 					if !ok {
 						return &contentScanError{Path: partialPath, Detail: "partial argument must be an object"}
 					}
-					if err := s.validateAllowedKeys(partial, partialPath, "boolValue", "jsonPath", "nullValue", "numberValue", "stringValue", "willContinue"); err != nil {
-						return err
-					}
 					if err := scanNullableStringMember(s, partial, "stringValue", partialPath); err != nil {
 						return err
 					}
@@ -2076,61 +1547,33 @@ func scanGeminiParts(s *scanner, content map[string]any, contentPath string) *co
 			}
 		}
 		if rawResponse, exists := part["functionResponse"]; exists {
-			contentFields++
 			response, ok := rawResponse.(map[string]any)
 			if !ok {
 				return &contentScanError{Path: partPath + ".functionResponse", Detail: "functionResponse must be an object"}
-			}
-			if err := s.validateAllowedKeys(response, partPath+".functionResponse", "id", "name", "response", "parts", "scheduling", "willContinue"); err != nil {
-				return err
 			}
 			if value, exists := response["response"]; exists {
 				response["response"] = s.scanContentValue(value, partPath+".functionResponse.response")
 			}
 		}
 		if rawCall, exists := part["toolCall"]; exists {
-			contentFields++
 			call, ok := rawCall.(map[string]any)
 			if !ok {
 				return &contentScanError{Path: partPath + ".toolCall", Detail: "toolCall must be an object"}
-			}
-			if err := s.validateAllowedKeys(call, partPath+".toolCall", "id", "toolType", "args"); err != nil {
-				return err
 			}
 			if args, exists := call["args"]; exists {
 				call["args"] = s.scanContentValue(args, partPath+".toolCall.args")
 			}
 		}
 		if rawResponse, exists := part["toolResponse"]; exists {
-			contentFields++
 			response, ok := rawResponse.(map[string]any)
 			if !ok {
 				return &contentScanError{Path: partPath + ".toolResponse", Detail: "toolResponse must be an object"}
-			}
-			if err := s.validateAllowedKeys(response, partPath+".toolResponse", "id", "toolType", "response"); err != nil {
-				return err
 			}
 			if value, exists := response["response"]; exists {
 				response["response"] = s.scanContentValue(value, partPath+".toolResponse.response")
 			}
 		}
-		for _, key := range []string{"mediaResolution", "partMetadata"} {
-			if raw, exists := part[key]; exists {
-				if _, ok := raw.(map[string]any); !ok {
-					return &contentScanError{Path: partPath + "." + key, Detail: key + " must be an object"}
-				}
-			}
-		}
-		for _, key := range []string{"inlineData", "fileData"} {
-			if raw, exists := part[key]; exists {
-				contentFields++
-				if _, ok := raw.(map[string]any); !ok {
-					return &contentScanError{Path: partPath + "." + key, Detail: key + " must be an object"}
-				}
-			}
-		}
 		if rawCode, exists := part["executableCode"]; exists {
-			contentFields++
 			code, ok := rawCode.(map[string]any)
 			if !ok {
 				return &contentScanError{Path: partPath + ".executableCode", Detail: "executableCode must be an object"}
@@ -2140,7 +1583,6 @@ func scanGeminiParts(s *scanner, content map[string]any, contentPath string) *co
 			}
 		}
 		if rawResult, exists := part["codeExecutionResult"]; exists {
-			contentFields++
 			result, ok := rawResult.(map[string]any)
 			if !ok {
 				return &contentScanError{Path: partPath + ".codeExecutionResult", Detail: "codeExecutionResult must be an object"}
@@ -2149,51 +1591,8 @@ func scanGeminiParts(s *scanner, content map[string]any, contentPath string) *co
 				return err
 			}
 		}
-		if contentFields == 0 {
-			return &contentScanError{Path: partPath, Detail: "part content is required"}
-		}
 	}
 	return nil
-}
-
-func validateBlockContent(value any, path string, allowNull bool) *contentScanError {
-	if value == nil {
-		if allowNull {
-			return nil
-		}
-		return &contentScanError{Path: path, Detail: "content must be a string or array"}
-	}
-	switch content := value.(type) {
-	case string:
-		return nil
-	case []any:
-		for i, item := range content {
-			if _, ok := item.(map[string]any); !ok {
-				return &contentScanError{Path: path + "[" + strconv.Itoa(i) + "]", Detail: "content block must be an object"}
-			}
-		}
-		return nil
-	default:
-		return &contentScanError{Path: path, Detail: "content must be a string or array"}
-	}
-}
-
-func validateInputContent(value any, path string) *contentScanError {
-	switch input := value.(type) {
-	case string:
-		return nil
-	case []any:
-		for i, item := range input {
-			switch item.(type) {
-			case string, map[string]any:
-			default:
-				return &contentScanError{Path: path + "[" + strconv.Itoa(i) + "]", Detail: "input item must be a string or object"}
-			}
-		}
-		return nil
-	default:
-		return &contentScanError{Path: path, Detail: "input must be a string or array"}
-	}
 }
 
 // reencodeJSON serializes a decoded/modified JSON document with HTML escaping

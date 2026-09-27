@@ -32,9 +32,6 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.Mode != modeFilter {
 		t.Fatalf("Mode = %q, want %q", cfg.Mode, modeFilter)
 	}
-	if cfg.UnknownFieldBehavior != unknownFieldBehaviorBlock {
-		t.Fatalf("UnknownFieldBehavior = %q, want %q", cfg.UnknownFieldBehavior, unknownFieldBehaviorBlock)
-	}
 	if cfg.BlockReturnOriginal {
 		t.Fatal("BlockReturnOriginal = true, want false")
 	}
@@ -53,7 +50,7 @@ func TestDefaultConfig(t *testing.T) {
 }
 
 func TestParseLifecycleConfigOverrides(t *testing.T) {
-	yamlText := "enabled: true\npriority: 100\nmode: block\nunknown_field_behavior: ignore\nblock_return_original: true\ntoken_label: MASKED\nvault_ttl_seconds: 60\nvault_max_entries: 5\nbuiltin_rules_enabled: false\n"
+	yamlText := "enabled: true\npriority: 100\nmode: block\nblock_return_original: true\ntoken_label: MASKED\nvault_ttl_seconds: 60\nvault_max_entries: 5\nbuiltin_rules_enabled: false\n"
 	cfg, err := parseLifecycleConfig(lifecycleRequest(t, yamlText))
 	if err != nil {
 		t.Fatalf("parseLifecycleConfig: %v", err)
@@ -63,9 +60,6 @@ func TestParseLifecycleConfigOverrides(t *testing.T) {
 	}
 	if cfg.Mode != modeBlock {
 		t.Fatalf("Mode = %q, want %q", cfg.Mode, modeBlock)
-	}
-	if cfg.UnknownFieldBehavior != unknownFieldBehaviorIgnore {
-		t.Fatalf("UnknownFieldBehavior = %q, want %q", cfg.UnknownFieldBehavior, unknownFieldBehaviorIgnore)
 	}
 	if !cfg.BlockReturnOriginal {
 		t.Fatalf("BlockReturnOriginal = false, want true")
@@ -107,6 +101,7 @@ func TestExplicitEmptyTokenLabelIsNotDefaulted(t *testing.T) {
 func TestLifecycleConfigRejectsUnknownFieldsAndExtraDocuments(t *testing.T) {
 	for _, yamlText := range []string{
 		"vault_ttl_second: 60\n",
+		"unknown_field_behavior: ignore\n",
 		"custom_value_rules:\n  - name: marker\n    regex: ok\n    future: true\n",
 		"mode: filter\n---\nmode: block\n",
 	} {
@@ -158,7 +153,6 @@ func TestInvalidConfigStructureRejectsAndPreservesSnapshot(t *testing.T) {
 		mutate func(*pluginConfig)
 	}{
 		{name: "zero ttl", mutate: func(cfg *pluginConfig) { cfg.VaultTTLSeconds = 0 }},
-		{name: "invalid unknown field behavior", mutate: func(cfg *pluginConfig) { cfg.UnknownFieldBehavior = "reject" }},
 		{name: "negative capacity", mutate: func(cfg *pluginConfig) { cfg.VaultMaxEntries = -1 }},
 		{name: "ttl duration overflow", mutate: func(cfg *pluginConfig) { cfg.VaultTTLSeconds = int(int64(^uint64(0)>>1)/int64(time.Second) + 1) }},
 		{name: "field missing name", mutate: func(cfg *pluginConfig) { cfg.CustomFieldRules = []customFieldRule{{Keys: []string{"password"}}} }},
@@ -282,7 +276,6 @@ func TestConfigFieldsDeclaresSchema(t *testing.T) {
 	fields := configFields()
 	want := map[string]bool{
 		"mode":                   false,
-		"unknown_field_behavior": false,
 		"block_return_original":  false,
 		"token_label":            false,
 		"vault_ttl_seconds":      false,
@@ -302,19 +295,13 @@ func TestConfigFieldsDeclaresSchema(t *testing.T) {
 				t.Fatalf("mode enum values = %#v, want %#v", f.EnumValues, []string{modeFilter, modeBlock})
 			}
 		}
-		if f.Name == "unknown_field_behavior" {
-			if f.Type != pluginapi.ConfigFieldTypeEnum {
-				t.Fatalf("unknown_field_behavior field type = %q, want %q", f.Type, pluginapi.ConfigFieldTypeEnum)
-			}
-			if len(f.EnumValues) != 2 || f.EnumValues[0] != unknownFieldBehaviorBlock || f.EnumValues[1] != unknownFieldBehaviorIgnore {
-				t.Fatalf("unknown_field_behavior enum values = %#v, want %#v", f.EnumValues, []string{unknownFieldBehaviorBlock, unknownFieldBehaviorIgnore})
-			}
-		}
 		if f.Name == "block_return_original" && f.Type != pluginapi.ConfigFieldTypeBoolean {
 			t.Fatalf("block_return_original field type = %q, want %q", f.Type, pluginapi.ConfigFieldTypeBoolean)
 		}
 		if _, ok := want[f.Name]; ok {
 			want[f.Name] = true
+		} else {
+			t.Fatalf("unexpected config field %q", f.Name)
 		}
 	}
 	for name, seen := range want {
