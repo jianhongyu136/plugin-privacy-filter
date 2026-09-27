@@ -12,9 +12,9 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-func TestPluginRegistersMainSchema5Contract(t *testing.T) {
+func TestPluginRegistersMainSchema6Contract(t *testing.T) {
 	t.Cleanup(streamCarry.clear)
-	raw, err := handleMethod(pluginabi.MethodPluginRegister, []byte(`{"schema_version":5}`))
+	raw, err := handleMethod(pluginabi.MethodPluginRegister, []byte(`{"schema_version":6}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -29,8 +29,8 @@ func TestPluginRegistersMainSchema5Contract(t *testing.T) {
 	if err := json.Unmarshal(env.Result, &reg); err != nil {
 		t.Fatal(err)
 	}
-	if reg.SchemaVersion != 5 {
-		t.Fatalf("schema version = %d, want main schema 5", reg.SchemaVersion)
+	if reg.SchemaVersion != pluginabi.SchemaVersion {
+		t.Fatalf("schema version = %d, want main schema %d", reg.SchemaVersion, pluginabi.SchemaVersion)
 	}
 	for _, capability := range []string{"request_interceptor", "request_lifecycle_plugin", "response_interceptor", "response_stream_interceptor"} {
 		if !reg.Capabilities[capability] {
@@ -137,7 +137,7 @@ func TestLifecycleRejectsSchemaV3(t *testing.T) {
 	}
 }
 
-func TestLifecycleAcceptsFutureSchemaAndAdvertisesV5(t *testing.T) {
+func TestLifecycleAcceptsFutureSchemaAndAdvertisesImplementedContract(t *testing.T) {
 	raw, err := handleMethod(
 		pluginabi.MethodPluginReconfigure,
 		lifecycleRequestForSchema(t, "token_label: FUTURE\n", pluginSchemaVersion+7),
@@ -156,8 +156,8 @@ func TestLifecycleAcceptsFutureSchemaAndAdvertisesV5(t *testing.T) {
 	if err := json.Unmarshal(env.Result, &reg); err != nil {
 		t.Fatalf("unmarshal registration: %v", err)
 	}
-	if reg.SchemaVersion != 5 {
-		t.Fatalf("schema version = %d, want implemented V5", reg.SchemaVersion)
+	if reg.SchemaVersion != pluginabi.SchemaVersion {
+		t.Fatalf("schema version = %d, want implemented schema %d", reg.SchemaVersion, pluginabi.SchemaVersion)
 	}
 	if _, label := activeRuleSet(); label != "FUTURE" {
 		t.Fatalf("future host config was not applied: label=%q", label)

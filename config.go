@@ -39,8 +39,10 @@ type lifecycleRequestPayload struct {
 	SchemaVersion uint32 `json:"schema_version"`
 }
 
-// Main schema 5 omits request bodies and history from payload chunk callbacks.
-const pluginSchemaVersion uint32 = pluginabi.SchemaVersionStreamChunkOmitHistory
+// Current schema preserves raw management JSON and retains schema 5 stream-chunk
+// omissions. This plugin has no management handler; the bump keeps the advertised
+// contract aligned with the host.
+const pluginSchemaVersion uint32 = pluginabi.SchemaVersion
 
 type unsupportedSchemaVersionError struct {
 	received uint32

@@ -49,7 +49,7 @@ flowchart LR
 
 宿主加载共享库，并通过一套精简的 C ABI（`cliproxy_plugin_init` / `call` / `free_buffer` / `shutdown`）驱动它。每次调用都携带一个方法名和一段 JSON 请求，返回一个 JSON 信封（`{ok, result, error}`）。插件实现的方法有：
 
-协议兼容性使用两个彼此独立的版本号。原生 C ABI 仍为 `pluginabi.ABIVersion == 1`。生命周期 JSON RPC 请求要求上游 CLIProxyAPI 的 `schema_version >= 5`；缺失版本和 V1-V4 会在解析配置和修改运行时状态之前被拒绝。Schema 5 会省略载荷块中的请求体和历史块。插件使用宿主的模型执行 `RequestID`、初始化回调及 `request.complete`，不再依赖私有分支的 `StreamID` 或结束块扩展。即使收到更高的宿主版本，插件也始终只声明自身实现的 schema 5 契约，不表示支持未知的未来功能。
+协议兼容性使用两个彼此独立的版本号。原生 C ABI 仍为 `pluginabi.ABIVersion == 1`。生命周期 JSON RPC 请求要求上游 CLIProxyAPI 的 `schema_version >= 6`；缺失版本和 V1-V5 会在解析配置和修改运行时状态之前被拒绝。Schema 5 会省略载荷块中的请求体和历史块，schema 6 则保留插件管理接口响应中的原始 JSON。本插件没有管理接口，因此 schema 6 不改变其请求、响应或流式处理行为。插件使用宿主的模型执行 `RequestID`、初始化回调及 `request.complete`，不再依赖私有分支的 `StreamID` 或结束块扩展。即使收到更高的宿主版本，插件也始终只声明自身实现的 schema 6 契约，不表示支持未知的未来功能。
 
 - `plugin.register` / `plugin.reconfigure` —— 解析并校验配置、编译当前规则集、原地重配置共享 vault，并把工作模式、规则、标签、匹配模式和 vault 作为一个原子的运行时快照一起发布。共享 vault 会保留在途映射及仍持有旧快照的处理器产生的延迟写入。
 - `request.intercept_before` / `request.intercept_after` —— 脱敏出站请求体。
@@ -170,14 +170,14 @@ flowchart TB
 
 ### 主线兼容与升级
 
-- 使用上游 CLIProxyAPI schema 5 或更新版本，不再支持私有分支的 schema 4 有状态会话契约。
+- 使用上游 CLIProxyAPI schema 6 或更新版本，不再支持 schema 5 和私有分支的 schema 4 有状态会话契约。
 - 更换共享库、禁用插件或改变活动拦截器链之前，先排空在途请求。主线不会把一条流固定到某个插件版本，新实例不能继承旧实例的 vault、allowlist 或重组缓冲。采用排空后升级或滚动替换实例，不要在活动流期间直接热替换 DLL。
 - 同一已加载插件内的规则和配置重载仍保留共享 vault；这与替换共享库不同。
 - 必须确保本插件收到初始化回调。主线中，前置流式拦截器在初始化时返回 `DropChunk` 可能阻止该回调，不能保证任意插件组合均可工作。缺少初始化时，响应块保持原样，不会绕过请求白名单还原。
 
 ## 构建
 
-需要 Go 1.26+ 和 C 工具链（CGO）。插件被构建为 C 共享库。`go.mod` 固定依赖官方 `github.com/router-for-me/CLIProxyAPI/v7` SDK 的 `v7.2.153`，对应主线提交 `934fb7928c42a8dd0aeaf39a321bef6601b55eb6`。本地构建和发布直接使用该依赖，不再要求相邻 checkout 或私有 `jhy` 分支。开发 SDK 本身时，可以用本地 Go workspace 引入支持 schema 5 的 CLIProxyAPI checkout。
+需要 Go 1.26+ 和 C 工具链（CGO）。插件被构建为 C 共享库。`go.mod` 固定依赖官方 `github.com/router-for-me/CLIProxyAPI/v7` SDK 的 `v7.3.19`，对应主线提交 `6dea3dfa`。本地构建和发布直接使用该依赖，不再要求相邻 checkout 或私有 `jhy` 分支。开发 SDK 本身时，可以用本地 Go workspace 引入支持 schema 6 的 CLIProxyAPI checkout。
 
 ```bash
 # 发布构建会从 v* Git 标签注入版本号；本地构建可以使用 dev。

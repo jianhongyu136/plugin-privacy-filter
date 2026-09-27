@@ -49,7 +49,7 @@ flowchart LR
 
 The host loads the shared library and drives it over a small C ABI (`cliproxy_plugin_init` / `call` / `free_buffer` / `shutdown`). Every call carries a method name and a JSON request and returns a JSON envelope (`{ok, result, error}`). The methods the plugin implements are:
 
-Protocol compatibility uses two independent version numbers. The native C ABI remains `pluginabi.ABIVersion == 1`. Lifecycle JSON RPC requests require upstream CLIProxyAPI `schema_version >= 5`; missing versions and V1-V4 are rejected before configuration parsing or runtime mutation. Schema 5 omits request bodies and history from payload chunks. The plugin uses the host's model-execution `RequestID`, header initialization, and `request.complete`, not the private branch's `StreamID` or end-chunk extension. It always advertises its implemented schema 5 contract, even when a later host version is received; this does not claim support for unknown future features.
+Protocol compatibility uses two independent version numbers. The native C ABI remains `pluginabi.ABIVersion == 1`. Lifecycle JSON RPC requests require upstream CLIProxyAPI `schema_version >= 6`; missing versions and V1-V5 are rejected before configuration parsing or runtime mutation. Schema 5 omits request bodies and history from payload chunks, and schema 6 preserves raw JSON for plugin management responses. This plugin has no management handler, so the schema 6 change does not alter its request, response, or stream behavior. The plugin uses the host's model-execution `RequestID`, header initialization, and `request.complete`, not the private branch's `StreamID` or end-chunk extension. It always advertises its implemented schema 6 contract, even when a later host version is received; this does not claim support for unknown future features.
 
 - `plugin.register` / `plugin.reconfigure` — parse and validate the config, compile the active rule set, reconfigure the shared vault in place, and publish mode, rules, label, patterns, and vault together as one atomic runtime snapshot. Sharing the vault preserves in-flight mappings and late writes from handlers using an older snapshot.
 - `request.intercept_before` / `request.intercept_after` — redact the outbound request body.
@@ -170,14 +170,14 @@ flowchart TB
 
 ### Main compatibility and upgrades
 
-- Use upstream CLIProxyAPI schema 5 or newer. The private branch's schema 4 stateful-session contract is no longer supported.
+- Use upstream CLIProxyAPI schema 6 or newer. Schema 5 and the private branch's schema 4 stateful-session contract are no longer supported.
 - Drain in-flight requests before replacing the shared library, disabling the plugin, or changing the active interceptor chain. Main does not pin a stream to one plugin generation; a replacement cannot inherit the old vault, allowlist, or reassembly buffers. Use drained or rolling instance upgrades instead of replacing a DLL during active streams.
 - Rule/configuration reloads within the same loaded plugin still preserve the shared vault. They are distinct from library replacement.
 - Ensure this plugin receives header initialization. An earlier stream interceptor returning `DropChunk` during init can prevent that callback on main; arbitrary interceptor combinations are not guaranteed. Missing initialization leaves response chunks unchanged rather than restoring outside a request allowlist.
 
 ## Building
 
-Requires Go 1.26+ and a C toolchain (CGO). The plugin is built as a C shared library. `go.mod` pins the official `github.com/router-for-me/CLIProxyAPI/v7` SDK to `v7.2.153`, matching main commit `934fb7928c42a8dd0aeaf39a321bef6601b55eb6`. Builds and releases use that dependency directly; a sibling checkout or private `jhy` branch is not required. A local Go workspace can include a schema-5 CLIProxyAPI checkout when developing the SDK itself.
+Requires Go 1.26+ and a C toolchain (CGO). The plugin is built as a C shared library. `go.mod` pins the official `github.com/router-for-me/CLIProxyAPI/v7` SDK to `v7.3.19`, matching main commit `6dea3dfa`. Builds and releases use that dependency directly; a sibling checkout or private `jhy` branch is not required. A local Go workspace can include a schema-6 CLIProxyAPI checkout when developing the SDK itself.
 
 ```bash
 # Release builds inject the version from the v* Git tag; local builds can use dev.
