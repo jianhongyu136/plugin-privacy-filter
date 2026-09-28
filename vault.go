@@ -245,7 +245,6 @@ func setSharedVault(v *vault) {
 	if prev := activeState.Load(); prev != nil {
 		ns.rules = prev.rules
 		ns.mode = prev.mode
-		ns.blockReturnOriginal = prev.blockReturnOriginal
 		ns.label = prev.label
 		ns.tokenRe = prev.tokenRe
 		ns.restoreTokenRe = prev.restoreTokenRe

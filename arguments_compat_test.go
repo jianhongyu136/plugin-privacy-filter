@@ -184,7 +184,7 @@ func TestInvalidArgumentsDetectionHasNoReplacementSideEffects(t *testing.T) {
 				var handled bool
 				var scanErr *contentScanError
 				if block {
-					result, handled, scanErr = scanRequestContentForBlock(body, formatOpenAIResponse, rules, tokens, redact, true)
+					result, handled, scanErr = scanRequestContentForBlock(body, formatOpenAIResponse, rules, tokens, redact)
 				} else {
 					result, handled, scanErr = scanRequestContent(body, formatOpenAIResponse, rules, tokens, redact)
 				}
@@ -195,8 +195,8 @@ func TestInvalidArgumentsDetectionHasNoReplacementSideEffects(t *testing.T) {
 					t.Fatalf("unexpected scan findings: redactions=%v read-only=%v", result.Matches, result.ReadOnlyMatches)
 				}
 				if block && tc.wantMatches > 0 {
-					if len(result.Body) != 0 || result.ReadOnlyMatches[0].Context != tc.original {
-						t.Fatalf("block scan did not preserve opt-in context or stopped incorrectly: %+v", result)
+					if len(result.Body) != 0 || result.ReadOnlyMatches[0].Context != "[redacted]" {
+						t.Fatalf("block scan retained plaintext context or stopped incorrectly: %+v", result)
 					}
 				} else if !bytes.Equal(result.Body, body) {
 					t.Fatal("read-only scan changed the original request bytes")
@@ -228,7 +228,7 @@ func TestInvalidArgumentsReadOnlyOverlappingRulesAndEarlyStop(t *testing.T) {
 				t.Fatal("read-only detection attempted replacement")
 				return ""
 			}
-			result, handled, scanErr := scanRequestContentWithOptions(body, formatOpenAIResponse, rules, testTokenRe, redact, mode == modeBlock, false)
+			result, handled, scanErr := scanRequestContentWithOptions(body, formatOpenAIResponse, rules, testTokenRe, redact, mode == modeBlock)
 			if !handled || scanErr != nil {
 				t.Fatalf("scan failed: handled=%v error=%v", handled, scanErr)
 			}

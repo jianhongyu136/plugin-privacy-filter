@@ -10,12 +10,13 @@ import (
 
 const scanContextMaxRunes = 160
 
-// scanMatch records a single redaction. Context normally contains only redacted
-// output; block mode may opt in to a bounded copy of the matched plaintext.
+// scanMatch records a redaction. Field is only populated in block mode when
+// the matching rule identifies a name; Context never stores block plaintext.
 type scanMatch struct {
 	Rule     string
 	RuleType string // "field" or "value"
 	Path     string
+	Field    string
 	Context  string
 }
 
@@ -44,7 +45,6 @@ type scanner struct {
 	tokenRe              tokenMatcher
 	redact               redactFunc
 	stopAfterFirst       bool
-	returnOriginal       bool
 	matches              []scanMatch
 	readOnlyMatches      []scanMatch
 	warnInvalidArguments func(path, detail string, matches []scanMatch)
@@ -74,7 +74,7 @@ func (s *scanner) walk(node any, path string) any {
 			childPath := joinDynamicKey(path)
 			if str, ok := child.(string); ok {
 				if rule, matched := s.matchFieldRule(key, str); matched {
-					v[key] = s.redactWhole(str, rule.name, childPath)
+					v[key] = s.redactWhole(str, rule.name, childPath, key)
 					continue
 				}
 				v[key] = s.scanText(str, childPath)
@@ -84,7 +84,7 @@ func (s *scanner) walk(node any, path string) any {
 			// redacted whole when the field name matches a rule; otherwise a
 			// sensitive value such as {"password": 123456} would leak.
 			if rule, matched := s.matchFieldRuleNonString(key); matched {
-				v[key] = s.redactWholeValue(child, rule.name, childPath)
+				v[key] = s.redactWholeValue(child, rule.name, childPath, key)
 				continue
 			}
 			v[key] = s.walk(child, childPath)
@@ -144,12 +144,12 @@ func (s *scanner) matchFieldRuleNonString(key string) (fieldRule, bool) {
 // value that merely contains a token substring (for example a forged
 // "hunter2 <REDACTED_0000000000000000>") still carries a secret and must be
 // redacted. Records a "field" match.
-func (s *scanner) redactWhole(value, ruleName, path string) string {
+func (s *scanner) redactWhole(value, ruleName, path, key string) string {
 	if s.isWholeToken(value) {
 		return value
 	}
 	token := s.redact(value)
-	s.recordMatch(scanMatch{Rule: ruleName, RuleType: "field", Path: path, Context: s.blockContext(value, token)})
+	s.recordMatch(scanMatch{Rule: ruleName, RuleType: "field", Path: path, Field: s.blockField(key), Context: token})
 	return token
 }
 
@@ -163,7 +163,7 @@ func (s *scanner) redactWhole(value, ruleName, path string) string {
 // preserves the secret's characters but not its original JSON kind; callers
 // that need the exact original type must not route such fields through the
 // filter.
-func (s *scanner) redactWholeValue(value any, ruleName, path string) any {
+func (s *scanner) redactWholeValue(value any, ruleName, path, key string) any {
 	raw, err := json.Marshal(value)
 	if err != nil {
 		// Unreachable for a value decoded from JSON; keep the original rather
@@ -171,7 +171,7 @@ func (s *scanner) redactWholeValue(value any, ruleName, path string) any {
 		return value
 	}
 	token := s.redact(string(raw))
-	s.recordMatch(scanMatch{Rule: ruleName, RuleType: "field", Path: path, Context: s.blockContext(string(raw), token)})
+	s.recordMatch(scanMatch{Rule: ruleName, RuleType: "field", Path: path, Field: s.blockField(key), Context: token})
 	return token
 }
 
@@ -243,13 +243,13 @@ nextRule:
 	for _, rule := range s.rules.valueRules {
 		for _, segment := range segments {
 			for _, match := range rule.re.FindAllStringSubmatchIndex(segment, -1) {
-				start, end, valid := valueRuleSpan(rule, segment, match)
+				_, _, valid := valueRuleSpan(rule, segment, match)
 				if !valid {
 					continue
 				}
 				findings = append(findings, scanMatch{
 					Rule: rule.name, RuleType: "value", Path: path,
-					Context: s.blockContext(segment[start:end], "[redacted]"),
+					Field: s.blockField(configFieldName(rule, segment, match)), Context: "[redacted]",
 				})
 				if s.stopAfterFirst {
 					return findings
@@ -306,7 +306,7 @@ func (s *scanner) applyValueRules(text, path string) string {
 				}
 				token := s.redact(fragment)
 				if s.stopAfterFirst {
-					s.recordMatch(scanMatch{Rule: r.name, RuleType: "value", Path: path, Context: s.blockContext(fragment, token)})
+					s.recordMatch(scanMatch{Rule: r.name, RuleType: "value", Path: path, Field: s.blockField(configFieldName(r, segment.value, match)), Context: token})
 				}
 				if firstToken == "" {
 					firstToken = token
@@ -339,15 +339,44 @@ func (s *scanner) applyValueRules(text, path string) string {
 	return text
 }
 
-func (s *scanner) blockContext(original, token string) string {
-	if !s.returnOriginal {
-		return token
+// blockField bounds and sanitizes a request-controlled key for diagnostics.
+// In filter mode keys stay out of match metadata and logs.
+func (s *scanner) blockField(key string) string {
+	if !s.stopAfterFirst {
+		return ""
 	}
-	runes := []rune(original)
-	if len(runes) <= scanContextMaxRunes {
-		return original
+	runes := []rune(key)
+	if len(runes) > 80 {
+		runes = append(runes[:77], '.', '.', '.')
 	}
-	return string(runes[:scanContextMaxRunes-3]) + "..."
+	for i, r := range runes {
+		if r < 32 || r == 127 {
+			runes[i] = ' '
+		}
+	}
+	return string(runes)
+}
+
+// configFieldName extracts the assignment key preceding capture group 1 only
+// from builtin config_* rules. It never inspects or returns the captured value.
+func configFieldName(rule valueRule, text string, match []int) string {
+	if !rule.hasConfigKey || len(match) < 4 || match[2] < match[0] || match[3] <= match[2] {
+		return ""
+	}
+	prefix := strings.TrimSpace(text[match[0]:match[2]])
+	if len(prefix) < 2 || (prefix[len(prefix)-1] != '=' && prefix[len(prefix)-1] != ':') {
+		return ""
+	}
+	key := strings.TrimSpace(prefix[:len(prefix)-1])
+	if key == "" {
+		return ""
+	}
+	for _, c := range key {
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.') {
+			return ""
+		}
+	}
+	return key
 }
 
 func redactedExcerpt(text, focus string) string {

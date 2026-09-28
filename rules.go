@@ -130,6 +130,7 @@ type fieldRule struct {
 type valueRule struct {
 	name             string
 	re               *regexp.Regexp
+	hasConfigKey     bool
 	validate         func(string) bool
 	enabledByDefault bool
 }
@@ -187,6 +188,7 @@ func builtinValueRules() []valueRule {
 		rules = append(rules, valueRule{
 			name:             d.Name,
 			re:               regexp.MustCompile(d.Regex),
+			hasConfigKey:     strings.HasPrefix(d.Name, "config_"),
 			validate:         validate,
 			enabledByDefault: d.EnabledByDefault,
 		})

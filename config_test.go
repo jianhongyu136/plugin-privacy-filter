@@ -32,9 +32,6 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.Mode != modeFilter {
 		t.Fatalf("Mode = %q, want %q", cfg.Mode, modeFilter)
 	}
-	if cfg.BlockReturnOriginal {
-		t.Fatal("BlockReturnOriginal = true, want false")
-	}
 	if cfg.TokenLabel != "REDACTED" {
 		t.Fatalf("TokenLabel = %q, want REDACTED", cfg.TokenLabel)
 	}
@@ -50,7 +47,7 @@ func TestDefaultConfig(t *testing.T) {
 }
 
 func TestParseLifecycleConfigOverrides(t *testing.T) {
-	yamlText := "enabled: true\npriority: 100\nmode: block\nblock_return_original: true\ntoken_label: MASKED\nvault_ttl_seconds: 60\nvault_max_entries: 5\nbuiltin_rules_enabled: false\n"
+	yamlText := "enabled: true\npriority: 100\nmode: block\n\ntoken_label: MASKED\nvault_ttl_seconds: 60\nvault_max_entries: 5\nbuiltin_rules_enabled: false\n"
 	cfg, err := parseLifecycleConfig(lifecycleRequest(t, yamlText))
 	if err != nil {
 		t.Fatalf("parseLifecycleConfig: %v", err)
@@ -61,9 +58,6 @@ func TestParseLifecycleConfigOverrides(t *testing.T) {
 	if cfg.Mode != modeBlock {
 		t.Fatalf("Mode = %q, want %q", cfg.Mode, modeBlock)
 	}
-	if !cfg.BlockReturnOriginal {
-		t.Fatalf("BlockReturnOriginal = false, want true")
-	}
 	if cfg.VaultTTLSeconds != 60 {
 		t.Fatalf("VaultTTLSeconds = %d, want 60", cfg.VaultTTLSeconds)
 	}
@@ -72,6 +66,14 @@ func TestParseLifecycleConfigOverrides(t *testing.T) {
 	}
 	if cfg.BuiltinRulesEnabled {
 		t.Fatalf("BuiltinRulesEnabled = true, want false")
+	}
+}
+
+func TestRemovedBlockReturnOriginalConfigIsRejected(t *testing.T) {
+	if _, err := parseLifecycleConfig(lifecycleRequest(t, `mode: block
+block_return_original: true
+`)); err == nil {
+		t.Fatal("removed block_return_original setting was accepted")
 	}
 }
 
@@ -276,7 +278,6 @@ func TestConfigFieldsDeclaresSchema(t *testing.T) {
 	fields := configFields()
 	want := map[string]bool{
 		"mode":                   false,
-		"block_return_original":  false,
 		"token_label":            false,
 		"vault_ttl_seconds":      false,
 		"vault_max_entries":      false,
@@ -294,9 +295,6 @@ func TestConfigFieldsDeclaresSchema(t *testing.T) {
 			if len(f.EnumValues) != 2 || f.EnumValues[0] != modeFilter || f.EnumValues[1] != modeBlock {
 				t.Fatalf("mode enum values = %#v, want %#v", f.EnumValues, []string{modeFilter, modeBlock})
 			}
-		}
-		if f.Name == "block_return_original" && f.Type != pluginapi.ConfigFieldTypeBoolean {
-			t.Fatalf("block_return_original field type = %q, want %q", f.Type, pluginapi.ConfigFieldTypeBoolean)
 		}
 		if _, ok := want[f.Name]; ok {
 			want[f.Name] = true

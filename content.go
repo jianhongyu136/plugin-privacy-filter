@@ -58,17 +58,17 @@ func classifyFormat(sourceFormat string) formatDisposition {
 // content regions cannot be located) or the format is unrecognized; the caller
 // treats that as a reason to reject the request.
 func scanRequestContent(body []byte, sourceFormat string, rules ruleSet, tokenRe tokenMatcher, redact redactFunc) (scanResult, bool, *contentScanError) {
-	return scanRequestContentWithOptions(body, sourceFormat, rules, tokenRe, redact, false, false)
+	return scanRequestContentWithOptions(body, sourceFormat, rules, tokenRe, redact, false)
 }
 
 // scanRequestContentForBlock validates all selected content regions, then stops rule
 // scanning after the first finding. Blocked bodies are never sent upstream, so
 // the mutated document is deliberately not re-encoded.
-func scanRequestContentForBlock(body []byte, sourceFormat string, rules ruleSet, tokenRe tokenMatcher, redact redactFunc, returnOriginal bool) (scanResult, bool, *contentScanError) {
-	return scanRequestContentWithOptions(body, sourceFormat, rules, tokenRe, redact, true, returnOriginal)
+func scanRequestContentForBlock(body []byte, sourceFormat string, rules ruleSet, tokenRe tokenMatcher, redact redactFunc) (scanResult, bool, *contentScanError) {
+	return scanRequestContentWithOptions(body, sourceFormat, rules, tokenRe, redact, true)
 }
 
-func scanRequestContentWithOptions(body []byte, sourceFormat string, rules ruleSet, tokenRe tokenMatcher, redact redactFunc, stopAfterFirst, returnOriginal bool) (scanResult, bool, *contentScanError) {
+func scanRequestContentWithOptions(body []byte, sourceFormat string, rules ruleSet, tokenRe tokenMatcher, redact redactFunc, stopAfterFirst bool) (scanResult, bool, *contentScanError) {
 	doc, ok := decodeJSONObject(body)
 	if !ok {
 		return scanResult{}, false, nil
@@ -92,7 +92,6 @@ func scanRequestContentWithOptions(body []byte, sourceFormat string, rules ruleS
 		tokenRe:        tokenRe,
 		redact:         redact,
 		stopAfterFirst: stopAfterFirst,
-		returnOriginal: returnOriginal,
 		// Log only during the rule scan, after read-only detection, not during
 		// prevalidation. Neither argument text nor match contexts enter the log.
 		warnInvalidArguments: func(path, detail string, matches []scanMatch) {

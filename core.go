@@ -214,7 +214,7 @@ func handleRequestIntercept(request []byte) (out []byte, err error) {
 	var handled bool
 	var scanErr *contentScanError
 	if st.mode == modeBlock {
-		result, handled, scanErr = scanRequestContentForBlock(req.Body, req.SourceFormat, st.rules, requestTokens, redact, st.blockReturnOriginal)
+		result, handled, scanErr = scanRequestContentForBlock(req.Body, req.SourceFormat, st.rules, requestTokens, redact)
 	} else {
 		result, handled, scanErr = scanRequestContent(req.Body, req.SourceFormat, st.rules, requestTokens, redact)
 	}
@@ -240,12 +240,14 @@ func handleRequestIntercept(request []byte) (out []byte, err error) {
 		// regions: reject rather than forward a body we could not scan.
 		return okEnvelope(terminateRequest("privacy-filter could not parse " + req.SourceFormat + " request body"))
 	}
-	logScanMatches("request", result.Matches)
 	if st.mode == modeBlock {
 		matches := append(result.Matches, result.ReadOnlyMatches...)
 		if len(matches) > 0 {
+			logBlockedMatch(matches[0])
 			return okEnvelope(terminateRequest(blockRejectReason(matches)))
 		}
+	} else {
+		logScanMatches("request", result.Matches)
 	}
 
 	var resp pluginapi.RequestInterceptResponse
@@ -274,6 +276,11 @@ func blockRejectReason(matches []scanMatch) string {
 		out.WriteString(match.RuleType)
 		out.WriteString(") at ")
 		out.WriteString(match.Path)
+		if match.Field != "" {
+			out.WriteString(" field ")
+			quoted, _ := json.Marshal(match.Field)
+			out.Write(quoted)
+		}
 		out.WriteString(": ")
 		var quoted bytes.Buffer
 		encoder := json.NewEncoder(&quoted)
@@ -399,6 +406,15 @@ func sanitizeUnsupportedContent(value string) string {
 		runes = append(runes, r)
 	}
 	return string(runes)
+}
+
+// logBlockedMatch records an identifiable field name, never the matched value.
+func logBlockedMatch(match scanMatch) {
+	fields := logrus.Fields{"stage": "request", "rule": match.Rule, "type": match.RuleType, "path": match.Path}
+	if match.Field != "" {
+		fields["field"] = match.Field
+	}
+	logrus.WithFields(fields).Info("privacy-filter blocked request")
 }
 
 // logScanMatches logs only bounded metadata grouped by rule name and type. It

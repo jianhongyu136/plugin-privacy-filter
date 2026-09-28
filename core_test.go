@@ -387,8 +387,8 @@ func TestBlockModeRejectsWithRedactedContextWithoutVaultWrites(t *testing.T) {
 	}
 }
 
-func TestBlockModeCanReturnOriginalValueWhenConfigured(t *testing.T) {
-	config := "mode: block\nblock_return_original: true\ntoken_label: BLOCKED\nbuiltin_rules_enabled: false\ncustom_value_rules:\n  - name: marker\n    regex: BLOCKSECRET[0-9]+\n"
+func TestBlockModeDoesNotReturnOriginalValue(t *testing.T) {
+	config := "mode: block\n\ntoken_label: BLOCKED\nbuiltin_rules_enabled: false\ncustom_value_rules:\n  - name: marker\n    regex: BLOCKSECRET[0-9]+\n"
 	callRegister(t, pluginabi.MethodPluginRegister, config)
 
 	body := []byte(`{"messages":[{"role":"user","content":"prefix BLOCKSECRET123 suffix"}]}`)
@@ -396,19 +396,19 @@ func TestBlockModeCanReturnOriginalValueWhenConfigured(t *testing.T) {
 	if !response.Reject {
 		t.Fatal("block mode did not reject a request containing a privacy match")
 	}
-	if !strings.Contains(response.RejectReason, `"BLOCKSECRET123"`) {
-		t.Fatalf("block reason lacks the original matched value: %q", response.RejectReason)
+	if strings.Contains(response.RejectReason, "BLOCKSECRET123") {
+		t.Fatalf("block reason leaked the matched value: %q", response.RejectReason)
 	}
-	if strings.Contains(response.RejectReason, "<BLOCKED_") {
-		t.Fatalf("block reason returned a replacement token despite configuration: %q", response.RejectReason)
+	if !strings.Contains(response.RejectReason, "<BLOCKED_") {
+		t.Fatalf("block reason lacks redacted context: %q", response.RejectReason)
 	}
 	if !strings.Contains(response.RejectReason, "marker (value) at messages[0].content") {
 		t.Fatalf("block reason lacks the match path: %q", response.RejectReason)
 	}
 }
 
-func TestBlockModeCanReturnOriginalFieldValueWhenConfigured(t *testing.T) {
-	config := "mode: block\nblock_return_original: true\ntoken_label: BLOCKED\nbuiltin_rules_enabled: false\ncustom_field_rules:\n  - name: password\n    keys: [password]\n"
+func TestBlockModeReturnsFieldNameNotValue(t *testing.T) {
+	config := "mode: block\n\ntoken_label: BLOCKED\nbuiltin_rules_enabled: false\ncustom_field_rules:\n  - name: password\n    keys: [password]\n"
 	callRegister(t, pluginabi.MethodPluginRegister, config)
 
 	body := []byte(`{"messages":[{"role":"assistant","content":null,"function_call":{"name":"login","arguments":"{\"password\":\"field-secret\"}"}}]}`)
@@ -416,27 +416,115 @@ func TestBlockModeCanReturnOriginalFieldValueWhenConfigured(t *testing.T) {
 	if !response.Reject {
 		t.Fatal("block mode did not reject a request containing a field-rule match")
 	}
-	if !strings.Contains(response.RejectReason, `"field-secret"`) {
-		t.Fatalf("block reason lacks the original field value: %q", response.RejectReason)
+	if strings.Contains(response.RejectReason, "field-secret") || !strings.Contains(response.RejectReason, `field "password"`) {
+		t.Fatalf("block reason lacks the field name or leaked its value: %q", response.RejectReason)
 	}
 }
 
-func TestBlockModeOriginalContextIsBounded(t *testing.T) {
-	config := "mode: block\nblock_return_original: true\ntoken_label: BLOCKED\nbuiltin_rules_enabled: false\ncustom_value_rules:\n  - name: marker\n    regex: LONGSECRET[A-Za-z]+\n"
-	callRegister(t, pluginabi.MethodPluginRegister, config)
+func TestBlockModeFieldDiagnosticsDoNotLogValues(t *testing.T) {
+	tests := []struct {
+		name, config        string
+		body                []byte
+		rule, field, secret string
+	}{
+		{
+			name:   "field-rule-alias",
+			config: "mode: block",
+			body:   []byte(`{"messages":[{"role":"assistant","content":null,"function_call":{"name":"login","arguments":"{\"passwd\":\"field-secret-123\"}"}}]}`),
+			rule:   "password", field: "passwd", secret: "field-secret-123",
+		},
+		{
+			name:   "field-rule-nonstring",
+			config: "mode: block",
+			body:   []byte(`{"messages":[{"role":"assistant","content":null,"function_call":{"name":"login","arguments":"{\"password\":123456789}"}}]}`),
+			rule:   "password", field: "password", secret: "123456789",
+		},
+		{
+			name:   "config-password",
+			config: "mode: block",
+			body:   []byte(`{"messages":[{"role":"user","content":"DB_PASSWORD = private-987"}]}`),
+			rule:   "config_password", field: "DB_PASSWORD", secret: "private-987",
+		},
+		{
+			name:   "config-secret",
+			config: "mode: block",
+			body:   []byte(`{"messages":[{"role":"user","content":"client_secret: private-987"}]}`),
+			rule:   "config_secret", field: "client_secret", secret: "private-987",
+		},
+		{
+			name:   "config-password-read-only",
+			config: "mode: block",
+			body:   []byte(`{"messages":[{"role":"assistant","content":null,"function_call":{"name":"login","arguments":"db_password=private-987 {"}}]}`),
+			rule:   "config_password", field: "db_password", secret: "private-987",
+		},
+		{
+			name: "value-only-credit-card",
+			config: `mode: block
+enabled_builtin_rules: [credit_card]
+`,
+			body: []byte(`{"messages":[{"role":"user","content":"4111111111111111"}]}`),
+			rule: "credit_card", secret: "4111111111111111",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			callRegister(t, pluginabi.MethodPluginRegister, tc.config)
+			logger := logrus.StandardLogger()
+			previousOutput := logger.Out
+			previousHooks := logger.ReplaceHooks(make(logrus.LevelHooks))
+			hook := &scanLogCapture{}
+			logger.AddHook(hook)
+			logger.SetOutput(io.Discard)
+			t.Cleanup(func() { logger.SetOutput(previousOutput); logger.ReplaceHooks(previousHooks) })
 
-	body := []byte(`{"messages":[{"role":"user","content":"LONGSECRET` + strings.Repeat("x", 220) + `"}]}`)
+			response := invokeRequestIntercept(t, pluginabi.MethodRequestInterceptBefore, formatOpenAI, tc.body)
+			if !response.Reject || !strings.Contains(response.RejectReason, tc.rule) || strings.Contains(response.RejectReason, tc.secret) {
+				t.Fatalf("unexpected rejection: %q", response.RejectReason)
+			}
+			var blocked logrus.Fields
+			for _, entry := range hook.entries {
+				if entry["rule"] == tc.rule && entry["type"] != nil {
+					blocked = entry
+					break
+				}
+			}
+			if blocked == nil || blocked["field"] != nil && blocked["field"] != tc.field {
+				t.Fatalf("missing or invalid block diagnostic: %#v", hook.entries)
+			}
+			if tc.field == "" {
+				if strings.Contains(response.RejectReason, ` field "`) || blocked["field"] != nil {
+					t.Fatalf("value-only match invented a field: reason=%q logs=%#v", response.RejectReason, hook.entries)
+				}
+			} else if !strings.Contains(response.RejectReason, `field "`+tc.field+`"`) || blocked["field"] != tc.field {
+				t.Fatalf("matched field missing: reason=%q logs=%#v", response.RejectReason, hook.entries)
+			}
+			if strings.Contains(fmt.Sprint(hook.entries), tc.secret) {
+				t.Fatalf("log leaked the matched value: %#v", hook.entries)
+			}
+		})
+	}
+}
+
+func TestBlockModeBoundsFieldNameWithoutLeakingValue(t *testing.T) {
+	key := "password-" + strings.Repeat("x", 120)
+	config := fmt.Sprintf(`mode: block
+builtin_rules_enabled: false
+custom_field_rules:
+  - name: credential
+    keys: [%s]
+`, key)
+	callRegister(t, pluginabi.MethodPluginRegister, config)
+	arguments := mustJSONMarshal(t, map[string]any{key: "private-value"})
+	body := mustJSONMarshal(t, map[string]any{"messages": []any{map[string]any{
+		"role": "assistant", "content": nil,
+		"function_call": map[string]any{"name": "login", "arguments": string(arguments)},
+	}}})
 	response := invokeRequestIntercept(t, pluginabi.MethodRequestInterceptBefore, formatOpenAI, body)
-	if !response.Reject {
-		t.Fatal("block mode did not reject the long privacy match")
+	if !response.Reject || strings.Contains(response.RejectReason, "private-value") {
+		t.Fatalf("invalid block response: %q", response.RejectReason)
 	}
-	quoted := response.RejectReason[strings.LastIndex(response.RejectReason, ": ")+2:]
-	var context string
-	if err := json.Unmarshal([]byte(quoted), &context); err != nil {
-		t.Fatalf("original context is not JSON-quoted: %v (%q)", err, quoted)
-	}
-	if len([]rune(context)) > scanContextMaxRunes || !strings.HasSuffix(context, "...") {
-		t.Fatalf("original context was not bounded with an ellipsis: runes=%d context=%q", len([]rune(context)), context)
+	if strings.Contains(response.RejectReason, key) || !strings.Contains(response.RejectReason, `field "password-`) || !strings.Contains(response.RejectReason, `..."`) {
+		t.Fatalf("field name was not bounded: %q", response.RejectReason)
 	}
 }
 

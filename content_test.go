@@ -71,7 +71,7 @@ func TestBlockScanStopsAfterFirstMatchWithoutRewriting(t *testing.T) {
 		return testRedact(original)
 	}
 
-	result, handled, scanErr := scanRequestContentForBlock(body, formatOpenAI, rules, testTokenRe, redact, false)
+	result, handled, scanErr := scanRequestContentForBlock(body, formatOpenAI, rules, testTokenRe, redact)
 	if !handled || scanErr != nil {
 		t.Fatalf("block scan failed: handled=%v err=%v", handled, scanErr)
 	}
