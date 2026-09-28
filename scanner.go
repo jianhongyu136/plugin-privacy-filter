@@ -10,14 +10,16 @@ import (
 
 const scanContextMaxRunes = 160
 
-// scanMatch records a redaction. Field is only populated in block mode when
-// the matching rule identifies a name; Context never stores block plaintext.
+// scanMatch records a redaction. Only identifiable rule-matched field names
+// enter diagnostics; Context never stores block plaintext.
 type scanMatch struct {
-	Rule     string
-	RuleType string // "field" or "value"
-	Path     string
-	Field    string
-	Context  string
+	Rule          string
+	RuleType      string // "field" or "value"
+	Path          string
+	Field         string
+	Fields        []string // additional names from multiple config assignments in one string
+	OmittedFields int
+	Context       string
 }
 
 // scanResult is the outcome of scanning a request body.
@@ -149,7 +151,7 @@ func (s *scanner) redactWhole(value, ruleName, path, key string) string {
 		return value
 	}
 	token := s.redact(value)
-	s.recordMatch(scanMatch{Rule: ruleName, RuleType: "field", Path: path, Field: s.blockField(key), Context: token})
+	s.recordMatch(scanMatch{Rule: ruleName, RuleType: "field", Path: path, Field: diagnosticField(key), Context: token})
 	return token
 }
 
@@ -171,7 +173,7 @@ func (s *scanner) redactWholeValue(value any, ruleName, path, key string) any {
 		return value
 	}
 	token := s.redact(string(raw))
-	s.recordMatch(scanMatch{Rule: ruleName, RuleType: "field", Path: path, Field: s.blockField(key), Context: token})
+	s.recordMatch(scanMatch{Rule: ruleName, RuleType: "field", Path: path, Field: diagnosticField(key), Context: token})
 	return token
 }
 
@@ -249,7 +251,7 @@ nextRule:
 				}
 				findings = append(findings, scanMatch{
 					Rule: rule.name, RuleType: "value", Path: path,
-					Field: s.blockField(configFieldName(rule, segment, match)), Context: "[redacted]",
+					Field: diagnosticField(configFieldName(rule, segment, match)), Context: "[redacted]",
 				})
 				if s.stopAfterFirst {
 					return findings
@@ -276,6 +278,8 @@ func (s *scanner) applyValueRules(text, path string) string {
 	for _, r := range s.rules.valueRules {
 		var fired bool
 		var firstToken string
+		var fields []string
+		var omittedFields int
 		var next []textSegment
 		for _, segment := range segments {
 			if segment.protected {
@@ -306,7 +310,26 @@ func (s *scanner) applyValueRules(text, path string) string {
 				}
 				token := s.redact(fragment)
 				if s.stopAfterFirst {
-					s.recordMatch(scanMatch{Rule: r.name, RuleType: "value", Path: path, Field: s.blockField(configFieldName(r, segment.value, match)), Context: token})
+					s.recordMatch(scanMatch{Rule: r.name, RuleType: "value", Path: path, Field: diagnosticField(configFieldName(r, segment.value, match)), Context: token})
+				}
+				if !s.stopAfterFirst && r.hasConfigKey {
+					field := diagnosticField(configFieldName(r, segment.value, match))
+					if field != "" {
+						seen := false
+						for _, existing := range fields {
+							if existing == field {
+								seen = true
+								break
+							}
+						}
+						if !seen {
+							if len(fields) < scanLogMaxPaths {
+								fields = append(fields, field)
+							} else {
+								omittedFields++
+							}
+						}
+					}
 				}
 				if firstToken == "" {
 					firstToken = token
@@ -322,7 +345,7 @@ func (s *scanner) applyValueRules(text, path string) string {
 		}
 		segments = next
 		if fired {
-			matchIndex := s.recordMatch(scanMatch{Rule: r.name, RuleType: "value", Path: path})
+			matchIndex := s.recordMatch(scanMatch{Rule: r.name, RuleType: "value", Path: path, Fields: fields, OmittedFields: omittedFields})
 			pending = append(pending, pendingContext{matchIndex: matchIndex, token: firstToken})
 		}
 	}
@@ -339,12 +362,9 @@ func (s *scanner) applyValueRules(text, path string) string {
 	return text
 }
 
-// blockField bounds and sanitizes a request-controlled key for diagnostics.
-// In filter mode keys stay out of match metadata and logs.
-func (s *scanner) blockField(key string) string {
-	if !s.stopAfterFirst {
-		return ""
-	}
+// diagnosticField bounds and sanitizes an identifiable rule-matched key.
+// Keys from unrelated runtime objects are never added to match metadata.
+func diagnosticField(key string) string {
 	runes := []rune(key)
 	if len(runes) > 80 {
 		runes = append(runes[:77], '.', '.', '.')
@@ -418,9 +438,8 @@ func redactedExcerpt(text, focus string) string {
 	return prefix + string(runes[start:end]) + suffix
 }
 
-// joinDynamicKey appends a fixed marker for a request-controlled object key.
-// The real key is still used for field-rule matching, but never enters
-// diagnostics or logs where it could disclose request content.
+// joinDynamicKey masks request-controlled object keys in paths. Only an
+// explicitly matched field-rule key is exposed separately as a bounded name.
 func joinDynamicKey(path string) string {
 	if path == "" {
 		return ".*"

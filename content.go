@@ -110,6 +110,15 @@ func scanRequestContentWithOptions(body []byte, sourceFormat string, rules ruleS
 					rules = append(rules, match.Rule)
 				}
 				fields["rules"] = rules
+				var namedFields []string
+				for _, match := range matches[:min(len(matches), scanLogMaxPaths)] {
+					if match.Field != "" {
+						namedFields = append(namedFields, match.Field)
+					}
+				}
+				if len(namedFields) > 0 {
+					fields["fields"] = namedFields
+				}
 			}
 			logrus.WithFields(fields).Warn("privacy-filter scanned invalid JSON arguments without replacement")
 		},

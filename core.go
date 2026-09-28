@@ -417,8 +417,8 @@ func logBlockedMatch(match scanMatch) {
 	logrus.WithFields(fields).Info("privacy-filter blocked request")
 }
 
-// logScanMatches logs only bounded metadata grouped by rule name and type. It
-// never logs the original value, token, or scan context.
+// logScanMatches groups rule findings and bounded identifiable field names.
+// It never logs the original value, token, or scan context.
 func logScanMatches(stage string, matches []scanMatch) {
 	if len(matches) == 0 {
 		return
@@ -428,15 +428,32 @@ func logScanMatches(stage string, matches []scanMatch) {
 		ruleType string
 	}
 	type group struct {
-		key          groupKey
-		hits         int
-		paths        []string
-		seenPaths    map[string]struct{}
-		omittedPaths int
+		key           groupKey
+		hits          int
+		paths         []string
+		seenPaths     map[string]struct{}
+		omittedPaths  int
+		fields        []string
+		omittedFields int
 	}
 
 	byKey := make(map[groupKey]*group)
 	ordered := make([]*group, 0)
+	addField := func(current *group, field string) {
+		if field == "" {
+			return
+		}
+		for _, existing := range current.fields {
+			if existing == field {
+				return
+			}
+		}
+		if len(current.fields) < scanLogMaxPaths {
+			current.fields = append(current.fields, field)
+		} else {
+			current.omittedFields++
+		}
+	}
 	for _, match := range matches {
 		key := groupKey{rule: match.Rule, ruleType: match.RuleType}
 		current := byKey[key]
@@ -446,6 +463,11 @@ func logScanMatches(stage string, matches []scanMatch) {
 			ordered = append(ordered, current)
 		}
 		current.hits++
+		addField(current, match.Field)
+		for _, field := range match.Fields {
+			addField(current, field)
+		}
+		current.omittedFields += match.OmittedFields
 		if _, seen := current.seenPaths[match.Path]; seen {
 			continue
 		}
@@ -467,6 +489,12 @@ func logScanMatches(stage string, matches []scanMatch) {
 		}
 		if current.omittedPaths > 0 {
 			fields["omitted_paths"] = current.omittedPaths
+		}
+		if len(current.fields) > 0 {
+			fields["fields"] = current.fields
+		}
+		if current.omittedFields > 0 {
+			fields["omitted_fields"] = current.omittedFields
 		}
 		logrus.WithFields(fields).Info("privacy-filter redacted values")
 	}

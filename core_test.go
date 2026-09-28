@@ -669,7 +669,7 @@ func TestLogScanMatchesAggregatesAndBoundsPaths(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		matches = append(matches, scanMatch{
 			Rule: "shared", RuleType: "field",
-			Path: fmt.Sprintf("$.messages[%d]", i), Context: "plaintext-marker",
+			Path: fmt.Sprintf("$.messages[%d]", i), Field: fmt.Sprintf("password%d", i), Context: "plaintext-marker",
 		})
 	}
 	matches = append(matches, matches[0])
@@ -688,6 +688,10 @@ func TestLogScanMatchesAggregatesAndBoundsPaths(t *testing.T) {
 	}
 	if entries[0]["omitted_paths"] != 2 {
 		t.Fatalf("omitted_paths = %#v, want 2", entries[0]["omitted_paths"])
+	}
+	fields, ok := entries[0]["fields"].([]string)
+	if !ok || len(fields) != 8 || fields[0] != "password0" || fields[7] != "password7" || entries[0]["omitted_fields"] != 2 {
+		t.Fatalf("field diagnostics were not bounded: %#v", entries[0])
 	}
 	if entries[1]["type"] != "value" || entries[1]["hits"] != 1 {
 		t.Fatalf("value group = %#v", entries[1])
@@ -856,4 +860,87 @@ func indexOfBytes(haystack, needle []byte) int {
 		}
 	}
 	return -1
+}
+
+func TestFilterLogIdentifiesConfigAssignmentFields(t *testing.T) {
+	callRegister(t, pluginabi.MethodPluginRegister, "mode: filter")
+	logger := logrus.StandardLogger()
+	previousOutput := logger.Out
+	previousHooks := logger.ReplaceHooks(make(logrus.LevelHooks))
+	hook := &scanLogCapture{}
+	logger.AddHook(hook)
+	logger.SetOutput(io.Discard)
+	t.Cleanup(func() { logger.SetOutput(previousOutput); logger.ReplaceHooks(previousHooks) })
+
+	body := []byte(`{"messages":[{"role":"user","content":"db_password=sample-secret backup_password=second-secret"}]}`)
+	response := invokeRequestIntercept(t, pluginabi.MethodRequestInterceptBefore, formatOpenAI, body)
+	if response.Reject || len(response.Body) == 0 {
+		t.Fatalf("filter did not redact the assignment: reject=%v body=%s", response.Reject, response.Body)
+	}
+	for _, entry := range hook.entries {
+		if entry["rule"] != "config_password" {
+			continue
+		}
+		fields, ok := entry["fields"].([]string)
+		if !ok || len(fields) != 2 || fields[0] != "db_password" || fields[1] != "backup_password" {
+			t.Fatalf("config_password log omitted the matched field: %#v", entry)
+		}
+		if strings.Contains(fmt.Sprint(entry), "sample-secret") || strings.Contains(fmt.Sprint(entry), "second-secret") {
+			t.Fatalf("log leaked the private value: %#v", entry)
+		}
+		return
+	}
+	t.Fatalf("missing config_password log: %#v", hook.entries)
+}
+
+func TestFilterLogIdentifiesFieldRuleKey(t *testing.T) {
+	callRegister(t, pluginabi.MethodPluginRegister, "mode: filter\nbuiltin_rules_enabled: false\ncustom_field_rules:\n  - name: credential\n    keys: [passwd]\n")
+	logger := logrus.StandardLogger()
+	previousOutput := logger.Out
+	previousHooks := logger.ReplaceHooks(make(logrus.LevelHooks))
+	hook := &scanLogCapture{}
+	logger.AddHook(hook)
+	logger.SetOutput(io.Discard)
+	t.Cleanup(func() { logger.SetOutput(previousOutput); logger.ReplaceHooks(previousHooks) })
+
+	body := []byte(`{"messages":[{"role":"assistant","content":null,"function_call":{"name":"login","arguments":"{\"passwd\":\"sample-secret\"}"}}]}`)
+	response := invokeRequestIntercept(t, pluginabi.MethodRequestInterceptBefore, formatOpenAI, body)
+	if response.Reject || len(response.Body) == 0 {
+		t.Fatalf("field rule did not redact: reject=%v body=%s", response.Reject, response.Body)
+	}
+	for _, entry := range hook.entries {
+		if entry["rule"] != "credential" {
+			continue
+		}
+		fields, ok := entry["fields"].([]string)
+		if !ok || len(fields) != 1 || fields[0] != "passwd" || strings.Contains(fmt.Sprint(entry), "sample-secret") {
+			t.Fatalf("field rule diagnostic omitted key or exposed value: %#v", entry)
+		}
+		return
+	}
+	t.Fatalf("missing credential log: %#v", hook.entries)
+}
+
+func TestFilterReadOnlyWarningIdentifiesConfigField(t *testing.T) {
+	callRegister(t, pluginabi.MethodPluginRegister, "mode: filter")
+	logger := logrus.StandardLogger()
+	previousOutput := logger.Out
+	previousHooks := logger.ReplaceHooks(make(logrus.LevelHooks))
+	hook := &scanLogCapture{}
+	logger.AddHook(hook)
+	logger.SetOutput(io.Discard)
+	t.Cleanup(func() { logger.SetOutput(previousOutput); logger.ReplaceHooks(previousHooks) })
+
+	body := []byte(`{"messages":[{"role":"assistant","content":null,"function_call":{"name":"login","arguments":"db_password=sample-secret {"}}]}`)
+	response := invokeRequestIntercept(t, pluginabi.MethodRequestInterceptBefore, formatOpenAI, body)
+	if response.Reject {
+		t.Fatalf("filter rejected malformed arguments: %s", response.RejectReason)
+	}
+	if len(hook.entries) != 1 {
+		t.Fatalf("expected one read-only warning, got %#v", hook.entries)
+	}
+	fields, ok := hook.entries[0]["fields"].([]string)
+	if !ok || len(fields) != 1 || fields[0] != "db_password" || strings.Contains(fmt.Sprint(hook.entries), "sample-secret") {
+		t.Fatalf("read-only warning omitted field or exposed value: %#v", hook.entries)
+	}
 }
