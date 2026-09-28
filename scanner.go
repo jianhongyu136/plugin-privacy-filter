@@ -3,12 +3,18 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"regexp"
 	"strconv"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 )
 
 const scanContextMaxRunes = 160
+const diagnosticPlaceholder = "[REDACTED]"
+
+var diagnosticTokenRe = restoreTokenPattern()
+var diagnosticPlaceholderRe = regexp.MustCompile(`\[REDACTED\]`)
 
 // scanMatch records a redaction. Only identifiable rule-matched field names
 // enter diagnostics; Context never stores block plaintext.
@@ -20,6 +26,7 @@ type scanMatch struct {
 	Fields        []string // additional names from multiple config assignments in one string
 	OmittedFields int
 	Context       string
+	Excerpt       string // bounded nearby text with all recognized tokens masked
 }
 
 // scanResult is the outcome of scanning a request body.
@@ -151,7 +158,7 @@ func (s *scanner) redactWhole(value, ruleName, path, key string) string {
 		return value
 	}
 	token := s.redact(value)
-	s.recordMatch(scanMatch{Rule: ruleName, RuleType: "field", Path: path, Field: diagnosticField(key), Context: token})
+	s.recordMatch(scanMatch{Rule: ruleName, RuleType: "field", Path: path, Field: diagnosticField(key), Context: token, Excerpt: fieldDiagnosticExcerpt(key)})
 	return token
 }
 
@@ -173,7 +180,7 @@ func (s *scanner) redactWholeValue(value any, ruleName, path, key string) any {
 		return value
 	}
 	token := s.redact(string(raw))
-	s.recordMatch(scanMatch{Rule: ruleName, RuleType: "field", Path: path, Field: diagnosticField(key), Context: token})
+	s.recordMatch(scanMatch{Rule: ruleName, RuleType: "field", Path: path, Field: diagnosticField(key), Context: token, Excerpt: fieldDiagnosticExcerpt(key)})
 	return token
 }
 
@@ -310,7 +317,8 @@ func (s *scanner) applyValueRules(text, path string) string {
 				}
 				token := s.redact(fragment)
 				if s.stopAfterFirst {
-					s.recordMatch(scanMatch{Rule: r.name, RuleType: "value", Path: path, Field: diagnosticField(configFieldName(r, segment.value, match)), Context: token})
+					s.recordMatch(scanMatch{Rule: r.name, RuleType: "value", Path: path, Field: diagnosticField(configFieldName(r, segment.value, match)), Context: token,
+						Excerpt: s.diagnosticTextExcerpt(text, path, fragment)})
 				}
 				if !s.stopAfterFirst && r.hasConfigKey {
 					field := diagnosticField(configFieldName(r, segment.value, match))
@@ -358,8 +366,52 @@ func (s *scanner) applyValueRules(text, path string) string {
 	// for an early rule from retaining plaintext that a later rule redacts.
 	for _, item := range pending {
 		s.matches[item.matchIndex].Context = redactedExcerpt(text, item.token)
+		s.matches[item.matchIndex].Excerpt = diagnosticExcerpt(text, item.token)
 	}
 	return text
+}
+
+// diagnosticTextExcerpt performs a read-only diagnostic pass over the string.
+// This masks *all* known value-rule hits, even though block mode stopped after
+// its first finding. It never calls the token-writing redactor or writes a vault.
+func (s *scanner) diagnosticTextExcerpt(text, path, fragment string) string {
+	// Keep block-mode diagnostics from rescanning an unbounded request string.
+	if len(text) > 64*1024 {
+		return diagnosticPlaceholder
+	}
+	redact := func(value string) string { return makeToken("DIAG", value) }
+	// Do not let a value rule reveal part of an existing or forged token.
+	withoutTokens := diagnosticTokenRe.ReplaceAllString(text, diagnosticPlaceholder)
+	preview := &scanner{rules: s.rules, tokenRe: diagnosticPlaceholderRe, redact: redact}
+	masked := preview.scanText(withoutTokens, path)
+	if excerpt := diagnosticExcerpt(masked, redact(fragment)); excerpt != "" {
+		return excerpt
+	}
+	return diagnosticPlaceholder
+}
+
+// diagnosticExcerpt replaces tokens before taking the bounded window so an
+// excerpt boundary cannot leave part of a token or its hash in a log.
+func diagnosticExcerpt(text, focus string) string {
+	index := strings.Index(text, focus)
+	if index < 0 {
+		return ""
+	}
+	prefix := diagnosticTokenRe.ReplaceAllString(text[:index], diagnosticPlaceholder)
+	suffix := diagnosticTokenRe.ReplaceAllString(text[index+len(focus):], diagnosticPlaceholder)
+	masked := prefix + diagnosticPlaceholder + suffix
+	masked = strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return ' '
+		}
+		return r
+	}, masked)
+	return redactedExcerptAt(masked, utf8.RuneCountInString(prefix), utf8.RuneCountInString(diagnosticPlaceholder))
+}
+
+func fieldDiagnosticExcerpt(key string) string {
+	quoted, _ := json.Marshal(diagnosticField(key))
+	return string(quoted) + ": " + strconv.Quote(diagnosticPlaceholder)
 }
 
 // diagnosticField bounds and sanitizes an identifiable rule-matched key.
@@ -400,14 +452,18 @@ func configFieldName(rule valueRule, text string, match []int) string {
 }
 
 func redactedExcerpt(text, focus string) string {
+	start, length := 0, 0
+	if byteIndex := strings.Index(text, focus); byteIndex >= 0 {
+		start = utf8.RuneCountInString(text[:byteIndex])
+		length = utf8.RuneCountInString(focus)
+	}
+	return redactedExcerptAt(text, start, length)
+}
+
+func redactedExcerptAt(text string, focusStart, focusLen int) string {
 	runes := []rune(text)
 	if len(runes) <= scanContextMaxRunes {
 		return text
-	}
-	focusStart, focusLen := 0, 0
-	if byteIndex := strings.Index(text, focus); byteIndex >= 0 {
-		focusStart = utf8.RuneCountInString(text[:byteIndex])
-		focusLen = utf8.RuneCountInString(focus)
 	}
 	window := func(size int) (int, int) {
 		start := focusStart - (size-focusLen)/2

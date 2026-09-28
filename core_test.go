@@ -376,7 +376,7 @@ func TestBlockModeRejectsWithRedactedContextWithoutVaultWrites(t *testing.T) {
 		t.Fatalf("block reason leaked plaintext: %q", response.RejectReason)
 	}
 	if !strings.Contains(response.RejectReason, "marker (value) at messages[0].content") ||
-		!strings.Contains(response.RejectReason, `: "<BLOCKED_`) {
+		!strings.Contains(response.RejectReason, `: "prefix [REDACTED] suffix"`) {
 		t.Fatalf("block reason lacks the first match and redacted token: %q", response.RejectReason)
 	}
 	if got, ok := st.vault.Get(existingToken); !ok || got != "in-flight" {
@@ -399,8 +399,8 @@ func TestBlockModeDoesNotReturnOriginalValue(t *testing.T) {
 	if strings.Contains(response.RejectReason, "BLOCKSECRET123") {
 		t.Fatalf("block reason leaked the matched value: %q", response.RejectReason)
 	}
-	if !strings.Contains(response.RejectReason, "<BLOCKED_") {
-		t.Fatalf("block reason lacks redacted context: %q", response.RejectReason)
+	if !strings.Contains(response.RejectReason, "prefix [REDACTED] suffix") || strings.Contains(response.RejectReason, "<BLOCKED_") {
+		t.Fatalf("block reason lacks a masked excerpt: %q", response.RejectReason)
 	}
 	if !strings.Contains(response.RejectReason, "marker (value) at messages[0].content") {
 		t.Fatalf("block reason lacks the match path: %q", response.RejectReason)
@@ -551,7 +551,7 @@ func TestBlockModeReasonIsBoundedAndSanitized(t *testing.T) {
 	if strings.Contains(response.RejectReason, "RAW-SECRET-KEY") || strings.Contains(response.RejectReason, "BLOCKSECRET999") || strings.Contains(response.RejectReason, "\nINJECT") {
 		t.Fatalf("block reason leaked or preserved control characters: %q", response.RejectReason)
 	}
-	if !strings.Contains(response.RejectReason, ".arguments.*") || !strings.Contains(response.RejectReason, "<BLOCKED_") {
+	if !strings.Contains(response.RejectReason, ".arguments.*") || !strings.Contains(response.RejectReason, "[REDACTED]") || strings.Contains(response.RejectReason, "<BLOCKED_") {
 		t.Fatalf("block reason lacks sanitized path/context: %q", response.RejectReason)
 	}
 	if len(response.RejectReason) > 512 {
@@ -943,4 +943,66 @@ func TestFilterReadOnlyWarningIdentifiesConfigField(t *testing.T) {
 	if !ok || len(fields) != 1 || fields[0] != "db_password" || strings.Contains(fmt.Sprint(hook.entries), "sample-secret") {
 		t.Fatalf("read-only warning omitted field or exposed value: %#v", hook.entries)
 	}
+}
+
+func TestFilterLogReportsDeduplicatedMaskedContext(t *testing.T) {
+	callRegister(t, pluginabi.MethodPluginRegister, "mode: filter")
+	logger := logrus.StandardLogger()
+	previousOutput := logger.Out
+	previousHooks := logger.ReplaceHooks(make(logrus.LevelHooks))
+	hook := &scanLogCapture{}
+	logger.AddHook(hook)
+	logger.SetOutput(io.Discard)
+	t.Cleanup(func() { logger.SetOutput(previousOutput); logger.ReplaceHooks(previousHooks) })
+
+	body := []byte(`{"messages":[{"role":"user","content":"service alpha db_password=example-secret after"},{"role":"user","content":"service alpha db_password=example-secret after"}]}`)
+	response := invokeRequestIntercept(t, pluginabi.MethodRequestInterceptBefore, formatOpenAI, body)
+	if response.Reject || len(response.Body) == 0 {
+		t.Fatalf("filter did not redact the request: reject=%v", response.Reject)
+	}
+	for _, entry := range hook.entries {
+		if entry["rule"] != "config_password" {
+			continue
+		}
+		contexts, ok := entry["contexts"].([]string)
+		if !ok || len(contexts) != 1 || !strings.Contains(contexts[0], "service alpha db_password=[REDACTED] after") {
+			t.Fatalf("log lacks a unique masked excerpt: %#v", entry)
+		}
+		if entry["hits"] != 2 || strings.Contains(fmt.Sprint(entry), "example-secret") || strings.Contains(contexts[0], "<REDACTED_") {
+			t.Fatalf("log repeated or leaked sensitive context: %#v", entry)
+		}
+		return
+	}
+	t.Fatalf("missing config_password log: %#v", hook.entries)
+}
+
+func TestBlockLogAndReasonUseMaskedContext(t *testing.T) {
+	callRegister(t, pluginabi.MethodPluginRegister, "mode: block")
+	logger := logrus.StandardLogger()
+	previousOutput := logger.Out
+	previousHooks := logger.ReplaceHooks(make(logrus.LevelHooks))
+	hook := &scanLogCapture{}
+	logger.AddHook(hook)
+	logger.SetOutput(io.Discard)
+	t.Cleanup(func() { logger.SetOutput(previousOutput); logger.ReplaceHooks(previousHooks) })
+
+	body := []byte(`{"messages":[{"role":"user","content":"service alpha db_password=example-secret and client_secret=another-secret after"}]}`)
+	response := invokeRequestIntercept(t, pluginabi.MethodRequestInterceptBefore, formatOpenAI, body)
+	if !response.Reject || !strings.Contains(response.RejectReason, "db_password=[REDACTED]") {
+		t.Fatalf("block reason lacks masked nearby text: %q", response.RejectReason)
+	}
+	if strings.Contains(response.RejectReason, "example-secret") || strings.Contains(response.RejectReason, "another-secret") || strings.Contains(response.RejectReason, "<REDACTED_") {
+		t.Fatalf("block reason leaked matched or adjacent private values: %q", response.RejectReason)
+	}
+	for _, entry := range hook.entries {
+		if entry["rule"] != "config_password" {
+			continue
+		}
+		context, ok := entry["context"].(string)
+		if !ok || !strings.Contains(context, "db_password=[REDACTED]") || strings.Contains(fmt.Sprint(entry), "example-secret") || strings.Contains(fmt.Sprint(entry), "another-secret") {
+			t.Fatalf("block log lacks masked nearby text: %#v", entry)
+		}
+		return
+	}
+	t.Fatalf("missing config_password block log: %#v", hook.entries)
 }

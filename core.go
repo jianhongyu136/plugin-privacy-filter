@@ -285,7 +285,11 @@ func blockRejectReason(matches []scanMatch) string {
 		var quoted bytes.Buffer
 		encoder := json.NewEncoder(&quoted)
 		encoder.SetEscapeHTML(false)
-		_ = encoder.Encode(match.Context)
+		context := match.Excerpt
+		if context == "" {
+			context = match.Context
+		}
+		_ = encoder.Encode(context)
 		out.Write(bytes.TrimSuffix(quoted.Bytes(), []byte{'\n'}))
 	}
 	if remaining := len(matches) - limit; remaining > 0 {
@@ -408,17 +412,20 @@ func sanitizeUnsupportedContent(value string) string {
 	return string(runes)
 }
 
-// logBlockedMatch records an identifiable field name, never the matched value.
+// logBlockedMatch records an identifiable field and a masked nearby excerpt.
 func logBlockedMatch(match scanMatch) {
 	fields := logrus.Fields{"stage": "request", "rule": match.Rule, "type": match.RuleType, "path": match.Path}
 	if match.Field != "" {
 		fields["field"] = match.Field
 	}
+	if match.Excerpt != "" {
+		fields["context"] = match.Excerpt
+	}
 	logrus.WithFields(fields).Info("privacy-filter blocked request")
 }
 
-// logScanMatches groups rule findings and bounded identifiable field names.
-// It never logs the original value, token, or scan context.
+// logScanMatches groups bounded field names and deduplicated masked excerpts.
+// It never logs the matched plaintext, token, or unredacted scan context.
 func logScanMatches(stage string, matches []scanMatch) {
 	if len(matches) == 0 {
 		return
@@ -428,13 +435,15 @@ func logScanMatches(stage string, matches []scanMatch) {
 		ruleType string
 	}
 	type group struct {
-		key           groupKey
-		hits          int
-		paths         []string
-		seenPaths     map[string]struct{}
-		omittedPaths  int
-		fields        []string
-		omittedFields int
+		key             groupKey
+		hits            int
+		paths           []string
+		seenPaths       map[string]struct{}
+		omittedPaths    int
+		fields          []string
+		omittedFields   int
+		contexts        []string
+		omittedContexts int
 	}
 
 	byKey := make(map[groupKey]*group)
@@ -468,6 +477,22 @@ func logScanMatches(stage string, matches []scanMatch) {
 			addField(current, field)
 		}
 		current.omittedFields += match.OmittedFields
+		if match.Excerpt != "" {
+			seen := false
+			for _, context := range current.contexts {
+				if context == match.Excerpt {
+					seen = true
+					break
+				}
+			}
+			if !seen {
+				if len(current.contexts) < scanLogMaxPaths {
+					current.contexts = append(current.contexts, match.Excerpt)
+				} else {
+					current.omittedContexts++
+				}
+			}
+		}
 		if _, seen := current.seenPaths[match.Path]; seen {
 			continue
 		}
@@ -495,6 +520,12 @@ func logScanMatches(stage string, matches []scanMatch) {
 		}
 		if current.omittedFields > 0 {
 			fields["omitted_fields"] = current.omittedFields
+		}
+		if len(current.contexts) > 0 {
+			fields["contexts"] = current.contexts
+		}
+		if current.omittedContexts > 0 {
+			fields["omitted_contexts"] = current.omittedContexts
 		}
 		logrus.WithFields(fields).Info("privacy-filter redacted values")
 	}

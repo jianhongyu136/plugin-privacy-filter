@@ -242,3 +242,16 @@ func TestOverlappingValueRulesDoNotRetokenizeEmittedTokens(t *testing.T) {
 		t.Fatalf("secret was tokenized more than once: %q", got)
 	}
 }
+
+func TestDiagnosticExcerptMasksWholeTokensBeforeTruncation(t *testing.T) {
+	focus := "<BLOCKED_abcdef0123456789>"
+	other := "<OTHER_0123456789abcdef>"
+	text := strings.Repeat("a", 75) + other + strings.Repeat("b", 20) + focus + strings.Repeat("c", 75)
+	excerpt := diagnosticExcerpt(text, focus)
+	if utf8.RuneCountInString(excerpt) > scanContextMaxRunes || !strings.Contains(excerpt, diagnosticPlaceholder) {
+		t.Fatalf("diagnostic excerpt was not bounded or masked: %q", excerpt)
+	}
+	if strings.Contains(excerpt, "0123456789abcdef") || strings.Contains(excerpt, "abcdef0123456789") || strings.Contains(excerpt, "<OTHER_") || strings.Contains(excerpt, "<BLOCKED_") {
+		t.Fatalf("diagnostic excerpt exposed a token or hash fragment: %q", excerpt)
+	}
+}
