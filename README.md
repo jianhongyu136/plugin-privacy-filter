@@ -97,7 +97,7 @@ flowchart TB
    - Tool-call `arguments` strings that cannot be parsed as exactly one JSON value (including empty, incomplete, malformed, or trailing-value input) are scanned as text without replacement. Only value-pattern rules apply because JSON field names cannot be reliably decoded; built-in `config_*` assignment patterns can still identify their textual key. This detection respects capture groups, validators, and existing vault-backed tokens, and never creates tokens or vault mappings. A match rejects in `block` mode; `filter` mode warns and forwards the original argument string while continuing to redact other content. A parse failure without a rule match does not block. Warnings contain the path, sanitized parse reason, mode, and matching rule metadata. This applies to OpenAI Chat legacy/current function calls and Responses function/MCP calls; required-member and string-type checks still apply.
    - All endpoints skip fields outside their known content regions, including extra fields on messages, content blocks, and tool-call envelopes. Examples include `output_config`, `phase`, `caller`, cache settings, file-result attributes, and opaque media. These fields are neither scanned nor schema-validated, and produce no unknown-field warnings. Unknown content block types and invalid structures needed to locate content can still be rejected.
    - Existing tokens under any grammar-valid label are not re-tokenized only when their exact mapping is still present in the shared vault. This keeps before/after passes stable across label changes without allowing forged token-shaped text to bypass scanning.
-5. In `filter` mode normal content matches are replaced by placeholder tokens `<LABEL_hash>`; read-only matches in malformed arguments only produce warnings. In `block` mode rule scanning stops at the first normal or read-only finding. The rejection reason and diagnostic log include a bounded nearby excerpt with recognized private values replaced by `[REDACTED]`, as well as an identifiable key for field and built-in `config_*` assignment rules. Value-only findings (such as card numbers) never return the matched plaintext. Remove the former `block_return_original` setting from existing configurations. Read-only detection never generates a token.
+5. In `filter` mode normal content matches are replaced by placeholder tokens `<LABEL_hash>`; read-only matches in malformed arguments only produce warnings. In `block` mode rule scanning stops at the first normal or read-only finding. The rejection reason and diagnostic log include a bounded nearby excerpt with recognized private values replaced by `[REDACTED]`, as well as an identifiable key for field and built-in `config_*` assignment rules. Value-only findings (such as card numbers) never return the matched plaintext. Read-only detection never generates a token.
 6. In `filter` mode the `token -> original` mapping is written to the vault and the redacted body is sent upstream. In `block` mode the request is rejected without writing a vault mapping or serializing the mutated JSON document. If nothing matched, either mode leaves the body byte-for-byte untouched and allows it through.
 
 ### Response path (restoration)
@@ -177,9 +177,11 @@ flowchart TB
 
 ## Building
 
-Requires Go 1.26+ and a C toolchain (CGO). The plugin is built as a C shared library. `go.mod` pins the official `github.com/router-for-me/CLIProxyAPI/v7` SDK to `v7.3.19`, matching main commit `6dea3dfa`. Builds and releases use that dependency directly; a sibling checkout or private `jhy` branch is not required. A local Go workspace can include a schema-6 CLIProxyAPI checkout when developing the SDK itself.
+Requires Go 1.26+ and a C toolchain (CGO). The plugin is built as a C shared library. `go.mod` pins the `github.com/router-for-me/CLIProxyAPI/v8` SDK to `v8.0.28`. Builds and releases use that dependency directly. A local Go workspace can select a CLIProxyAPI v8 checkout when developing the SDK itself.
 
 ```bash
+go mod download
+
 # Release builds inject the version from the v* Git tag; local builds can use dev.
 VERSION=dev
 
@@ -194,11 +196,11 @@ CGO_ENABLED=1 GOOS=windows GOARCH=amd64 CC=gcc \
   -o dist/privacy-filter-windows-amd64.dll .
 ```
 
-The release workflow produces prebuilt Linux `.so` and Windows `.dll` artifacts on every `v*` tag.
+The release workflow produces Linux `amd64`/`arm64` `.so` plugins and a Windows `amd64` `.dll` plugin on every `v*` tag. Linux ARM64 builds use a native `ubuntu-24.04-arm` runner and GCC. All three artifacts are uploaded to the workflow and attached to the GitHub release.
 
 ## Configuration
 
-Configuration lives under the `privacy-filter` plugin subtree in the host config. All keys are optional; defaults are shown below. Parsing is strict: unknown keys, extra YAML documents, non-positive or unrepresentable vault TTLs, unknown or whitespace-padded builtin rule names, and incomplete custom rules reject the configuration without replacing the active runtime snapshot.
+Configuration lives under the `privacy-filter` plugin subtree in the host config. All keys are optional; defaults are shown below. Only the listed plugin settings are read. Host-owned metadata such as `store` and other unrecognized fields are ignored rather than preventing registration or reconfiguration. YAML must still be parseable as a single document, and values for supported settings must satisfy their documented constraints.
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -223,7 +225,7 @@ plugins:
   configs:
     privacy-filter:
       enabled: true
-       mode: filter
+      mode: filter
       token_label: REDACTED
       vault_ttl_seconds: 3600
       vault_max_entries: 1000

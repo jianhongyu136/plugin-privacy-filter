@@ -11,8 +11,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 	"gopkg.in/yaml.v3"
 )
 
@@ -92,8 +92,8 @@ func defaultConfig() pluginConfig {
 	}
 }
 
-// parseLifecycleConfig extracts config_yaml from the RPC request and unmarshals
-// it over a default-seeded config so omitted keys keep their defaults.
+// parseLifecycleConfig reads only plugin-owned settings from config_yaml, ignoring
+// host metadata and other unused fields. Omitted settings keep their defaults.
 func parseLifecycleConfig(request []byte) (pluginConfig, error) {
 	var payload lifecycleRequestPayload
 	if err := json.Unmarshal(request, &payload); err != nil {
@@ -105,7 +105,6 @@ func parseLifecycleConfig(request []byte) (pluginConfig, error) {
 	cfg := defaultConfig()
 	if len(payload.ConfigYAML) > 0 {
 		decoder := yaml.NewDecoder(bytes.NewReader(payload.ConfigYAML))
-		decoder.KnownFields(true)
 		if err := decoder.Decode(&cfg); err != nil {
 			return pluginConfig{}, err
 		}

@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
 func lifecycleRequest(t *testing.T, yamlText string) []byte {
@@ -69,11 +69,15 @@ func TestParseLifecycleConfigOverrides(t *testing.T) {
 	}
 }
 
-func TestRemovedBlockReturnOriginalConfigIsRejected(t *testing.T) {
-	if _, err := parseLifecycleConfig(lifecycleRequest(t, `mode: block
+func TestRemovedBlockReturnOriginalConfigIsIgnored(t *testing.T) {
+	cfg, err := parseLifecycleConfig(lifecycleRequest(t, `mode: block
 block_return_original: true
-`)); err == nil {
-		t.Fatal("removed block_return_original setting was accepted")
+`))
+	if err != nil {
+		t.Fatalf("removed setting should be ignored: %v", err)
+	}
+	if cfg.Mode != modeBlock || cfg.TokenLabel != defaultConfig().TokenLabel {
+		t.Fatalf("removed setting changed the plugin configuration: %+v", cfg)
 	}
 }
 
@@ -100,16 +104,28 @@ func TestExplicitEmptyTokenLabelIsNotDefaulted(t *testing.T) {
 	}
 }
 
-func TestLifecycleConfigRejectsUnknownFieldsAndExtraDocuments(t *testing.T) {
+func TestLifecycleConfigIgnoresUnusedFields(t *testing.T) {
 	for _, yamlText := range []string{
 		"vault_ttl_second: 60\n",
 		"unknown_field_behavior: ignore\n",
 		"custom_value_rules:\n  - name: marker\n    regex: ok\n    future: true\n",
-		"mode: filter\n---\nmode: block\n",
 	} {
-		if _, err := parseLifecycleConfig(lifecycleRequest(t, yamlText)); err == nil {
-			t.Fatalf("invalid YAML configuration was accepted: %q", yamlText)
+		cfg, err := parseLifecycleConfig(lifecycleRequest(t, yamlText))
+		if err != nil {
+			t.Fatalf("unused configuration field should be ignored: %v", err)
 		}
+		if cfg.Mode != modeFilter || cfg.VaultTTLSeconds != defaultConfig().VaultTTLSeconds {
+			t.Fatalf("unused field changed known settings: %+v", cfg)
+		}
+		if err := applyConfig(cfg); err != nil {
+			t.Fatalf("ignored fields prevented configuration from applying: %v", err)
+		}
+	}
+}
+
+func TestLifecycleConfigRejectsExtraDocuments(t *testing.T) {
+	if _, err := parseLifecycleConfig(lifecycleRequest(t, "mode: filter\n---\nmode: block\n")); err == nil {
+		t.Fatal("multiple YAML documents were accepted")
 	}
 }
 

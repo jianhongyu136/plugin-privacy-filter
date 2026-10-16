@@ -97,7 +97,7 @@ flowchart TB
    - 工具调用的 `arguments` 字符串若无法解析为恰好一个 JSON 值（包括空字符串、内容不完整、语法错误或尾随多余值），则按文本进行只读检测，不做替换。由于无法可靠解码 JSON 字段名，此时只应用值模式规则（但内置 `config_*` 赋值模式仍可识别其文本键名），并保留捕获组、校验器及已有 vault token 的识别语义，不生成 token 或写入 vault。命中时 `block` 模式阻断；`filter` 模式告警并保留参数原文，其他内容继续正常脱敏。仅解析失败但未命中规则不会阻断。警告包含路径、不含原文的解析原因、模式和命中规则元数据。此行为适用于 OpenAI Chat 新旧函数调用及 Responses 函数/MCP 调用；必需字段和字符串类型检查仍然生效。
    - 所有端点统一跳过已知内容区域以外的字段，包括消息、内容块和工具调用外层的额外字段。例如 `output_config`、`phase`、`caller`、缓存配置、文件结果属性和不透明媒体数据均不扫描、不做协议结构校验，也不打印未知字段警告。无法识别的内容块类型，以及定位内容所必需的非法结构，仍可能被拒绝。
    - 任意符合标签语法的已有 token 只有在共享 vault 中仍有精确映射时才不会被再次 token 化；这样既能在 before/after 阶段之间更换标签时保持稳定，也不会让伪造的 token 形状文本绕过扫描。
-5. `filter` 模式会把正常内容中的命中替换为占位符 token `<LABEL_hash>`，异常参数中的只读命中仅告警。`block` 模式在正常扫描或只读检测首次命中时停止；拒绝响应和诊断日志会展示命中附近的有界脱敏片段（隐私值用 `[REDACTED]` 替代），并在能识别时显示字段规则或内置 `config_*` 赋值规则的实际键名；银行卡号等纯值命中不显示隐私原文。已有配置中的 `block_return_original` 需移除。只读检测不生成 token。
+5. `filter` 模式会把正常内容中的命中替换为占位符 token `<LABEL_hash>`，异常参数中的只读命中仅告警。`block` 模式在正常扫描或只读检测首次命中时停止；拒绝响应和诊断日志会展示命中附近的有界脱敏片段（隐私值用 `[REDACTED]` 替代），并在能识别时显示字段规则或内置 `config_*` 赋值规则的实际键名；银行卡号等纯值命中不显示隐私原文。只读检测不生成 token。
 6. `filter` 模式把 `token -> 原文` 映射写入 vault，并把脱敏请求体发往上游。`block` 模式拒绝请求，既不写入 vault 映射，也不序列化已修改的 JSON 文档。若无任何命中，两种模式都会让请求体逐字节保持原样并放行。
 
 ### 响应路径（还原）
@@ -177,9 +177,11 @@ flowchart TB
 
 ## 构建
 
-需要 Go 1.26+ 和 C 工具链（CGO）。插件被构建为 C 共享库。`go.mod` 固定依赖官方 `github.com/router-for-me/CLIProxyAPI/v7` SDK 的 `v7.3.19`，对应主线提交 `6dea3dfa`。本地构建和发布直接使用该依赖，不再要求相邻 checkout 或私有 `jhy` 分支。开发 SDK 本身时，可以用本地 Go workspace 引入支持 schema 6 的 CLIProxyAPI checkout。
+需要 Go 1.26+ 和 C 工具链（CGO）。插件被构建为 C 共享库。`go.mod` 固定依赖 `github.com/router-for-me/CLIProxyAPI/v8` SDK 的 `v8.0.28`。本地构建和发布直接使用该依赖。开发 SDK 本身时，可以用本地 Go workspace 引入 CLIProxyAPI v8 checkout。
 
 ```bash
+go mod download
+
 # 发布构建会从 v* Git 标签注入版本号；本地构建可以使用 dev。
 VERSION=dev
 
@@ -194,11 +196,11 @@ CGO_ENABLED=1 GOOS=windows GOARCH=amd64 CC=gcc \
   -o dist/privacy-filter-windows-amd64.dll .
 ```
 
-发布工作流会在每个 `v*` 标签上产出预编译的 Linux `.so` 和 Windows `.dll` 文件。
+发布工作流会在每个 `v*` 标签上产出 Linux `amd64`、`arm64` 的 `.so` 插件，以及 Windows `amd64` 的 `.dll` 插件。Linux ARM64 使用原生 `ubuntu-24.04-arm` runner 和 GCC 构建。三份产物均会上传为工作流构建产物，并附加到 GitHub Release。
 
 ## 配置
 
-配置位于宿主配置中 `privacy-filter` 插件子树下。所有键均为可选；下表列出默认值。解析采用严格模式：未知键、多份 YAML 文档、非正数或无法表示的 vault TTL、未知或两侧带空白的内置规则名、不完整的自定义规则都会导致配置被拒绝，且不会替换当前运行时快照。
+配置位于宿主配置中 `privacy-filter` 插件子树下。所有键均为可选；下表列出默认值。插件只读取下表中的配置项；宿主的 `store` 元数据和其他未识别字段会被忽略，不会因此拒绝注册或重配置。YAML 本身仍须能解析为单份文档，插件实际使用的配置值仍应满足表中约束。
 
 | 键 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
@@ -223,7 +225,7 @@ plugins:
   configs:
     privacy-filter:
       enabled: true
-       mode: filter
+      mode: filter
       token_label: REDACTED
       vault_ttl_seconds: 3600
       vault_max_entries: 1000
