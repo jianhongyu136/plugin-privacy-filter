@@ -1391,9 +1391,7 @@ func restoreSemanticStream(key string, data []byte, tokenRe *regexp.Regexp, labe
 			}
 		}
 		for _, field := range argumentFieldsByFrame[frame] {
-			if _, exists := field.owner[field.field]; exists {
-				delete(field.owner, field.field)
-			}
+			delete(field.owner, field.field)
 		}
 		r := &restorer{tokenRe: tokenRe, allowed: allowed, v: v}
 		r.walk(frame.doc)

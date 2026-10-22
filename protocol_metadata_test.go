@@ -38,6 +38,10 @@ func TestEndpointsScanContentAndSkipProtocolMetadata(t *testing.T) {
 			`{"instructions":"CONTENTSECRET","output_config":{"password":"OUTERSECRET"},"input":[{"id":"ref","future":"OUTERSECRET"},{"role":"user","content":"CONTENTSECRET","phase":42,"future":"OUTERSECRET"},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"CONTENTSECRET","future":"OUTERSECRET"}],"phase":{},"future":true},{"type":"input_text","text":"CONTENTSECRET","prompt_cache_breakpoint":"OUTERSECRET","future":true}]}`,
 		},
 		{
+			"responses configuration updates", formatOpenAIResponse,
+			`{"reasoning":{"effort":"medium"},"input":[{"type":"message","role":"user","content":"CONTENTSECRET"},{"type":"configuration_update","reasoning":{"effort":"OUTERSECRET"},"future":{"password":"OUTERSECRET"}},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"CONTENTSECRET"}]},{"type":"configuration_update","reasoning":{"effort":"high"}},{"type":"configuration_update"}]}`,
+		},
+		{
 			"responses tools", formatOpenAIResponse,
 			`{"input":[{"type":"function_call","arguments":"{\"password\":\"CONTENTSECRET\"}","caller":{"type":"future","password":"OUTERSECRET"},"namespace":42,"future":true},{"type":"custom_tool_call","input":"CONTENTSECRET","caller":42,"namespace":{},"future":"OUTERSECRET"},{"type":"function_call_output","output":"CONTENTSECRET","caller":"OUTERSECRET","future":true},{"type":"mcp_call","arguments":"{\"password\":\"CONTENTSECRET\"}","output":"CONTENTSECRET","future":"OUTERSECRET"}]}`,
 		},
@@ -110,6 +114,24 @@ func TestEndpointsScanContentAndSkipProtocolMetadata(t *testing.T) {
 					}
 				})
 			}
+		}
+	}
+}
+
+func TestResponsesConfigurationUpdateAcceptedByBothHooks(t *testing.T) {
+	for _, method := range []string{pluginabi.MethodRequestInterceptBefore, pluginabi.MethodRequestInterceptAfter} {
+		for _, mode := range []string{modeFilter, modeBlock} {
+			t.Run(method+"/"+mode, func(t *testing.T) {
+				callRegister(t, pluginabi.MethodPluginRegister, "mode: "+mode+"\n")
+				body := []byte(`{ "input": [ { "type": "configuration_update", "reasoning": { "effort": "xhigh" } } ] }`)
+				resp := invokeRequestIntercept(t, method, formatOpenAIResponse, body)
+				if resp.Reject {
+					t.Fatalf("configuration update was rejected: %s", resp.RejectReason)
+				}
+				if len(resp.Body) != 0 {
+					t.Fatal("configuration-only request was rewritten")
+				}
+			})
 		}
 	}
 }

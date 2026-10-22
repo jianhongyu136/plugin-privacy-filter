@@ -716,6 +716,8 @@ func scanResponsesInput(s *scanner, value any, path string) (any, *contentScanEr
 			item["arguments"] = s.scanContentValue(rawArguments, itemPath+".arguments")
 		case "tool_search_output", "additional_tools":
 			// Tool definitions and their schemas are configuration, not runtime text.
+		case "configuration_update":
+			// Request settings remain opaque protocol configuration.
 		case "input_image", "input_file":
 			// Image and file payloads remain opaque.
 		case "computer_screenshot", "item_reference",

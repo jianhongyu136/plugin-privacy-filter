@@ -834,6 +834,7 @@ func TestResponsesDiscriminatedInputsFailClosed(t *testing.T) {
 	tests := []string{
 		`{"input":[{"type":"computer_call","action":{"type":"paste","text":"unscanned"}}]}`,
 		`{"input":[{"type":"local_shell_call","action":{"type":"future","command":"unscanned"}}]}`,
+		`{"input":[{"type":"message","role":"user","content":[{"type":"configuration_update","reasoning":{"effort":"high"},"text":"unscanned"}]}]}`,
 	}
 	for _, body := range tests {
 		resp := requestIntercept(t, formatOpenAIResponse, []byte(body))
