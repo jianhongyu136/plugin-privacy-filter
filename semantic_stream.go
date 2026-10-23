@@ -1073,7 +1073,8 @@ func (s *streamStore) rewriteSemanticPartsWithTerminals(key string, groups map[s
 		if pending == "" {
 			delete(e.content, channel)
 		} else {
-			e.content[channel] = pending
+			// A short suffix must not retain the full delta's backing storage.
+			e.content[channel] = strings.Clone(pending)
 		}
 		entryBytes = channelBaseBytes
 		if pending != "" {
@@ -1262,7 +1263,7 @@ func encodeSemanticJSON(doc any) ([]byte, bool) {
 // renderSemanticFrames replaces only changed JSON payload spans. Every gap is
 // still passed through generic SSE restoration so mixed event streams retain
 // the existing behavior.
-func renderSemanticFrames(data []byte, frames []*semanticFrame, tokenRe *regexp.Regexp, allowed map[string]struct{}, v *vault) []byte {
+func renderSemanticFrames(data []byte, frames []*semanticFrame, tokenRe *regexp.Regexp, labels []string, allowed map[string]struct{}, v *vault) []byte {
 	ordered := append([]*semanticFrame(nil), frames...)
 	sort.SliceStable(ordered, func(i, j int) bool { return ordered[i].start < ordered[j].start })
 
@@ -1273,7 +1274,7 @@ func renderSemanticFrames(data []byte, frames []*semanticFrame, tokenRe *regexp.
 		if frame.start < cursor || frame.next > len(data) {
 			return data
 		}
-		out.Write(restoreSSE(data[cursor:frame.start], tokenRe, allowed, v))
+		out.Write(restoreSSE(data[cursor:frame.start], tokenRe, labels, allowed, v))
 		for _, synthetic := range frame.before {
 			payload, ok := encodeSemanticJSON(synthetic.doc)
 			if !ok {
@@ -1304,7 +1305,7 @@ func renderSemanticFrames(data []byte, frames []*semanticFrame, tokenRe *regexp.
 		out.Write(data[frame.payloadEnd:frame.next])
 		cursor = frame.next
 	}
-	out.Write(restoreSSE(data[cursor:], tokenRe, allowed, v))
+	out.Write(restoreSSE(data[cursor:], tokenRe, labels, allowed, v))
 	return out.Bytes()
 }
 
@@ -1414,5 +1415,5 @@ func restoreSemanticStream(key string, data []byte, tokenRe *regexp.Regexp, labe
 	}
 	streamCarry.rewriteJSONArgumentOps(key, batch.argumentOps, tokenRe, labels, allowed, v)
 	streamCarry.rewriteSemanticPartsWithTerminals(key, batch.groups, batch.channelOrder, batch.terminals, tokenRe, labels, allowed, v)
-	return renderSemanticFrames(data, batch.frames, tokenRe, allowed, v), true
+	return renderSemanticFrames(data, batch.frames, tokenRe, labels, allowed, v), true
 }

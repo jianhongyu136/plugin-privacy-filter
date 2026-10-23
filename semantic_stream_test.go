@@ -7,7 +7,31 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unsafe"
 )
+
+func TestSemanticTextCopiesRetainedTail(t *testing.T) {
+	store := newStreamStore()
+	text := strings.Repeat("x", 1<<20) + "<"
+	owner := map[string]any{"delta": text}
+	frame := &semanticFrame{}
+	const key, channel = "stream", "openai:choice:0"
+	store.rewriteSemanticParts(key, map[string][]*semanticPart{
+		channel: {{frame: frame, channel: channel, owner: owner, field: "delta", text: text, hasText: true}},
+	}, tokenPattern("REDACTED"), []string{"REDACTED"}, nil, newVault(1, time.Hour))
+
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	pending := store.entries[key].content[channel]
+	if pending != "<" || owner["delta"] != text[:len(text)-1] {
+		t.Fatal("semantic text was not split into emitted text and the pending prefix")
+	}
+	start := uintptr(unsafe.Pointer(unsafe.StringData(text)))
+	pendingStart := uintptr(unsafe.Pointer(unsafe.StringData(pending)))
+	if pendingStart >= start && pendingStart < start+uintptr(len(text)) {
+		t.Fatal("pending prefix retained the large text backing storage")
+	}
+}
 
 func TestSemanticOpenAIChatPreservesEventLineAndCRLF(t *testing.T) {
 	setSharedVault(newVault(16, time.Hour))
@@ -274,12 +298,11 @@ func TestSemanticPendingFailsOpenWhenEntryWouldExceedByteBudget(t *testing.T) {
 		channel := "openai-response:item:" + strings.Repeat("x", 64) + ":output:0:content:0"
 		baseBytes := len(key) + len("carry") + len("allowed") + len("existing") + len("pending")
 		store := newStreamStoreWithLimits(time.Minute, baseBytes+len(channel)+len(fragment)-1)
+		store.allowlist(key, func() map[string]struct{} { return map[string]struct{}{"allowed": {}} })
 
 		store.mu.Lock()
 		entry := store.getOrCreateLocked(key, time.Now())
 		entry.carry = []byte("carry")
-		entry.allowed = map[string]struct{}{"allowed": {}}
-		entry.hasAllow = true
 		entry.content = map[string]string{"existing": "pending"}
 		store.resizeEntryLocked(entry)
 		store.mu.Unlock()

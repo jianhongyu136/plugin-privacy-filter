@@ -516,6 +516,28 @@ func TestCollectTokensFindsJSONEscapedMappedTokens(t *testing.T) {
 	}
 }
 
+func TestCollectTokensFromJSONCopiesMappedToken(t *testing.T) {
+	v := newVault(1, time.Hour)
+	placeholder := makeToken("REDACTED", "mapped value")
+	v.Put(placeholder, "mapped value")
+	text := strings.Repeat("x", 1<<20) + placeholder
+	allowed := make(map[string]struct{})
+	collectTokensFromJSON(map[string]any{"content": text}, restoreTokenPattern(), v, allowed)
+	if len(allowed) != 1 {
+		t.Fatalf("collected %d tokens, want 1", len(allowed))
+	}
+	start := uintptr(unsafe.Pointer(unsafe.StringData(text)))
+	for candidate := range allowed {
+		if candidate != placeholder {
+			t.Fatalf("collected unexpected token %q", candidate)
+		}
+		candidateStart := uintptr(unsafe.Pointer(unsafe.StringData(candidate)))
+		if candidateStart >= start && candidateStart < start+uintptr(len(text)) {
+			t.Fatal("allowlist token retained the decoded request backing storage")
+		}
+	}
+}
+
 func TestResetStreamCarry(t *testing.T) {
 	label, tokenRe := detokTestSetup()
 	req := []byte(`{"model":"z"}`)
@@ -625,7 +647,7 @@ func TestStreamStoreExpiresAbandonedActiveState(t *testing.T) {
 	if store.has("active") {
 		t.Fatal("request with no completion notification survived idle TTL cleanup")
 	}
-	if _, initialized := store.activeAllowlist("active"); initialized {
+	if _, _, initialized := store.activeAllowlist("active"); initialized {
 		t.Fatal("expired request retained an initialized allowlist")
 	}
 }
@@ -644,7 +666,7 @@ func TestStreamStoreCompletionMarkerRetainsNoPayloadAndExpires(t *testing.T) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	entry := store.entries["completed"]
-	if entry == nil || !entry.completed || entry.active || entry.hasAllow || entry.allowed != nil || entry.carry != nil || entry.content != nil || entry.arguments != nil || entry.argumentOverflow {
+	if entry == nil || !entry.completed || entry.active || entry.hasAllow || entry.allowed != nil || entry.labels != nil || entry.allowedBytes != 0 || entry.carry != nil || entry.content != nil || entry.arguments != nil || entry.argumentOverflow {
 		t.Fatalf("completion retained payload state: %+v", entry)
 	}
 	if store.totalBytes != len("completed") {

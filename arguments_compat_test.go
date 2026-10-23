@@ -162,6 +162,8 @@ func TestInvalidArgumentsDetectionHasNoReplacementSideEffects(t *testing.T) {
 		{"optional capture", "FALLBACKSECRET", `(optional)?FALLBACKSECRET`, "FALLBACKSECRET", nil, 1},
 		{"validator rejects", "value=bad", `value=(bad)`, "", acceptSecret, 0},
 		{"validator finds later match", "value=bad value=FALLBACKSECRET", `value=(bad|FALLBACKSECRET)`, "FALLBACKSECRET", acceptSecret, 1},
+		{"validator preserves anchor", "badFALLBACKSECRET", `^(bad|FALLBACKSECRET)`, "", acceptSecret, 0},
+		{"validator preserves word boundary", "badFALLBACKSECRET", `\b(bad|FALLBACKSECRET)`, "", acceptSecret, 0},
 		{"empty capture", "FALLBACKSECRET", `()FALLBACKSECRET`, "", nil, 0},
 		{"existing token", token, `REDACTED`, "", nil, 0},
 		{"forged token", "<REDACTED_0000000000000000>", `REDACTED`, "REDACTED", nil, 1},

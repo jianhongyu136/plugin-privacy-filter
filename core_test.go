@@ -701,36 +701,6 @@ func TestLogScanMatchesAggregatesAndBoundsPaths(t *testing.T) {
 	}
 }
 
-func TestRequestScanErrorLogsUnsupportedContent(t *testing.T) {
-	callRegister(t, pluginabi.MethodPluginRegister, "")
-	logger := logrus.StandardLogger()
-	previousOutput := logger.Out
-	previousHooks := logger.ReplaceHooks(make(logrus.LevelHooks))
-	hook := &scanLogCapture{}
-	logger.AddHook(hook)
-	logger.SetOutput(io.Discard)
-	t.Cleanup(func() {
-		logger.SetOutput(previousOutput)
-		logger.ReplaceHooks(previousHooks)
-	})
-
-	resp := invokeRequestIntercept(t, pluginabi.MethodRequestInterceptBefore, formatOpenAIResponse,
-		[]byte(`{"input":[{"type":"future_block","payload":"PLAINTEXT-MUST-NOT-BE-LOGGED"}]}`))
-	if !resp.Reject {
-		t.Fatal("unsupported Responses input was not rejected")
-	}
-	if len(hook.entries) != 1 {
-		t.Fatalf("warning log entries = %d, want 1: %#v", len(hook.entries), hook.entries)
-	}
-	entry := hook.entries[0]
-	if entry["unsupported_content"] != "future_block" {
-		t.Fatalf("unsupported_content = %#v, want future_block", entry["unsupported_content"])
-	}
-	if strings.Contains(fmt.Sprint(entry), "PLAINTEXT-MUST-NOT-BE-LOGGED") {
-		t.Fatalf("unsupported payload leaked into logs: %#v", entry)
-	}
-}
-
 func TestProtocolFieldsPassedWithoutLogs(t *testing.T) {
 	callRegister(t, pluginabi.MethodPluginRegister, "")
 	logger := logrus.StandardLogger()
@@ -751,48 +721,6 @@ func TestProtocolFieldsPassedWithoutLogs(t *testing.T) {
 	}
 	if len(hook.entries) != 0 {
 		t.Fatalf("protocol fields were logged: %#v", hook.entries)
-	}
-}
-
-func TestRequestScanErrorBoundsUnsupportedContentLog(t *testing.T) {
-	callRegister(t, pluginabi.MethodPluginRegister, "")
-	logger := logrus.StandardLogger()
-	previousOutput := logger.Out
-	previousHooks := logger.ReplaceHooks(make(logrus.LevelHooks))
-	hook := &scanLogCapture{}
-	logger.AddHook(hook)
-	logger.SetOutput(io.Discard)
-	t.Cleanup(func() {
-		logger.SetOutput(previousOutput)
-		logger.ReplaceHooks(previousHooks)
-	})
-
-	unsupportedType := "\n" + strings.Repeat("APIKEY-", unsupportedContentLogMaxRunes)
-	body, err := json.Marshal(map[string]any{
-		"input": []any{map[string]any{"type": unsupportedType}},
-	})
-	if err != nil {
-		t.Fatalf("marshal body: %v", err)
-	}
-	resp := invokeRequestIntercept(t, pluginabi.MethodRequestInterceptBefore, formatOpenAIResponse, body)
-	if !resp.Reject {
-		t.Fatal("unsupported Responses input was not rejected")
-	}
-	if len(hook.entries) != 1 {
-		t.Fatalf("warning log entries = %d, want 1: %#v", len(hook.entries), hook.entries)
-	}
-	logged, ok := hook.entries[0]["unsupported_content"].(string)
-	if !ok {
-		t.Fatalf("unsupported_content = %#v, want string", hook.entries[0]["unsupported_content"])
-	}
-	if len([]rune(logged)) > unsupportedContentLogMaxRunes {
-		t.Fatalf("unsupported_content log value is unbounded: %d runes", len([]rune(logged)))
-	}
-	if logged == unsupportedType {
-		t.Fatal("unsupported_content log value was not bounded")
-	}
-	if strings.ContainsAny(logged, "\r\n") {
-		t.Fatalf("unsupported_content log value contains a line break: %q", logged)
 	}
 }
 
@@ -819,13 +747,13 @@ func TestEmptyProtocolFieldPassedWithoutLogs(t *testing.T) {
 	}
 }
 
-func TestRequestScanErrorIncludesUnsupportedResponsesType(t *testing.T) {
+func TestRequestScanErrorIncludesContentPath(t *testing.T) {
 	callRegister(t, pluginabi.MethodPluginRegister, "")
 	items := make([]any, 133)
 	for i := 0; i < 132; i++ {
 		items[i] = map[string]any{"id": "item-reference"}
 	}
-	items[132] = map[string]any{"type": "future_block"}
+	items[132] = map[string]any{"type": "message", "content": 42}
 	body, err := json.Marshal(map[string]any{"input": items})
 	if err != nil {
 		t.Fatalf("marshal body: %v", err)
@@ -833,9 +761,9 @@ func TestRequestScanErrorIncludesUnsupportedResponsesType(t *testing.T) {
 
 	resp := invokeRequestIntercept(t, pluginabi.MethodRequestInterceptBefore, formatOpenAIResponse, body)
 	if !resp.Reject {
-		t.Fatal("unsupported Responses input was not rejected")
+		t.Fatal("malformed Responses content was not rejected")
 	}
-	want := "input[132].type: unsupported content block type (unsupported type: future_block)"
+	want := "input[132].content: content must be a string or array"
 	if !strings.Contains(resp.RejectReason, want) {
 		t.Fatalf("reject reason = %q, want substring %q", resp.RejectReason, want)
 	}

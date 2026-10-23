@@ -39,7 +39,9 @@ const (
 // next chunk boundary. touchedAt drives TTL and LRU-style eviction.
 type streamEntry struct {
 	key              string
-	allowed          map[string]struct{}
+	allowed          map[string]struct{} // Immutable after initialization, like labels and allowedBytes.
+	labels           []string
+	allowedBytes     int
 	hasAllow         bool
 	active           bool
 	completed        bool
@@ -110,6 +112,11 @@ func (s *streamStore) allowlist(key string, build func() map[string]struct{}) ma
 	s.mu.Unlock()
 
 	allowed := build()
+	labels := tokenLabels(allowed)
+	allowedBytes := 0
+	for candidate := range allowed {
+		allowedBytes += len(candidate)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now = time.Now()
@@ -120,6 +127,8 @@ func (s *streamStore) allowlist(key string, build func() map[string]struct{}) ma
 	e.active = e.active || active
 	if !e.hasAllow {
 		e.allowed = allowed
+		e.labels = labels
+		e.allowedBytes = allowedBytes
 		e.hasAllow = true
 		s.resizeEntryLocked(e)
 		if e.bytes > s.maxBytes {
@@ -134,17 +143,17 @@ func (s *streamStore) allowlist(key string, build func() map[string]struct{}) ma
 
 // activeAllowlist returns state initialized by a schema-v5 header callback.
 // Payload callbacks never rebuild it because heavy request fields are init-only.
-func (s *streamStore) activeAllowlist(key string) (map[string]struct{}, bool) {
+func (s *streamStore) activeAllowlist(key string) (map[string]struct{}, []string, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := time.Now()
 	s.purgeLocked(now)
 	e, ok := s.entries[key]
 	if !ok || !e.active || e.completed {
-		return nil, false
+		return nil, nil, false
 	}
 	s.touchLocked(e, now)
-	return e.allowed, true
+	return e.allowed, e.labels, true
 }
 
 // takeCarry returns and clears any withheld bytes for key, mirroring the
@@ -348,10 +357,7 @@ func (s *streamStore) touchLocked(e *streamEntry, now time.Time) {
 
 func (s *streamStore) resizeEntryLocked(e *streamEntry) {
 	s.totalBytes -= e.bytes
-	e.bytes = len(e.key) + len(e.carry)
-	for token := range e.allowed {
-		e.bytes += len(token)
-	}
+	e.bytes = len(e.key) + len(e.carry) + e.allowedBytes
 	for channel, pending := range e.content {
 		e.bytes += len(channel) + len(pending)
 	}
@@ -465,7 +471,10 @@ func collectTokensFromJSON(node any, tokenRe *regexp.Regexp, v *vault, set map[s
 			start, end := offset+match[0], offset+match[1]
 			token := value[start:end]
 			if _, ok := v.Get(token); ok {
-				set[token] = struct{}{}
+				if _, seen := set[token]; !seen {
+					// Decoded tokens can be short slices of an entire prompt string.
+					set[strings.Clone(token)] = struct{}{}
+				}
 			}
 			offset = end
 		}
@@ -512,10 +521,10 @@ func tokenLabels(tokens map[string]struct{}) []string {
 // rather than fetched here, so the label used to build tokenRe/allowed and the
 // vault used to resolve them always come from the same reconfigure generation.
 func restoreBody(data []byte, tokenRe *regexp.Regexp, allowed map[string]struct{}, v *vault) []byte {
-	return restoreBodyForMediaType(data, tokenRe, allowed, v, "", "")
+	return restoreBodyForMediaType(data, tokenRe, tokenLabels(allowed), allowed, v, "", "")
 }
 
-func restoreBodyForMediaType(data []byte, tokenRe *regexp.Regexp, allowed map[string]struct{}, v *vault, mediaType, sourceFormat string) []byte {
+func restoreBodyForMediaType(data []byte, tokenRe *regexp.Regexp, labels []string, allowed map[string]struct{}, v *vault, mediaType, sourceFormat string) []byte {
 	if v == nil || len(data) == 0 {
 		return data
 	}
@@ -525,10 +534,10 @@ func restoreBodyForMediaType(data []byte, tokenRe *regexp.Regexp, allowed map[st
 		return data
 	}
 	if isJSONMediaType(mediaType) {
-		return restoreJSONDocForFormat(data, tokenRe, tokenLabels(allowed), allowed, v, sourceFormat)
+		return restoreJSONDocForFormat(data, tokenRe, labels, allowed, v, sourceFormat)
 	}
 	if strings.EqualFold(mediaType, "text/event-stream") {
-		return restoreSSE(data, tokenRe, allowed, v)
+		return restoreSSE(data, tokenRe, labels, allowed, v)
 	}
 	if mediaType != "" {
 		if tokenRe.Find(data) == nil {
@@ -541,11 +550,11 @@ func restoreBodyForMediaType(data []byte, tokenRe *regexp.Regexp, allowed map[st
 	// <LABEL_hash> or JSON-escaped as \u003cLABEL_hash\u003e. Decoding the JSON
 	// normalizes both. restoreJSONDoc only rewrites the body when it actually
 	// restores something, so token-free responses are left byte-for-byte intact.
-	if restored, ok := restoreJSONDocForFormatResult(data, tokenRe, tokenLabels(allowed), allowed, v, sourceFormat); ok {
+	if restored, ok := restoreJSONDocForFormatResult(data, tokenRe, labels, allowed, v, sourceFormat); ok {
 		return restored
 	}
 	if isSSEData(data) {
-		return restoreSSE(data, tokenRe, allowed, v)
+		return restoreSSE(data, tokenRe, labels, allowed, v)
 	}
 	if looksLikeJSON(data) {
 		// Never inject raw plaintext into malformed JSON-looking content. Doing
@@ -600,7 +609,7 @@ func advanceJSONArgumentLex(state jsonArgumentLexState, data string) jsonArgumen
 		if state.mode == jsonArgumentOutsideString {
 			if c == '"' {
 				state.mode = jsonArgumentInsideString
-			} else if c < 0x20 {
+			} else if c < 0x20 && c != '\t' && c != '\n' && c != '\r' {
 				state.invalid = true
 			}
 			continue
@@ -1138,7 +1147,7 @@ func isSSEData(data []byte) bool {
 // restoreSSE restores tokens within the "data:" fields of an SSE payload,
 // decoding JSON frames where possible so escaping stays valid, and preserves
 // the exact line framing of everything else.
-func restoreSSE(data []byte, tokenRe *regexp.Regexp, allowed map[string]struct{}, v *vault) []byte {
+func restoreSSE(data []byte, tokenRe *regexp.Regexp, labels []string, allowed map[string]struct{}, v *vault) []byte {
 	var out bytes.Buffer
 	out.Grow(len(data))
 	for start := 0; start < len(data); {
@@ -1155,7 +1164,7 @@ func restoreSSE(data []byte, tokenRe *regexp.Regexp, allowed map[string]struct{}
 			// Decode JSON frames first so escaped tokens (\u003c..\u003e) are
 			// recognized; fall back to byte-level replacement for non-JSON frames.
 			var restored []byte
-			if r, ok := restoreJSONDocForFormatResult(payload, tokenRe, tokenLabels(allowed), allowed, v, ""); ok {
+			if r, ok := restoreJSONDocForFormatResult(payload, tokenRe, labels, allowed, v, ""); ok {
 				restored = r
 			} else if !looksLikeJSON(payload) && tokenRe.Find(payload) != nil {
 				restored = restoreRaw(payload, tokenRe, allowed, v)
@@ -1459,5 +1468,5 @@ func detokenizeStreamChunkForMediaType(key string, chunk []byte, tokenRe *regexp
 	if restored, handled := restoreSemanticStream(key, buf, tokenRe, labels, allowed, v, mediaType, sourceFormat); handled {
 		return restored, false
 	}
-	return restoreBodyForMediaType(buf, tokenRe, allowed, v, mediaType, sourceFormat), false
+	return restoreBodyForMediaType(buf, tokenRe, labels, allowed, v, mediaType, sourceFormat), false
 }

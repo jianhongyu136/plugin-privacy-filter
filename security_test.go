@@ -680,26 +680,29 @@ func testNonStreamArgumentRestoration(t *testing.T, sourceFormat string, makeBod
 	st.vault.Put(token, secret)
 	requestBody := []byte(`{"input":"` + token + `"}`)
 
-	t.Run("special characters and outer field", func(t *testing.T) {
-		body := mustJSONMarshal(t, makeBody(`{"value":"`+token+`"}`, token))
-		delivered := invokeNonStreamResponseBody(t, sourceFormat, requestBody, body)
-		doc, ok := decodeOneJSON(delivered)
-		if !ok {
-			t.Fatalf("restored non-stream body is invalid JSON: %q", delivered)
-		}
-		root := doc.(map[string]any)
-		if got := root["summary"]; got != secret {
-			t.Fatalf("ordinary outer string restoration = %#v, want %q", got, secret)
-		}
-		argument := argumentFrom(root)
-		var decoded map[string]string
-		if err := json.Unmarshal([]byte(argument), &decoded); err != nil {
-			t.Fatalf("restored non-stream arguments are invalid JSON %q: %v", argument, err)
-		}
-		if got := decoded["value"]; got != secret {
-			t.Fatalf("restored non-stream argument value = %q, want %q", got, secret)
-		}
-	})
+	for _, whitespace := range []string{"", "\n", "\r", "\t"} {
+		t.Run(fmt.Sprintf("special characters and outer field/whitespace=%q", whitespace), func(t *testing.T) {
+			argumentBody := whitespace + "{" + whitespace + `"value"` + whitespace + ":" + whitespace + `"` + token + `"` + whitespace + "}" + whitespace
+			body := mustJSONMarshal(t, makeBody(argumentBody, token))
+			delivered := invokeNonStreamResponseBody(t, sourceFormat, requestBody, body)
+			doc, ok := decodeOneJSON(delivered)
+			if !ok {
+				t.Fatalf("restored non-stream body is invalid JSON: %q", delivered)
+			}
+			root := doc.(map[string]any)
+			if got := root["summary"]; got != secret {
+				t.Fatalf("ordinary outer string restoration = %#v, want %q", got, secret)
+			}
+			argument := argumentFrom(root)
+			var decoded map[string]string
+			if err := json.Unmarshal([]byte(argument), &decoded); err != nil {
+				t.Fatalf("restored non-stream arguments are invalid JSON %q: %v", argument, err)
+			}
+			if got := decoded["value"]; got != secret {
+				t.Fatalf("restored non-stream argument value = %q, want %q", got, secret)
+			}
+		})
+	}
 
 	t.Run("malformed arguments remain unchanged", func(t *testing.T) {
 		malformed := `{"value":"` + token
@@ -3740,6 +3743,67 @@ func assertNoArgumentState(t *testing.T, key, channelPrefix string) {
 	for channel := range entry.arguments {
 		if strings.HasPrefix(channel, channelPrefix) {
 			t.Fatalf("argument state %q remained after terminal: %#v", channel, entry.arguments)
+		}
+	}
+}
+
+func TestStreamFormattedJSONArgumentRestoration(t *testing.T) {
+	callRegister(t, pluginabi.MethodPluginRegister, "")
+	st := activeSnapshot()
+	original := "quote=\" slash=\\ newline=\n unicode=世界"
+	placeholder := makeToken(st.label, original)
+	st.vault.Put(placeholder, original)
+	providers := []struct {
+		format   string
+		frame    func(*testing.T, string) []byte
+		argument func(*testing.T, []byte) string
+	}{
+		{
+			formatOpenAI,
+			func(t *testing.T, fragment string) []byte {
+				return openAIChatToolArgumentSSEBody(t, 0, 0, fragment, nil)
+			},
+			func(t *testing.T, body []byte) string { return openAIChatToolArguments(t, body)["0:0"] },
+		},
+		{
+			formatOpenAIResponse,
+			func(t *testing.T, fragment string) []byte {
+				return responsesFunctionArgumentSSEBody("response.function_call_arguments.delta", responsesFunctionArgumentDelta(t, 0, "call_whitespace", fragment))
+			},
+			func(t *testing.T, body []byte) string {
+				return openAIResponsesFunctionArgumentDeltas(t, body)["0:call_whitespace"]
+			},
+		},
+		{
+			formatClaude,
+			func(t *testing.T, fragment string) []byte { return claudeInputJSONDeltaBody(t, 0, fragment) },
+			func(t *testing.T, body []byte) string { return claudeInputJSONByBlock(t, body)[0] },
+		},
+	}
+	for _, provider := range providers {
+		for _, whitespace := range []string{"\n", "\r", "\t"} {
+			t.Run(fmt.Sprintf("%s/whitespace=%q", provider.format, whitespace), func(t *testing.T) {
+				requestID := t.Name()
+				requestBody := mustJSONMarshal(t, map[string]any{"messages": []any{map[string]any{"role": "user", "content": placeholder}}})
+				if provider.format == formatOpenAIResponse {
+					requestBody = mustJSONMarshal(t, map[string]any{"input": placeholder})
+				}
+				initStreamWithID(t, provider.format, requestID, requestBody)
+				t.Cleanup(func() { completeStream(t, requestID) })
+				argument := whitespace + "{" + whitespace + `"value"` + whitespace + ":" + whitespace + `"` + placeholder + `"` + whitespace + "}" + whitespace
+				split := strings.Index(argument, placeholder) + len(placeholder)/2
+				var delivered []byte
+				for index, fragment := range []string{argument[:split], argument[split:]} {
+					body := provider.frame(t, fragment)
+					response := invokeStreamBodyWithID(t, provider.format, requestID, index, body)
+					delivered = append(delivered, deliveredStreamBody(response, body)...)
+				}
+				var decoded map[string]string
+				got := provider.argument(t, delivered)
+				if err := json.Unmarshal([]byte(got), &decoded); err != nil || decoded["value"] != original {
+					t.Fatalf("formatted arguments were not restored: got=%q decoded=%v err=%v", got, decoded, err)
+				}
+			})
 		}
 	}
 }

@@ -829,24 +829,6 @@ func TestResponsesAgentMessageAcceptedAndTextRedacted(t *testing.T) {
 	}
 }
 
-func TestResponsesDiscriminatedInputsFailClosed(t *testing.T) {
-	callRegister(t, pluginabi.MethodPluginRegister, "")
-	tests := []string{
-		`{"input":[{"type":"computer_call","action":{"type":"paste","text":"unscanned"}}]}`,
-		`{"input":[{"type":"local_shell_call","action":{"type":"future","command":"unscanned"}}]}`,
-		`{"input":[{"type":"message","role":"user","content":[{"type":"configuration_update","reasoning":{"effort":"high"},"text":"unscanned"}]}]}`,
-	}
-	for _, body := range tests {
-		resp := requestIntercept(t, formatOpenAIResponse, []byte(body))
-		if !resp.Reject {
-			t.Fatalf("malformed Responses union was accepted: %s", body)
-		}
-		if strings.Contains(resp.RejectReason, "unscanned") {
-			t.Fatalf("reject reason leaked input content: %q", resp.RejectReason)
-		}
-	}
-}
-
 func TestResponsesCurrentRuntimeItemsRedacted(t *testing.T) {
 	callRegister(t, pluginabi.MethodPluginRegister, "builtin_rules_enabled: false\ncustom_field_rules:\n  - name: password\n    keys: [password]\ncustom_value_rules:\n  - name: marker\n    regex: '(TEXTSECRET|OPAQUESECRET)'\n")
 	items := []any{
@@ -922,33 +904,31 @@ func TestResponsesToolSearchOutputSkipsProtocolRole(t *testing.T) {
 	}
 }
 
-func TestResponsesCurrentRuntimeUnionsFailClosed(t *testing.T) {
+func TestResponsesMalformedRuntimeContentRejected(t *testing.T) {
 	callRegister(t, pluginabi.MethodPluginRegister, "")
 	tests := []string{
-		`{"input":[{"type":"computer_call","actions":[{"type":"future","payload":"unscanned"}]}]}`,
+		`{"input":[{"type":"computer_call","actions":[{"type":"type","text":42}]}]}`,
 		`{"input":[{"type":"shell_call","action":{"commands":[42]}}]}`,
-		`{"input":[{"type":"apply_patch_call","operation":{"type":"future","diff":"unscanned"}}]}`,
+		`{"input":[{"type":"apply_patch_call","operation":{"type":"update_file","path":"file.txt","diff":42}}]}`,
 	}
 	for _, body := range tests {
 		resp := requestIntercept(t, formatOpenAIResponse, []byte(body))
 		if !resp.Reject {
-			t.Fatalf("invalid current Responses union was accepted: %s", body)
-		}
-		if strings.Contains(resp.RejectReason, "unscanned") {
-			t.Fatalf("reject reason leaked runtime content: %q", resp.RejectReason)
+			t.Fatalf("malformed Responses runtime content was accepted: %s", body)
 		}
 	}
 }
 
-func TestOpenAIToolCallRequiresFunctionArguments(t *testing.T) {
+func TestOpenAIToolCallRequiresRuntimeInput(t *testing.T) {
 	callRegister(t, pluginabi.MethodPluginRegister, "")
 	tests := []string{
 		`{"messages":[{"role":"assistant","content":null,"tool_calls":[{"type":"function"}]}]}`,
 		`{"messages":[{"role":"assistant","content":null,"tool_calls":[{"type":"function","function":{"name":"run"}}]}]}`,
+		`{"messages":[{"role":"assistant","content":null,"tool_calls":[{"type":"custom","custom":{"name":"runner"}}]}]}`,
 	}
 	for _, body := range tests {
 		if resp := requestIntercept(t, formatOpenAI, []byte(body)); !resp.Reject {
-			t.Fatalf("tool call without required runtime arguments was accepted: %s", body)
+			t.Fatalf("tool call without required runtime input was accepted: %s", body)
 		}
 	}
 }
@@ -975,23 +955,6 @@ func TestOpenAIMessageMetadataAndCustomToolCallRedacted(t *testing.T) {
 	}
 	if strings.Contains(string(resp.Body), "TEXTSECRET") {
 		t.Fatalf("OpenAI runtime text was not redacted: %s", resp.Body)
-	}
-}
-
-func TestOpenAIToolCallDiscriminatorFailsClosed(t *testing.T) {
-	callRegister(t, pluginabi.MethodPluginRegister, "")
-	tests := []string{
-		`{"messages":[{"role":"assistant","content":null,"tool_calls":[{"type":"custom","custom":{"name":"runner"}}]}]}`,
-		`{"messages":[{"role":"assistant","content":null,"tool_calls":[{"type":"future","payload":"unscanned"}]}]}`,
-	}
-	for _, body := range tests {
-		resp := requestIntercept(t, formatOpenAI, []byte(body))
-		if !resp.Reject {
-			t.Fatalf("invalid tool call union was accepted: %s", body)
-		}
-		if strings.Contains(resp.RejectReason, "unscanned") {
-			t.Fatalf("reject reason leaked tool call content: %q", resp.RejectReason)
-		}
 	}
 }
 
@@ -1120,23 +1083,6 @@ func TestClaudeDocumentsAndCurrentBlocksAcceptedAndTextRedacted(t *testing.T) {
 	}
 	if !strings.Contains(string(resp.Body), "OPAQUESECRET") {
 		t.Fatalf("opaque Claude data was unexpectedly changed: %s", resp.Body)
-	}
-}
-
-func TestClaudeNestedOnlyAndUnknownResultKindsReject(t *testing.T) {
-	callRegister(t, pluginabi.MethodPluginRegister, "")
-	tests := []string{
-		`{"messages":[{"content":[{"type":"code_execution_result","stdout":"unscanned","stderr":""}]}]}`,
-		`{"messages":[{"content":[{"type":"text_editor_code_execution_tool_result","tool_use_id":"x","content":{"type":"text_editor_code_execution_view_result","file_type":"future","content":"unscanned"}}]}]}`,
-	}
-	for _, body := range tests {
-		resp := requestIntercept(t, formatClaude, []byte(body))
-		if !resp.Reject {
-			t.Fatalf("invalid Claude union was accepted: %s", body)
-		}
-		if strings.Contains(resp.RejectReason, "unscanned") {
-			t.Fatalf("reject reason leaked content: %q", resp.RejectReason)
-		}
 	}
 }
 
@@ -1284,29 +1230,6 @@ func TestStrictJSONStringWhitespaceLimitedToFunctionArguments(t *testing.T) {
 	functionArgs := requestIntercept(t, formatOpenAIResponse, []byte(`{"input":[{"type":"function_call","arguments":"   "}]}`))
 	if functionArgs.Reject {
 		t.Fatalf("function argument whitespace compatibility changed: %s", functionArgs.RejectReason)
-	}
-}
-
-func TestUnknownProviderContentBlockRejected(t *testing.T) {
-	callRegister(t, pluginabi.MethodPluginRegister, "")
-	tests := []struct {
-		format string
-		body   string
-	}{
-		{format: formatOpenAI, body: `{"messages":[{"content":[{"type":"future_block","payload":"secret"}]}]}`},
-		{format: formatOpenAIResponse, body: `{"input":[{"type":"future_block","payload":"secret"}]}`},
-		{format: formatClaude, body: `{"messages":[{"content":[{"type":"future_block","payload":"secret"}]}]}`},
-	}
-	for _, tt := range tests {
-		t.Run(tt.format, func(t *testing.T) {
-			resp := requestIntercept(t, tt.format, []byte(tt.body))
-			if !resp.Reject {
-				t.Fatalf("unknown content block must be rejected: %s", tt.body)
-			}
-			if strings.Contains(resp.RejectReason, "secret") {
-				t.Fatalf("reject reason leaked block content: %q", resp.RejectReason)
-			}
-		})
 	}
 }
 

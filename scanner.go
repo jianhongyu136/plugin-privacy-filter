@@ -227,6 +227,27 @@ func valueRuleSpan(r valueRule, text string, match []int) (start, end int, valid
 	return start, end, end > start && (r.validate == nil || r.validate(text[start:end]))
 }
 
+// firstValueRuleMatch stops after the first nonempty, validator-approved hit.
+// Grow the candidate batch only after rejected hits. Each search uses the
+// original string so anchors, word boundaries, and empty-match rules retain
+// regexp.FindAll semantics; validators run only on newly discovered candidates.
+func firstValueRuleMatch(rule valueRule, text string) (match []int, start, end int) {
+	checked := 0
+	for limit := 1; ; limit *= 2 {
+		matches := rule.re.FindAllStringSubmatchIndex(text, limit)
+		for _, candidate := range matches[checked:] {
+			start, end, valid := valueRuleSpan(rule, text, candidate)
+			if valid {
+				return candidate, start, end
+			}
+		}
+		if len(matches) < limit || limit > len(text) {
+			return nil, 0, 0
+		}
+		checked = len(matches)
+	}
+}
+
 // detectText runs value rules without replacements or token creation. Invalid
 // JSON has no reliable field-name structure, so field rules do not apply. One
 // finding is recorded per matching rule; block mode stops at the first finding.
@@ -251,11 +272,7 @@ func (s *scanner) detectText(text, path string) []scanMatch {
 nextRule:
 	for _, rule := range s.rules.valueRules {
 		for _, segment := range segments {
-			for _, match := range rule.re.FindAllStringSubmatchIndex(segment, -1) {
-				_, _, valid := valueRuleSpan(rule, segment, match)
-				if !valid {
-					continue
-				}
+			if match, _, _ := firstValueRuleMatch(rule, segment); match != nil {
 				findings = append(findings, scanMatch{
 					Rule: rule.name, RuleType: "value", Path: path,
 					Field: diagnosticField(configFieldName(rule, segment, match)), Context: "[redacted]",
@@ -272,6 +289,23 @@ nextRule:
 
 // applyValueRules runs every value rule over a token-free text segment.
 func (s *scanner) applyValueRules(text, path string) string {
+	if len(s.rules.valueRules) == 0 {
+		return text
+	}
+	if s.stopAfterFirst {
+		for _, rule := range s.rules.valueRules {
+			match, start, end := firstValueRuleMatch(rule, text)
+			if match == nil {
+				continue
+			}
+			fragment := text[start:end]
+			placeholder := s.redact(fragment)
+			s.recordMatch(scanMatch{Rule: rule.name, RuleType: "value", Path: path,
+				Field: diagnosticField(configFieldName(rule, text, match)), Context: placeholder,
+				Excerpt: s.diagnosticTextExcerpt(text, path, fragment)})
+		}
+		return text
+	}
 	type textSegment struct {
 		value     string
 		protected bool
@@ -316,11 +350,7 @@ func (s *scanner) applyValueRules(text, path string) string {
 					next = append(next, textSegment{value: segment.value[match[0]:rs]})
 				}
 				token := s.redact(fragment)
-				if s.stopAfterFirst {
-					s.recordMatch(scanMatch{Rule: r.name, RuleType: "value", Path: path, Field: diagnosticField(configFieldName(r, segment.value, match)), Context: token,
-						Excerpt: s.diagnosticTextExcerpt(text, path, fragment)})
-				}
-				if !s.stopAfterFirst && r.hasConfigKey {
+				if r.hasConfigKey {
 					field := diagnosticField(configFieldName(r, segment.value, match))
 					if field != "" {
 						seen := false

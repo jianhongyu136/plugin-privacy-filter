@@ -2,6 +2,7 @@ package main
 
 import (
 	"container/list"
+	"strings"
 	"sync"
 	"time"
 )
@@ -138,6 +139,9 @@ func newVault(maxEntries int, ttl time.Duration) *vault {
 // Put stores or refreshes the mapping token->original and marks it most
 // recently used, evicting the least recently used entry if over capacity.
 func (v *vault) Put(token, original string) {
+	// Matches can be slices of a much larger prompt. Own only the matched value
+	// so its lifetime in the vault cannot retain the entire source text.
+	original = strings.Clone(original)
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	now := time.Now()

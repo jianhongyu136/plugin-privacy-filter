@@ -1,9 +1,38 @@
 package main
 
 import (
+	"strings"
 	"testing"
 	"time"
+	"unsafe"
 )
+
+func TestVaultPutCopiesValuesFromLargeText(t *testing.T) {
+	for _, refresh := range []bool{false, true} {
+		name := "insert"
+		if refresh {
+			name = "refresh"
+		}
+		t.Run(name, func(t *testing.T) {
+			v := newVault(1, time.Hour)
+			if refresh {
+				v.Put("placeholder", "old value")
+			}
+			text := strings.Repeat("x", 1<<20) + "matched value"
+			value := text[len(text)-len("matched value"):]
+			v.Put("placeholder", value)
+			stored, ok := v.Get("placeholder")
+			if !ok || stored != value {
+				t.Fatalf("stored value = %q, found=%v", stored, ok)
+			}
+			start := uintptr(unsafe.Pointer(unsafe.StringData(text)))
+			storedStart := uintptr(unsafe.Pointer(unsafe.StringData(stored)))
+			if storedStart >= start && storedStart < start+uintptr(len(text)) {
+				t.Fatal("vault retained the large source text backing storage")
+			}
+		})
+	}
+}
 
 func TestVaultPutGet(t *testing.T) {
 	v := newVault(10, time.Hour)

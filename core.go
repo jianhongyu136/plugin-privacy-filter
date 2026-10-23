@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
-	"unicode"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
@@ -225,15 +224,8 @@ func handleRequestIntercept(request []byte) (out []byte, err error) {
 			"path":          scanErr.Path,
 			"error":         scanErr.Detail,
 		}
-		if scanErr.HasUnsupportedContent {
-			fields["unsupported_content"] = sanitizeUnsupportedContent(scanErr.UnsupportedContent)
-		}
 		logrus.WithFields(fields).Warn("privacy-filter rejected unscannable request content")
-		msg := scanErr.Detail
-		if scanErr.HasUnsupportedType {
-			msg += " (unsupported type: " + sanitizeUnsupportedContent(scanErr.UnsupportedContent) + ")"
-		}
-		return okEnvelope(terminateRequest("privacy-filter could not scan request content at " + scanErr.Path + ": " + msg))
+		return okEnvelope(terminateRequest("privacy-filter could not scan request content at " + scanErr.Path + ": " + scanErr.Detail))
 	}
 	if !handled {
 		// A recognized format whose body could not be parsed into its content
@@ -316,7 +308,7 @@ func handleResponseIntercept(request []byte) ([]byte, error) {
 	allowed := collectTokens(req.RequestBody, tokenRe, st.vault)
 	contentType := req.ResponseHeaders.Get("Content-Type")
 	mediaType := strings.TrimSpace(strings.SplitN(contentType, ";", 2)[0])
-	restored := restoreBodyForMediaType(req.Body, tokenRe, allowed, st.vault, mediaType, req.SourceFormat)
+	restored := restoreBodyForMediaType(req.Body, tokenRe, tokenLabels(allowed), allowed, st.vault, mediaType, req.SourceFormat)
 	var resp pluginapi.ResponseInterceptResponse
 	if len(restored) > 0 && !bytes.Equal(restored, req.Body) {
 		resp.Body = restored
@@ -355,7 +347,7 @@ func handleStreamChunkIntercept(request []byte) ([]byte, error) {
 			return errorEnvelope("invalid_request", fmt.Sprintf("unsupported stream chunk index %d", req.ChunkIndex)), nil
 		}
 	}
-	allowed, initialized := streamCarry.activeAllowlist(req.RequestID)
+	allowed, labels, initialized := streamCarry.activeAllowlist(req.RequestID)
 	if !initialized {
 		return errorEnvelope("invalid_request", fmt.Sprintf("request %q was not initialized", req.RequestID)), nil
 	}
@@ -372,7 +364,7 @@ func handleStreamChunkIntercept(request []byte) ([]byte, error) {
 		req.RequestID,
 		req.Body,
 		tokenRe,
-		tokenLabels(allowed),
+		labels,
 		allowed,
 		st.vault,
 		mediaType,
@@ -395,22 +387,6 @@ func handleStreamChunkIntercept(request []byte) ([]byte, error) {
 }
 
 const scanLogMaxPaths = 8
-
-const unsupportedContentLogMaxRunes = 160
-
-func sanitizeUnsupportedContent(value string) string {
-	runes := make([]rune, 0, unsupportedContentLogMaxRunes)
-	for _, r := range value {
-		if len(runes) == unsupportedContentLogMaxRunes {
-			return string(runes[:unsupportedContentLogMaxRunes-3]) + "..."
-		}
-		if unicode.IsControl(r) {
-			r = ' '
-		}
-		runes = append(runes, r)
-	}
-	return string(runes)
-}
 
 // logBlockedMatch records an identifiable field and a masked nearby excerpt.
 func logBlockedMatch(match scanMatch) {

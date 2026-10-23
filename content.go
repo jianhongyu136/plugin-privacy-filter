@@ -51,8 +51,9 @@ func classifyFormat(sourceFormat string) formatDisposition {
 // object whose key happens to match a field rule (for example a tool parameter
 // named "api_key"), which corrupts the request. Restricting redaction to
 // content regions keeps the request structurally intact.
-// Protocol siblings are neither scanned nor validated; visitors only select
-// known content fields and validate the structure needed to traverse them.
+// Protocol siblings and unrecognized item/block types are neither scanned nor
+// validated. Visitors select known content fields and validate only the
+// structure needed to traverse those fields.
 //
 // It returns handled=false when the body is not a single JSON object (so the
 // content regions cannot be located) or the format is unrecognized; the caller
@@ -210,11 +211,8 @@ func scanImageVideoContent(s *scanner, doc map[string]any) *contentScanError {
 // contentScanError describes content that cannot be scanned safely. Detail is
 // deliberately sanitized for the termination response and diagnostic log.
 type contentScanError struct {
-	Path                  string
-	Detail                string
-	UnsupportedContent    string
-	HasUnsupportedContent bool
-	HasUnsupportedType    bool
+	Path   string
+	Detail string
 }
 
 // scanContentValue scans one content region. A plain string is scanned with the
@@ -317,10 +315,7 @@ func scanOpenAIMessageContent(s *scanner, value any, path string, allowNull bool
 		if !ok {
 			return nil, &contentScanError{Path: blockPath, Detail: "content block must be an object"}
 		}
-		kind, err := contentBlockType(block, blockPath)
-		if err != nil {
-			return nil, err
-		}
+		kind := contentBlockType(block)
 		switch kind {
 		case "text", "input_text", "output_text":
 			if err := scanStringMember(s, block, "text", blockPath, true); err != nil {
@@ -330,10 +325,6 @@ func scanOpenAIMessageContent(s *scanner, value any, path string, allowNull bool
 			if err := scanStringMember(s, block, "refusal", blockPath, true); err != nil {
 				return nil, err
 			}
-		case "image_url", "input_audio", "file", "image_file":
-			// Media and file payloads are deliberately outside the text scanner.
-		default:
-			return nil, unknownContentBlock(blockPath, kind)
 		}
 	}
 	return blocks, nil
@@ -356,12 +347,10 @@ func scanOpenAIToolCallArguments(s *scanner, msg map[string]any, messagePath str
 		if !ok {
 			return &contentScanError{Path: toolCallPath, Detail: "tool call must be an object"}
 		}
-		kind := "function"
-		if rawType, exists := toolCall["type"]; exists {
-			var ok bool
-			kind, ok = rawType.(string)
-			if !ok || kind == "" {
-				return &contentScanError{Path: toolCallPath + ".type", Detail: "tool call type must be a non-empty string"}
+		kind := contentBlockType(toolCall)
+		if _, hasType := toolCall["type"]; !hasType {
+			if _, hasFunction := toolCall["function"]; hasFunction {
+				kind = "function"
 			}
 		}
 		if kind == "custom" {
@@ -376,7 +365,7 @@ func scanOpenAIToolCallArguments(s *scanner, msg map[string]any, messagePath str
 			continue
 		}
 		if kind != "function" {
-			return &contentScanError{Path: toolCallPath + ".type", Detail: "unsupported tool call type", UnsupportedContent: kind, HasUnsupportedContent: true, HasUnsupportedType: true}
+			continue
 		}
 		rawFunction, exists := toolCall["function"]
 		if !exists {
@@ -468,20 +457,11 @@ func scanStrictJSONString(s *scanner, value, path string) (string, bool, *conten
 	return string(reencodeJSON(doc, []byte(value))), true, nil
 }
 
-func contentBlockType(block map[string]any, path string) (string, *contentScanError) {
-	rawType, exists := block["type"]
-	if !exists {
-		return "", &contentScanError{Path: path + ".type", Detail: "content block type is required"}
-	}
-	kind, ok := rawType.(string)
-	if !ok || kind == "" {
-		return "", &contentScanError{Path: path + ".type", Detail: "content block type must be a non-empty string"}
-	}
-	return kind, nil
-}
-
-func unknownContentBlock(path, kind string) *contentScanError {
-	return &contentScanError{Path: path + ".type", Detail: "unsupported content block type", UnsupportedContent: kind, HasUnsupportedContent: true, HasUnsupportedType: true}
+// contentBlockType selects a known visitor rather than validating the protocol.
+// Missing, non-string, and future discriminators leave the object opaque.
+func contentBlockType(block map[string]any) string {
+	kind, _ := block["type"].(string)
+	return kind
 }
 
 func scanStringMember(s *scanner, object map[string]any, key, path string, required bool) *contentScanError {
@@ -541,15 +521,8 @@ func scanResponsesInput(s *scanner, value any, path string) (any, *contentScanEr
 			return nil, &contentScanError{Path: itemPath, Detail: "input item must be a string or object"}
 		}
 		if _, hasType := item["type"]; !hasType {
-			if id, hasID := item["id"].(string); hasID && id != "" {
-				if _, hasRole := item["role"]; !hasRole {
-					if _, hasContent := item["content"]; !hasContent {
-						continue
-					}
-				}
-			}
 			if _, hasRole := item["role"]; !hasRole {
-				return nil, &contentScanError{Path: itemPath + ".type", Detail: "input item type or role is required"}
+				continue
 			}
 			content, exists := item["content"]
 			if !exists {
@@ -562,10 +535,7 @@ func scanResponsesInput(s *scanner, value any, path string) (any, *contentScanEr
 			item["content"] = walked
 			continue
 		}
-		kind, err := contentBlockType(item, itemPath)
-		if err != nil {
-			return nil, err
-		}
+		kind := contentBlockType(item)
 		switch kind {
 		case "message":
 			content, exists := item["content"]
@@ -714,17 +684,6 @@ func scanResponsesInput(s *scanner, value any, path string) (any, *contentScanEr
 				return nil, &contentScanError{Path: itemPath + ".arguments", Detail: "arguments is required"}
 			}
 			item["arguments"] = s.scanContentValue(rawArguments, itemPath+".arguments")
-		case "tool_search_output", "additional_tools":
-			// Tool definitions and their schemas are configuration, not runtime text.
-		case "configuration_update":
-			// Request settings remain opaque protocol configuration.
-		case "input_image", "input_file":
-			// Image and file payloads remain opaque.
-		case "computer_screenshot", "item_reference",
-			"computer_call_output", "compaction", "compaction_trigger", "image_generation_call":
-			// Media, file data, and identifiers remain byte-equivalent values.
-		default:
-			return nil, unknownContentBlock(itemPath, kind)
 		}
 	}
 	return items, nil
@@ -755,15 +714,20 @@ func scanComputerSafetyChecks(s *scanner, item map[string]any, path string) *con
 func scanComputerCallActions(s *scanner, item map[string]any, path string) *contentScanError {
 	rawAction, hasAction := item["action"]
 	rawActions, hasActions := item["actions"]
-	if hasAction == hasActions {
-		return &contentScanError{Path: path + ".action", Detail: "exactly one of action or actions is required"}
+	if !hasAction && !hasActions {
+		return &contentScanError{Path: path + ".action", Detail: "action or actions is required"}
 	}
 	if hasAction {
 		action, ok := rawAction.(map[string]any)
 		if !ok {
 			return &contentScanError{Path: path + ".action", Detail: "action must be an object"}
 		}
-		return scanComputerAction(s, action, path+".action")
+		if err := scanComputerAction(s, action, path+".action"); err != nil {
+			return err
+		}
+	}
+	if !hasActions {
+		return nil
 	}
 	actions, ok := rawActions.([]any)
 	if !ok {
@@ -783,18 +747,10 @@ func scanComputerCallActions(s *scanner, item map[string]any, path string) *cont
 }
 
 func scanComputerAction(s *scanner, action map[string]any, path string) *contentScanError {
-	kind, err := contentBlockType(action, path)
-	if err != nil {
-		return err
-	}
-	switch kind {
-	case "type":
+	if contentBlockType(action) == "type" {
 		return scanStringMember(s, action, "text", path, true)
-	case "click", "double_click", "drag", "keypress", "move", "scroll", "screenshot", "wait":
-		return nil
-	default:
-		return unknownContentBlock(path, kind)
 	}
+	return nil
 }
 
 func scanLocalShellCall(s *scanner, item map[string]any, path string) *contentScanError {
@@ -806,12 +762,8 @@ func scanLocalShellCall(s *scanner, item map[string]any, path string) *contentSc
 	if !ok {
 		return &contentScanError{Path: path + ".action", Detail: "action must be an object"}
 	}
-	kind, err := contentBlockType(action, path+".action")
-	if err != nil {
-		return err
-	}
-	if kind != "exec" {
-		return unknownContentBlock(path+".action", kind)
+	if contentBlockType(action) != "exec" {
+		return nil
 	}
 	if err := scanStringOrStringArrayMember(s, action, "command", path+".action", true); err != nil {
 		return err
@@ -943,10 +895,7 @@ func scanApplyPatchCall(s *scanner, item map[string]any, path string) *contentSc
 	if !ok {
 		return &contentScanError{Path: path + ".operation", Detail: "operation is required and must be an object"}
 	}
-	kind, err := contentBlockType(operation, path+".operation")
-	if err != nil {
-		return err
-	}
+	kind := contentBlockType(operation)
 	switch kind {
 	case "create_file", "update_file":
 		if err := scanStringMember(s, operation, "path", path+".operation", true); err != nil {
@@ -955,9 +904,8 @@ func scanApplyPatchCall(s *scanner, item map[string]any, path string) *contentSc
 		return scanStringMember(s, operation, "diff", path+".operation", true)
 	case "delete_file":
 		return scanStringMember(s, operation, "path", path+".operation", true)
-	default:
-		return unknownContentBlock(path+".operation", kind)
 	}
+	return nil
 }
 
 func scanCodeInterpreterCall(s *scanner, item map[string]any, path string) *contentScanError {
@@ -978,19 +926,10 @@ func scanCodeInterpreterCall(s *scanner, item map[string]any, path string) *cont
 		if !ok {
 			return &contentScanError{Path: outputPath, Detail: "output must be an object"}
 		}
-		kind, err := contentBlockType(output, outputPath)
-		if err != nil {
-			return err
-		}
-		switch kind {
-		case "logs":
+		if contentBlockType(output) == "logs" {
 			if err := scanStringMember(s, output, "logs", outputPath, true); err != nil {
 				return err
 			}
-		case "image":
-			// Images remain opaque.
-		default:
-			return unknownContentBlock(outputPath, kind)
 		}
 	}
 	return nil
@@ -1001,10 +940,7 @@ func scanWebSearchCall(s *scanner, item map[string]any, path string) *contentSca
 	if !ok {
 		return &contentScanError{Path: path + ".action", Detail: "action is required and must be an object"}
 	}
-	kind, err := contentBlockType(action, path+".action")
-	if err != nil {
-		return err
-	}
+	kind := contentBlockType(action)
 	switch kind {
 	case "search":
 		if err := scanOptionalStringArrayMember(s, action, "queries", path+".action"); err != nil {
@@ -1013,11 +949,8 @@ func scanWebSearchCall(s *scanner, item map[string]any, path string) *contentSca
 		return scanNullableStringMember(s, action, "query", path+".action")
 	case "find_in_page":
 		return scanStringMember(s, action, "pattern", path+".action", true)
-	case "open_page":
-		return nil
-	default:
-		return unknownContentBlock(path+".action", kind)
 	}
+	return nil
 }
 
 func scanFileSearchCall(s *scanner, item map[string]any, path string) *contentScanError {
@@ -1059,10 +992,7 @@ func scanResponsesContent(s *scanner, value any, path string) (any, *contentScan
 		if !ok {
 			return nil, &contentScanError{Path: itemPath, Detail: "content block must be an object"}
 		}
-		kind, err := contentBlockType(item, itemPath)
-		if err != nil {
-			return nil, err
-		}
+		kind := contentBlockType(item)
 		switch kind {
 		case "input_text", "output_text", "text", "summary_text", "reasoning_text":
 			if err := scanStringMember(s, item, "text", itemPath, true); err != nil {
@@ -1072,9 +1002,6 @@ func scanResponsesContent(s *scanner, value any, path string) (any, *contentScan
 			if err := scanStringMember(s, item, "refusal", itemPath, true); err != nil {
 				return nil, err
 			}
-		case "input_image", "input_file", "computer_screenshot", "encrypted_content":
-		default:
-			return nil, unknownContentBlock(itemPath, kind)
 		}
 	}
 	return items, nil
@@ -1139,10 +1066,7 @@ func scanClaudeBlocks(s *scanner, value any, path string, allowNull bool) (any, 
 		if !ok {
 			return nil, &contentScanError{Path: blockPath, Detail: "content block must be an object"}
 		}
-		kind, err := contentBlockType(block, blockPath)
-		if err != nil {
-			return nil, err
-		}
+		kind := contentBlockType(block)
 		switch kind {
 		case "text":
 			if err := scanStringMember(s, block, "text", blockPath, true); err != nil {
@@ -1216,12 +1140,6 @@ func scanClaudeBlocks(s *scanner, value any, path string, allowNull bool) (any, 
 				return nil, scanErr
 			}
 			block["content"] = walked
-		case "tool_reference", "container_upload":
-			// Tool names and references are protocol identifiers, not user text.
-		case "image", "redacted_thinking":
-			// Source data, URLs, MIME metadata, and encrypted thinking stay opaque.
-		default:
-			return nil, unknownContentBlock(blockPath, kind)
 		}
 	}
 	return blocks, nil
@@ -1241,10 +1159,7 @@ func scanClaudeToolResultContent(s *scanner, value any, path string) (any, *cont
 	if !ok {
 		return nil, &contentScanError{Path: path, Detail: "tool result content must be a string, array, object, or null"}
 	}
-	kind, err := contentBlockType(result, path)
-	if err != nil {
-		return nil, err
-	}
+	kind := contentBlockType(result)
 	switch kind {
 	case "web_fetch_result":
 		if err := scanClaudeWebFetchResult(s, result, path); err != nil {
@@ -1262,22 +1177,10 @@ func scanClaudeToolResultContent(s *scanner, value any, path string) (any, *cont
 			return nil, err
 		}
 	case "text_editor_code_execution_view_result":
-		fileType, ok := result["file_type"].(string)
-		if !ok {
-			return nil, &contentScanError{Path: path + ".file_type", Detail: "file_type must be a string"}
-		}
-		if _, ok := result["content"].(string); !ok {
-			return nil, &contentScanError{Path: path + ".content", Detail: "content must be a string"}
-		}
-		switch fileType {
-		case "text":
+		if fileType, _ := result["file_type"].(string); fileType == "text" {
 			if err := scanStringMember(s, result, "content", path, true); err != nil {
 				return nil, err
 			}
-		case "image", "pdf":
-			// Binary/media content remains opaque.
-		default:
-			return nil, &contentScanError{Path: path + ".file_type", Detail: "unsupported file_type", UnsupportedContent: fileType, HasUnsupportedContent: true, HasUnsupportedType: true}
 		}
 	case "text_editor_code_execution_str_replace_result":
 		if err := scanOptionalStringArrayMember(s, result, "lines", path); err != nil {
@@ -1287,12 +1190,6 @@ func scanClaudeToolResultContent(s *scanner, value any, path string) (any, *cont
 		if err := scanNullableStringMember(s, result, "error_message", path); err != nil {
 			return nil, err
 		}
-	case "text_editor_code_execution_create_result", "web_search_tool_result_error",
-		"web_fetch_tool_result_error", "code_execution_tool_result_error",
-		"bash_code_execution_tool_result_error":
-		// Status flags and error codes are protocol metadata.
-	default:
-		return nil, unknownContentBlock(path, kind)
 	}
 	return result, nil
 }
@@ -1306,12 +1203,8 @@ func scanClaudeWebFetchResult(s *scanner, result map[string]any, path string) *c
 	if !ok {
 		return &contentScanError{Path: path + ".content", Detail: "content must be an object"}
 	}
-	kind, err := contentBlockType(document, path+".content")
-	if err != nil {
-		return err
-	}
-	if kind != "document" {
-		return unknownContentBlock(path+".content", kind)
+	if contentBlockType(document) != "document" {
+		return nil
 	}
 	return scanClaudeDocument(s, document, path+".content")
 }
@@ -1331,10 +1224,7 @@ func scanClaudeDocument(s *scanner, document map[string]any, path string) *conte
 	if !ok {
 		return &contentScanError{Path: path + ".source", Detail: "source must be an object"}
 	}
-	sourceType, err := contentBlockType(source, path+".source")
-	if err != nil {
-		return err
-	}
+	sourceType := contentBlockType(source)
 	switch sourceType {
 	case "text":
 		return scanStringMember(s, source, "data", path+".source", true)
@@ -1348,10 +1238,6 @@ func scanClaudeDocument(s *scanner, document map[string]any, path string) *conte
 			return scanErr
 		}
 		source["content"] = walked
-	case "base64", "url":
-		// PDF data and URLs stay opaque.
-	default:
-		return unknownContentBlock(path+".source", sourceType)
 	}
 	return nil
 }
@@ -1370,19 +1256,10 @@ func scanClaudeDocumentSourceBlocks(s *scanner, value any, path string) (any, *c
 		if !ok {
 			return nil, &contentScanError{Path: blockPath, Detail: "content block must be an object"}
 		}
-		kind, err := contentBlockType(block, blockPath)
-		if err != nil {
-			return nil, err
-		}
-		switch kind {
-		case "text":
+		if contentBlockType(block) == "text" {
 			if err := scanStringMember(s, block, "text", blockPath, true); err != nil {
 				return nil, err
 			}
-		case "image":
-			// Image payloads remain opaque.
-		default:
-			return nil, unknownContentBlock(blockPath, kind)
 		}
 	}
 	return blocks, nil
@@ -1399,15 +1276,10 @@ func scanClaudeTextBlocks(s *scanner, value any, path string) (any, *contentScan
 		if !ok {
 			return nil, &contentScanError{Path: blockPath, Detail: "content block must be an object"}
 		}
-		kind, err := contentBlockType(block, blockPath)
-		if err != nil {
-			return nil, err
-		}
-		if kind != "text" {
-			return nil, unknownContentBlock(blockPath, kind)
-		}
-		if err := scanStringMember(s, block, "text", blockPath, true); err != nil {
-			return nil, err
+		if contentBlockType(block) == "text" {
+			if err := scanStringMember(s, block, "text", blockPath, true); err != nil {
+				return nil, err
+			}
 		}
 	}
 	return blocks, nil
@@ -1418,19 +1290,10 @@ func scanClaudeToolSearchResult(s *scanner, value any, path string) (any, *conte
 	if !ok {
 		return nil, &contentScanError{Path: path, Detail: "tool search result must be an object"}
 	}
-	kind, err := contentBlockType(result, path)
-	if err != nil {
-		return nil, err
-	}
-	switch kind {
-	case "tool_search_tool_result_error":
+	if contentBlockType(result) == "tool_search_tool_result_error" {
 		if err := scanNullableStringMember(s, result, "error_message", path); err != nil {
 			return nil, err
 		}
-	case "tool_search_tool_search_result":
-		// Tool references are protocol metadata, not message content.
-	default:
-		return nil, unknownContentBlock(path, kind)
 	}
 	return result, nil
 }
